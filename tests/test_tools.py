@@ -177,6 +177,12 @@ def test_commands_run_in_root_with_sanitized_env(root: Path, monkeypatch):
         assert "exit_code=3" in r.content and "hello" in r.content
         r = tl.dispatch("run_command", {"command": "   "})
         assert r.is_error
+        # model-supplied timeouts: NaN / inf / negative / non-numeric are refused before anything runs
+        for bad in [float("nan"), float("inf"), -1, 0, "10", True]:
+            r = tl.dispatch("run_command", {"command": "echo never", "timeout_s": bad})
+            assert r.is_error and "timeout_s" in r.content, (bad, r.content)
+        r = tl.dispatch("run_command", {"command": "echo fine", "timeout_s": 5})
+        assert not r.is_error and "fine" in r.content
     env = sanitized_env(Path("."))
     assert "FAKE_PROVIDER_KEY" not in env and "MAS_DATABASE_URL" not in env and "PATH" in env
 

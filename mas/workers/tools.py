@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -258,8 +259,17 @@ class ToolLayer:
 
     # ------------------------------------------------------------------ commands (through the execution backend)
 
-    def _timeout(self, requested: float | None) -> float:
-        t = self.limits.command_timeout_s if requested is None else min(float(requested), self.limits.command_timeout_s)
+    def _timeout(self, requested: Any) -> float:
+        """Model-supplied timeout: must be a finite positive number (JSON parsers accept NaN/Infinity; bools are ints);
+        anything else is a tool error, and the value is capped by the layer's limit and the attempt deadline."""
+        if requested is None:
+            t = self.limits.command_timeout_s
+        else:
+            if isinstance(requested, bool) or not isinstance(requested, int | float) or not math.isfinite(requested):
+                raise ToolError(f"timeout_s must be a finite number, got {requested!r}")
+            if requested <= 0:
+                raise ToolError(f"timeout_s must be positive, got {requested!r}")
+            t = min(float(requested), self.limits.command_timeout_s)
         if self.deadline is not None:
             t = min(t, max(0.05, self.deadline - time.monotonic()))
         return t
