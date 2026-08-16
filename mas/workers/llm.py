@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -104,9 +105,11 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
-def data_envelope(label: str, content: str) -> str:
-    """Wrap untrusted content. The marker is explicit and the closing line repeats it so a fake 'end of data' inside the
-    content cannot pretend the envelope closed."""
+def data_envelope(label: str, content: str, *, nonce: bool = False) -> str:
+    """Wrap untrusted content. The closing marker repeats the label — and, with `nonce=True`, an unguessable tag — so
+    content that contains a forged '<<END DATA …>>' line still sits *inside* the envelope."""
+    if nonce:
+        label = f"{label} #{secrets.token_hex(4)}"
     return f"<<DATA {label}>>\n{content}\n<<END DATA {label}>>"
 
 
@@ -253,7 +256,7 @@ class LLMAgent:
         return {
             "role": "tool",
             "tool_call_id": tc.id,
-            "content": data_envelope(f"tool_result {tc.name}", content),
+            "content": data_envelope(f"tool_result {tc.name}", content, nonce=True),
             "is_error": is_error,
         }
 
@@ -264,7 +267,7 @@ class LLMAgent:
         lines = [
             f"# Task {ctx.task.key} (capability: {ctx.task.capability}, attempt {ctx.attempt.attempt_number})",
             "",
-            data_envelope("task goal", str(ctx.task.goal or "").strip()),
+            data_envelope("task goal", str(ctx.task.goal or "").strip(), nonce=True),
             "",
             f"Output contract — artifacts this task must produce: {contract}",
             "- `git_commit` is produced by the runtime from whatever you leave in the worktree; do not list it in `finish`.",
@@ -280,7 +283,7 @@ class LLMAgent:
                 lines.append(f"Reads are limited to these paths: {ctx.paths}")
         if ctx.conflicts:
             lines.append("")
-            lines.append(data_envelope("unresolved merge conflicts (paths)", "\n".join(ctx.conflicts)))
+            lines.append(data_envelope("unresolved merge conflicts (paths)", "\n".join(ctx.conflicts), nonce=True))
             lines.append("Resolve these conflict markers first.")
         if ctx.inputs:
             lines.append("")
