@@ -312,13 +312,18 @@ class AcceptanceVerifier:
             "--mount",
             f"type=bind,src={suite.resolve()},dst=/acceptance,readonly",
             self.image,
+            # container-side hard stop (defence in depth): if the verifier process dies, the sandbox still ends by itself
+            "timeout",
+            "-s",
+            "KILL",
+            str(timeout_s + 5),
             *manifest["command"],
         ]
         # Bounded capture: stdout/stderr are drained through pipes by reader threads that keep at most
         # max_output_bytes each and DISCARD the rest, so a flooding suite can neither block on a full pipe nor
         # write past the cap onto the host. On overflow the container is killed and the verdict is INVALID.
         # `--log-driver none`: the daemon must not keep a second, unbounded copy of the output either.
-        cmd[2:2] = ["--log-driver", "none"]
+        cmd[2:2] = ["--log-driver", "none", "--rm"]  # daemon removes the container on exit even with no verifier alive
         cap = self.limits.max_output_bytes
         out = _BoundedCapture(cap)
         err = _BoundedCapture(cap)

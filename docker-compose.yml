@@ -1,3 +1,5 @@
+# Data: /data (bare repos + worktrees) is a host bind mount (default ./.mas) so the verifier service on the host can read
+# the exact integration commits and promote refs; workers/orchestrator see it as /data. Single host by design.
 # Networks: `backend` is internal (no egress). Workers and the orchestrator live only there — they can reach
 # Postgres, nothing else (invariant I-11; antipatterns A8/B12 containment). Postgres also sits on the default
 # network so the host can reach it on the published port.
@@ -34,11 +36,11 @@ services:
     environment:
       MAS_DATABASE_URL: postgresql://mas:mas@postgres:5432/mas
       MAS_POOL: ${MAS_POOL:-default}
-    # This Compose profile is the LLM-free substrate demo: stub workers require an explicit stub verifier.
-    # Real verification is run by a host orchestrator with Docker access; never mount docker.sock here.
-    command: ["mas", "orchestrate", "--watch", "--stub-verifier"]
+    # The hardened orchestrator has no Docker: it moves runs to VERIFYING and leaves them for the verifier service
+    # (`mas verify --watch` on the host, which has Docker). Never mount docker.sock here. `--verifier stub` = test mode.
+    command: ["mas", "orchestrate", "--watch", "--verifier", "${MAS_ORCH_VERIFIER:-external}", "--parallel", "4"]
     volumes:
-      - masdata:/data
+      - ${MAS_DATA_DIR:-./.mas}:/data
     networks: [backend]
     read_only: true
     tmpfs: [/tmp]
@@ -59,7 +61,7 @@ services:
       MAS_WORKSPACE: git
     command: ["mas", "worker", "--stub", "--stub-sleep", "${MAS_STUB_SLEEP:-0.5}"]
     volumes:
-      - masdata:/data
+      - ${MAS_DATA_DIR:-./.mas}:/data
       - ./acceptance:/app/acceptance:ro
     networks: [backend]
     read_only: true
@@ -69,4 +71,3 @@ services:
 
 volumes:
   pgdata:
-  masdata:

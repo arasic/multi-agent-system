@@ -309,7 +309,7 @@ Per-attempt limits: `max_runtime_s`, `max_tokens`. Exceeding runtime → `TIMEOU
 - **Trusted adapters (ADR-007 §4a, step 7B):** a suite may be an approved *contract* (`contract.json`) executed by the trusted runner baked into the verifier image (`/opt/mas/adapters/runner.py`, from `mas/verifier/adapters/`). Four typed criterion types only — `build_succeeds`, `tests_required`, `http_status`, `restart_persists` — validated by the same schema module on the host (freeze + verification) and inside the sandbox; unmappable → `INVALID`. The verifier forces the trusted runner command and `expected_checks == contract ids`; per-check timeouts must fit the suite timeout. Service lifecycle for the http checks (start → health → stop → restart, `{state_dir}` survives restarts) is owned by the runner. No generic DSL.
 - **Hash pinning (ADR-007):** `VerificationRequest.expected_suite_sha256`, when set, must equal the suite's digest on disk or the result is `INVALID` before the runner is touched. The orchestrator will carry the approved contract's hash once contracts are frozen (7B/11); `AcceptanceVerifier.suite_digest(benchmark)` is what a freeze pins.
 - The full report lives in the `verification` artifact; the event log gets a bounded copy (long stdout/stderr truncated).
-- The sandbox requires access to a Docker runner. The hardened Compose orchestrator deliberately has no `docker.sock`; its stub-worker demo opts into `--stub-verifier`. Real acceptance currently runs from a host orchestrator. A separate verifier service/runner API is the production-safe distributed boundary; mounting the host Docker socket into the control plane is not accepted.
+- **Verifier service (7C).** The hardened Compose orchestrator has no Docker; it runs with `--verifier external` (`DeferredVerification`): when integration completes it moves the run to `VERIFYING` and *leaves it*. A separate `mas verify --watch` process — wherever the sandbox runner (Docker) is available, typically the host — claims `VERIFYING` runs under the existing verify advisory lock, runs the real `AcceptanceVerifier`, publishes the evidence and transitions the run. Bounded (`--parallel`), one connection per job, safe with several instances, re-entrant after a crash (the lock dies with the session; the run stays `VERIFYING`; budgets bound it). The sandbox command is wrapped in a container-side `timeout -s KILL` and started with `--rm`, so an orphaned sandbox ends and is removed even if no verifier is alive. `mas verify --once` verifies whatever is currently `VERIFYING` and exits.
 
 ---
 
@@ -391,6 +391,10 @@ MVP roles (three, no dynamic routing): **planner** → strong model; **worker** 
 
 ---
 
+## 11b. Orchestrator service concurrency (7C)
+
+`orchestrate_forever` is a **bounded executor** (`--parallel N`): every tick runs on its own connection under a **per-run session advisory lock** (`TICK_LOCK_NS`), so two orchestrator processes never tick the same run at once, and an in-flight set stops two local threads from doing so. The verifier is invoked outside any row lock (the tick's transaction ends before verification; only the verify advisory lock is held). A slow verification of run A therefore never blocks run B. `verify_forever` uses the same loop for the verifier service.
+
 ## 12. Concurrency knob and the single-agent baseline
 
 - `runs.max_concurrency` bounds simultaneously `RUNNING` attempts. **Config C (sequential MAS) is config D with `max_concurrency = 1`** — same code path, one knob.
@@ -402,7 +406,7 @@ MVP roles (three, no dynamic routing): **planner** → strong model; **worker** 
 
 `docker-compose.yml`: `postgres`, `orchestrator`, `worker` (scale ×N). Workers poll Postgres; no queue. Verifier: ephemeral container started by the orchestrator (or isolated subprocess early on).
 
-- **Shared volume `masdata:/data`** holds `repos/` (bare repo per run) and `worktrees/` — mounted by workers and the orchestrator (one host / one volume in the MVP).
+- **`/data` is a host bind mount** (`${MAS_DATA_DIR:-./.mas}`) holding `repos/` (bare repo per run) and `worktrees/` — mounted by workers and the orchestrator, and readable by the host-side verifier service (which needs the exact integration commits and promotes `run/<run>/integration`). One host by design; a multi-host deployment would push/fetch or containerise the verifier with an API-driven (volume / `docker cp`) transfer instead of bind mounts.
 - **Networks:** `backend` is `internal: true` — workers and orchestrator have **no egress**; Postgres also joins `frontend` so the host reaches the published port.
 - **Worker/orchestrator containers:** `USER mas` (uid 1000), `read_only: true` rootfs, `tmpfs /tmp`, `cap_drop: [ALL]`, `no-new-privileges`, `./acceptance:/app/acceptance:ro`. Verified: cannot write `/app`, cannot reach the internet, can reach Postgres and `/data`.
 - Later (step 10): the LLM worker needs a model-API egress — give *that* service a proxy/allow-list, not the network; agent tools stay sandboxed to the worktree.

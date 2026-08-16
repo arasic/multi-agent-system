@@ -107,3 +107,14 @@ class MissingVerifier:
             status=VerificationStatus.INVALID,
             evidence={"run_id": str(request.run_id)},
         )
+
+
+class DeferredVerification:
+    """Marker verifier for the orchestrator *service*: the orchestrator moves a run to VERIFYING and leaves it there
+    for a separate verifier service (`mas verify --watch`) that has sandbox (Docker) access. It never produces a
+    verdict itself; if no verifier service ever comes, the run's budgets end it (I-4) — nothing passes by default."""
+
+    name = "deferred"
+
+    def verify(self, request: VerificationRequest) -> VerificationResult:  # pragma: no cover - never called by design
+        return VerificationResult.fail("verification is deferred to the verifier service", status=VerificationStatus.INVALID)

@@ -155,7 +155,7 @@ docker compose up -d postgres
 .venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3 --stub-verifier
 .venv/Scripts/mas replay <run_id>
 docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
-.venv/Scripts/python -m pytest -q                                   # 111 tests, no API key; uses its own temp DB
+.venv/Scripts/python -m pytest -q                                   # 117 tests, no API key; uses its own temp DB
 ```
 
 Runs are tagged with a **pool**: `mas run` uses a private `local:<pid>` pool, the compose services serve `default`, so they never take each other's work even on the same database. Tests are isolated too — each pytest process creates and drops its own `mas_test_<pid>` database, so concurrent test runs can't collide.
@@ -163,7 +163,9 @@ Runs are tagged with a **pool**: `mas run` uses a private `local:<pid>` pool, th
 Distributed (orchestrator + 3 worker containers, then kill one mid-run):
 
 ```
+docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
 docker compose build orchestrator && docker compose up -d --scale worker=3 orchestrator worker
+.venv/Scripts/mas verify --watch             # host-side verifier service (has Docker) — real sandboxed verdicts
 .venv/Scripts/mas submit --dag benchmarks/url_shortener/dag.json --wait
 docker kill multi-agent-system-worker-2      # the reaper reassigns its task; the run still passes
 ```
@@ -178,7 +180,9 @@ docker kill multi-agent-system-worker-2      # the reaper reassigns its task; th
 
 **Step 7B done:** trusted acceptance adapters (`build_succeeds`, `tests_required`, `http_status`, `restart_persists`) — typed contracts validated on the host and in the sandbox, executed by a trusted runner baked into the verifier image; unmappable criteria fail closed. `mas contract <file>` validates a contract and prints the suite digest a freeze pins.
 
-**Still missing before an LLM goes in:** concurrent run ticking in the orchestrator service and a verifier service so service-mode runs get real verdicts (7C). The hardened Compose orchestrator intentionally has no Docker socket; use a host orchestrator for real verification until a separate verifier service/runner API exists. See [docs/roadmap.md](docs/roadmap.md).
+**Step 7C done:** the orchestrator service ticks runs concurrently (bounded executor, per-run advisory locks, one connection per tick — a slow verification never blocks other runs) and defers verification (`--verifier external`) to a **verifier service** (`mas verify --watch`) that has sandbox access; service-mode runs now get real verdicts. Demonstrated fire-and-forget: submit through the services, kill a worker, kill the verifier mid-verification, restart → `PASS`.
+
+**M1 substrate is complete.** Next: models (M2) — `ModelProvider`, the LLM worker + tool layer, the LLM planner with questions/assumptions/acceptance-contract proposal, one bounded repair cycle; then the fair benchmark (M3). The hardened Compose orchestrator intentionally has no Docker socket; use a host orchestrator for real verification until a separate verifier service/runner API exists. See [docs/roadmap.md](docs/roadmap.md).
 
 ## Later
 

@@ -13,12 +13,14 @@ Nothing here calls a model. Nothing here interprets task content.
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 from uuid import UUID
 
 from mas.artifacts import store
-from mas.db.connection import Conn
+from mas.db.connection import Conn, connect
 from mas.db.events import emit
 from mas.models.enums import (
     INTEGRATION_CAPABILITY,
@@ -33,7 +35,14 @@ from mas.orchestrator import budgets as budget_rules
 from mas.orchestrator import state_machine as sm
 from mas.orchestrator.leases import reap_expired
 from mas.planner.planner import Planner
-from mas.verifier.base import MissingVerifier, VerificationRequest, VerificationResult, VerificationStatus, Verifier
+from mas.verifier.base import (
+    DeferredVerification,
+    MissingVerifier,
+    VerificationRequest,
+    VerificationResult,
+    VerificationStatus,
+    Verifier,
+)
 
 log = logging.getLogger(__name__)
 
@@ -275,6 +284,8 @@ def tick(
         # REPLANNING: step 13.
 
     if do_verify:
+        if isinstance(verifier, DeferredVerification):
+            return sm.get_run(conn, run_id)  # a verifier service (`mas verify --watch`) will pick this run up
         return _verify(conn, run_id, verifier, workspace)
     return sm.get_run(conn, run_id)
 
@@ -366,21 +377,169 @@ def open_runs(conn: Conn, pools: list[str] | tuple[str, ...] | None = None) -> l
     return [r["id"] for r in rows]
 
 
+TICK_LOCK_NS = 0x4D415354  # 'MAST': per-run advisory lock held for the duration of one tick (cross-process)
+
+
+def _try_tick_lock(conn: Conn, run_id: UUID) -> bool:
+    row = conn.execute("SELECT pg_try_advisory_lock(%s, hashtext(%s)) AS ok", (TICK_LOCK_NS, str(run_id))).fetchone()
+    return bool(row and row["ok"])
+
+
+def _tick_unlock(conn: Conn, run_id: UUID) -> None:
+    try:
+        conn.execute("SELECT pg_advisory_unlock(%s, hashtext(%s))", (TICK_LOCK_NS, str(run_id)))
+    except Exception:
+        log.debug("tick unlock failed", exc_info=True)
+
+
+def _tick_job(
+    database_url: str | None,
+    run_id: UUID,
+    verifier: Verifier | None,
+    workspace: Any | None,
+    planner: Planner | None,
+    capabilities: set[str] | None,
+) -> Run | None:
+    """One tick on its own connection under the per-run tick lock. Returns None if another process holds the run."""
+    conn = connect(database_url)
+    try:
+        if not _try_tick_lock(conn, run_id):
+            return None
+        try:
+            return tick(conn, run_id, verifier=verifier, workspace=workspace, planner=planner, capabilities=capabilities)
+        finally:
+            _tick_unlock(conn, run_id)
+    finally:
+        conn.close()
+
+
+def _service_loop(
+    *,
+    name: str,
+    database_url: str | None,
+    select_runs,
+    job,
+    tick_s: float,
+    stop: threading.Event | None,
+    max_parallel: int,
+) -> None:
+    """Bounded executor: at most `max_parallel` runs in flight, one DB connection per job, never the same run in two
+    local threads (in-flight set) and never the same run in two processes (job takes a per-run advisory lock).
+    A slow job (e.g. a 3-minute acceptance run) never blocks other runs — they proceed on the other executor slots."""
+    stop = stop or threading.Event()
+    in_flight: dict[UUID, Future] = {}
+    scan = connect(database_url)
+    try:
+        with ThreadPoolExecutor(max_workers=max_parallel, thread_name_prefix=name) as ex:
+            while not stop.is_set():
+                for rid, fut in list(in_flight.items()):
+                    if fut.done():
+                        in_flight.pop(rid)
+                        exc = fut.exception()
+                        if exc is not None:
+                            log.error("%s: job for run %s failed: %r", name, rid, exc)
+                try:
+                    candidates = select_runs(scan)
+                except Exception:
+                    log.exception("%s: scan failed", name)
+                    scan.rollback()
+                    candidates = []
+                for rid in candidates:
+                    if rid in in_flight or len(in_flight) >= max_parallel:
+                        continue
+                    in_flight[rid] = ex.submit(job, rid)
+                stop.wait(tick_s)
+            for fut in in_flight.values():  # drain: let running jobs finish (they hold locks and connections)
+                try:
+                    fut.result(timeout=600)
+                except Exception:
+                    log.debug("%s: in-flight job failed during drain", name, exc_info=True)
+    finally:
+        scan.close()
+
+
 def orchestrate_forever(
-    conn: Conn,
+    database_url: str | None,
     *,
     verifier: Verifier | None = None,
     tick_s: float = 0.5,
-    stop=None,
+    stop: threading.Event | None = None,
     pools: list[str] | tuple[str, ...] | None = None,
     workspace: Any | None = None,
+    planner: Planner | None = None,
+    capabilities: set[str] | None = None,
+    max_parallel: int = 4,
 ) -> None:
-    """Service mode (docker compose `orchestrator`): tick every open run in `pools` (None = all) until asked to stop."""
-    while stop is None or not stop.is_set():
-        for rid in open_runs(conn, pools):
-            try:
-                tick(conn, rid, verifier=verifier, workspace=workspace)
-            except Exception:
-                log.exception("tick failed for run %s", rid)
-                conn.rollback()
-        time.sleep(tick_s)
+    """Orchestrator service (docker compose `orchestrator`): tick every open run in `pools` (None = all), concurrently
+    and bounded, until asked to stop. With verifier=DeferredVerification() runs stop at VERIFYING for `mas verify`."""
+    _service_loop(
+        name="orchestrate",
+        database_url=database_url,
+        select_runs=lambda c: open_runs(c, pools),
+        job=lambda rid: _tick_job(database_url, rid, verifier, workspace, planner, capabilities),
+        tick_s=tick_s,
+        stop=stop,
+        max_parallel=max_parallel,
+    )
+
+
+# ----------------------------------------------------------------------------- verifier service
+
+
+def verifying_runs(conn: Conn, pools: list[str] | tuple[str, ...] | None = None) -> list[UUID]:
+    if pools is None:
+        rows = conn.execute("SELECT id FROM runs WHERE status = 'VERIFYING' ORDER BY created_at").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id FROM runs WHERE status = 'VERIFYING' AND pool = ANY(%s) ORDER BY created_at", (list(pools),)
+        ).fetchall()
+    return [r["id"] for r in rows]
+
+
+def _verify_job(database_url: str | None, run_id: UUID, verifier: Verifier, workspace: Any | None) -> Run:
+    conn = connect(database_url)
+    try:
+        return _verify(conn, run_id, verifier, workspace)  # takes the verify advisory lock; re-entrant; DB-free verifier
+    finally:
+        conn.close()
+
+
+def verify_once(
+    conn: Conn,
+    *,
+    verifier: Verifier,
+    workspace: Any | None = None,
+    pools: list[str] | tuple[str, ...] | None = None,
+) -> list[tuple[UUID, RunStatus]]:
+    """Verify every run currently in VERIFYING (in `pools`) once, on this connection. Tests and `mas verify --once`."""
+    out: list[tuple[UUID, RunStatus]] = []
+    for rid in verifying_runs(conn, pools):
+        run = _verify(conn, rid, verifier, workspace)
+        out.append((rid, run.status))
+    return out
+
+
+def verify_forever(
+    database_url: str | None,
+    *,
+    verifier: Verifier,
+    tick_s: float = 0.5,
+    stop: threading.Event | None = None,
+    pools: list[str] | tuple[str, ...] | None = None,
+    workspace: Any | None = None,
+    max_parallel: int = 2,
+) -> None:
+    """Verifier service (`mas verify --watch`): a process WITH sandbox access that claims runs in VERIFYING (left there
+    by orchestrators running with DeferredVerification) and produces real verdicts. Bounded, one connection per job;
+    the verify advisory lock makes it safe to run several of these, and re-entrant after a crash."""
+    if isinstance(verifier, DeferredVerification | MissingVerifier):
+        raise ValueError("the verifier service needs a real verifier")
+    _service_loop(
+        name="verify",
+        database_url=database_url,
+        select_runs=lambda c: verifying_runs(c, pools),
+        job=lambda rid: _verify_job(database_url, rid, verifier, workspace),
+        tick_s=tick_s,
+        stop=stop,
+        max_parallel=max_parallel,
+    )

@@ -3,7 +3,8 @@
 mas migrate                              apply schema migrations
 mas run --dag FILE [--workers N ...]     in-process run: orchestrator + N stub workers (dev/demo)
 mas submit --dag FILE [--wait]           create a run for the orchestrator/worker services to execute
-mas orchestrate --watch | --run ID       orchestrator service (compose) or tick one run to terminal
+mas orchestrate --watch [--verifier external|acceptance|stub] [--parallel N]   orchestrator service (bounded, concurrent)
+mas verify --watch | --once              verifier service: real sandboxed verdicts for runs left in VERIFYING
 mas worker --stub [--capabilities ...]   worker service (compose)
 mas status RUN_ID                        summary + metrics (+ pending questions when AWAITING_INPUT)
 mas answer RUN_ID "text"                 answer the planner's clarifying questions (ADR-006)
@@ -212,22 +213,82 @@ def cmd_submit(args: argparse.Namespace) -> int:
     return 0 if cur.status.value == "PASSED" else 1
 
 
+def _service_verifier(kind: str):
+    """acceptance = real sandboxed verifier (needs Docker); external = leave runs in VERIFYING for `mas verify`;
+    stub = explicit test mode only."""
+    from mas.verifier.base import DeferredVerification
+
+    if kind == "stub":
+        return StubVerifier(passed=True)
+    if kind == "external":
+        return DeferredVerification()
+    return _acceptance_verifier()
+
+
 def cmd_orchestrate(args: argparse.Namespace) -> int:
     conn = connect()
     migrate(conn)
-    verifier = StubVerifier(passed=True) if args.stub_verifier else _acceptance_verifier()
+    kind = "stub" if args.stub_verifier else args.verifier
+    verifier = _service_verifier(kind)
     if args.run:
         final = scheduler.run_until_terminal(conn, UUID(args.run), verifier=verifier, tick_s=args.tick_s)
         print(f"{final.status.value} verdict={final.verdict}")
         return 0 if final.status.value == "PASSED" else 1
     pools = _pools(args.pool)
     ws = _workspace(None)
-    print(f"orchestrator: watching open runs in pools={pools} workspace={ws.name} (Ctrl-C to stop)")
+    conn.close()
+    print(
+        f"orchestrator: watching open runs in pools={pools} workspace={ws.name} verifier={kind} "
+        f"parallel={args.parallel} (Ctrl-C to stop)"
+    )
     stop = threading.Event()
     try:
-        scheduler.orchestrate_forever(conn, verifier=verifier, tick_s=args.tick_s, stop=stop, pools=pools, workspace=ws)
+        scheduler.orchestrate_forever(
+            settings().database_url,
+            verifier=verifier,
+            tick_s=args.tick_s,
+            stop=stop,
+            pools=pools,
+            workspace=ws,
+            max_parallel=args.parallel,
+        )
     except KeyboardInterrupt:
-        pass
+        stop.set()
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Verifier service: claims runs in VERIFYING (left there by `mas orchestrate --verifier external`) and produces
+    real, sandboxed verdicts. Runs where the sandbox runner (Docker) is available — typically the host."""
+    pools = _pools(args.pool)
+    ws = _workspace(None)
+    verifier = StubVerifier(passed=True) if args.stub_verifier else _acceptance_verifier()
+    if args.once:
+        conn = connect()
+        migrate(conn)
+        results = scheduler.verify_once(conn, verifier=verifier, workspace=ws, pools=pools)
+        conn.close()
+        for rid, status in results:
+            print(f"  {rid} -> {status.value}")
+        print(f"verified {len(results)} run(s)")
+        return 0
+    print(
+        f"verifier: watching VERIFYING runs in pools={pools} verifier={getattr(verifier, 'name', '?')} "
+        f"parallel={args.parallel} (Ctrl-C to stop)"
+    )
+    stop = threading.Event()
+    try:
+        scheduler.verify_forever(
+            settings().database_url,
+            verifier=verifier,
+            tick_s=args.tick_s,
+            stop=stop,
+            pools=pools,
+            workspace=ws,
+            max_parallel=args.parallel,
+        )
+    except KeyboardInterrupt:
+        stop.set()
     return 0
 
 
@@ -461,8 +522,25 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--run", default=None)
     o.add_argument("--tick-s", type=float, default=settings().orchestrator_tick_s)
     o.add_argument("--pool", default=None, help="comma-separated pools to serve; '*' = all (default: $MAS_POOL or 'default')")
-    o.add_argument("--stub-verifier", action="store_true", help="explicit test mode only; never use for real verdicts")
+    o.add_argument(
+        "--verifier",
+        default="acceptance",
+        choices=["acceptance", "external", "stub"],
+        help="acceptance = sandboxed verifier in this process (needs Docker); external = leave runs in VERIFYING for "
+        "`mas verify --watch`; stub = explicit test mode only",
+    )
+    o.add_argument("--stub-verifier", action="store_true", help="alias for --verifier stub (explicit test mode only)")
+    o.add_argument("--parallel", type=int, default=4, help="max runs ticked concurrently (bounded executor)")
     o.set_defaults(fn=cmd_orchestrate)
+
+    vf = sub.add_parser("verify", help="verifier service: real sandboxed verdicts for runs left in VERIFYING")
+    vf.add_argument("--watch", action="store_true")
+    vf.add_argument("--once", action="store_true", help="verify all currently VERIFYING runs once and exit")
+    vf.add_argument("--tick-s", type=float, default=settings().orchestrator_tick_s)
+    vf.add_argument("--pool", default=None, help="comma-separated pools to serve; '*' = all (default: $MAS_POOL or 'default')")
+    vf.add_argument("--parallel", type=int, default=2, help="max concurrent verifications (each is a sandbox)")
+    vf.add_argument("--stub-verifier", action="store_true", help="explicit test mode only")
+    vf.set_defaults(fn=cmd_verify)
 
     w = sub.add_parser("worker", help="worker service")
     w.add_argument("--stub", action="store_true")
