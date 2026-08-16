@@ -18,7 +18,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -106,6 +108,7 @@ class Worker:
         pricing: Pricing | None = None,
         attempt_max_calls: int | None = None,
         attempt_max_tokens: int | None = None,
+        exec_backend_factory: Callable[[Path, UUID], Any] | None = None,
     ):
         self.worker_id = worker_id
         self.capabilities = list(capabilities)
@@ -123,6 +126,10 @@ class Worker:
         self.attempt_max_calls = attempt_max_calls if attempt_max_calls is not None else settings().attempt_max_calls
         self.attempt_max_tokens = attempt_max_tokens if attempt_max_tokens is not None else settings().attempt_max_tokens
         self._telemetry_lock = threading.Lock()
+        # confined execution for command tools, one backend per attempt: (worktree, attempt_id) -> ExecutionBackend.
+        # The runtime creates it after the worktree exists and closes it in every exit path, so the sandbox never
+        # outlives the attempt. None = the agent gets no command tools (stub agents; workers without Docker).
+        self.exec_backend_factory = exec_backend_factory
         self.stats = WorkerStats()
         self._conn: Conn | None = None
         self.dead = threading.Event()  # set by die(): simulate a crash — stop everything, report nothing
@@ -225,6 +232,7 @@ class Worker:
         handle: WorkspaceHandle | None = None
         died = False
         metered: MeteredProvider | None = None
+        backend: Any = None
         try:
             inputs = _dependency_outputs(self.conn, claim.task)
             metered = self._metered(claim, cancel=cancel, deadline=deadline)
@@ -234,6 +242,12 @@ class Worker:
                 log.exception("workspace creation failed for %s", claim.task.key)
                 result = AgentResult(success=False, failure_reason=f"workspace: {e}")
             else:
+                if handle is not None and self.exec_backend_factory is not None:
+                    try:
+                        backend = self.exec_backend_factory(handle.path, claim.attempt.id)
+                    except Exception:  # no confined execution → no command tools (fail closed), the attempt still runs
+                        log.exception("execution backend unavailable for %s; command tools disabled", claim.task.key)
+                        backend = None
                 ctx = TaskContext(
                     run=claim.run,
                     task=claim.task,
@@ -245,6 +259,8 @@ class Worker:
                     paths=list((claim.task.context_spec or {}).get("paths", []) or []),
                     conflicts=list(handle.conflicts) if handle else [],
                     model=metered,
+                    deadline=deadline,
+                    exec_backend=backend,
                 )
                 try:
                     result = self.agent.execute(ctx)
@@ -290,6 +306,11 @@ class Worker:
             hb.settled.set()
         finally:
             hb.stop()  # only now — after settlement — does the lease stop being renewed
+            if backend is not None:  # the sandbox dies with the attempt: settlement, failure, cancel or simulated death
+                try:
+                    backend.close()
+                except Exception:
+                    log.warning("execution backend close failed for %s", claim.task.key, exc_info=True)
             if not died:
                 try:
                     self.workspace.cleanup(handle)

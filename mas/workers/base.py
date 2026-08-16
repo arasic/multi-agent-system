@@ -48,9 +48,14 @@ class TaskContext:
         default_factory=list
     )  # context_spec.paths — the only paths the agent should read (tool layer enforces)
     conflicts: list[str] = field(default_factory=list)  # unresolved merge conflicts left by input assembly (agent must resolve)
-    # The model for this attempt: a MeteredProvider (telemetry, pricing, per-attempt call budget) handed over by the
-    # runtime, or None when the worker has no model (stub agents). Agents never build providers themselves.
+    # The model for this attempt: a MeteredProvider (telemetry, pricing, per-attempt call budget, deadline, cancel)
+    # handed over by the runtime, or None when the worker has no model (stub agents). Agents never build providers.
     model: ModelProvider | None = None
+    # Attempt runtime deadline (time.monotonic()); tools and model calls are clamped to it. None = unbounded (tests).
+    deadline: float | None = None
+    # Confined execution for command tools (mas/workers/execution.py), created and closed by the runtime — the
+    # sandbox dies with the attempt (settlement, cancellation, timeout, worker death). None = no command tools.
+    exec_backend: Any = None
 
 
 class Agent(Protocol):

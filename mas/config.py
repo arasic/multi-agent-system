@@ -57,6 +57,8 @@ class Settings:
     # Execution sandbox for command tools (step 10): one hardened container per attempt (mas/workers/execution.py).
     # Default image = the verifier image (python + pytest + sh + coreutils timeout, non-root). Workers without Docker
     # get NO command tools (fail closed) until the execution-runner service exists.
+    exec_backend: str = field(default_factory=lambda: _env("MAS_EXEC_BACKEND", "sandbox"))  # sandbox | none (never local)
+    exec_docker: str = field(default_factory=lambda: _env("MAS_EXEC_DOCKER", "docker"))
     exec_image: str = field(default_factory=lambda: _env("MAS_EXEC_IMAGE", _env("MAS_VERIFIER_IMAGE", "mas-verifier:latest")))
     exec_cpus: float = field(default_factory=lambda: float(_env("MAS_EXEC_CPUS", "1.0")))
     exec_memory_mb: int = field(default_factory=lambda: int(_env("MAS_EXEC_MEMORY_MB", "512")))

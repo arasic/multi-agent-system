@@ -79,6 +79,7 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 .venv/Scripts/mas run --dag ... --ask "Which DB?;Which Python?"  # ADR-006 demo: planner asks first, run waits (on the clock)
 .venv/Scripts/mas answer <run_id> "sqlite; 3.12"                 # ...answer from another terminal; run continues
 .venv/Scripts/mas artifacts <run_id>                             # git_commit shas, <sha>:path documents, verification
+.venv/Scripts/mas run --dag ... --agent llm --model fake:demo    # LLM worker loop (fake provider: no key; real: anthropic:<model> / openai:<model>)
 .venv/Scripts/mas models                                         # configured model roles + pricing status (MAS_MODEL_*, MAS_MODEL_PRICES)
 .venv/Scripts/mas models --ping --spec fake:demo                 # one metered test call (use anthropic:<model> / openai:<model> with a key)
 git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's whole history (one branch per attempt)

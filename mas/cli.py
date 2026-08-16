@@ -1,11 +1,11 @@
 """`mas` command line.
 
 mas migrate                              apply schema migrations
-mas run --dag FILE [--workers N ...]     in-process run: orchestrator + N stub workers (dev/demo)
+mas run --dag FILE [--workers N ...]     in-process run: orchestrator + N workers (--agent stub|llm) (dev/demo)
 mas submit --dag FILE [--wait]           create a run for the orchestrator/worker services to execute
 mas orchestrate --watch [--verifier external|acceptance|stub] [--parallel N]   orchestrator service (bounded, concurrent)
 mas verify --watch | --once              verifier service: real sandboxed verdicts for runs left in VERIFYING
-mas worker --stub [--capabilities ...]   worker service (compose); --model <provider>:<model> attaches a metered model
+mas worker [--agent stub|llm] [--model <provider>:<model>] [--exec-backend sandbox|none]   worker service (compose)
 mas models [--ping]                      configured model roles, pricing status; --ping makes one metered test call
 mas status RUN_ID                        summary + metrics (+ pending questions when AWAITING_INPUT)
 mas answer RUN_ID "text"                 answer the planner's clarifying questions (ADR-006)
@@ -20,11 +20,13 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import socket
 import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from mas import metrics
@@ -104,15 +106,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
 
     stop = threading.Event()
-    agent = StubAgent(default_script={"sleep_s": args.stub_sleep})
-    provider = _worker_provider(None)  # $MAS_MODEL_WORKER; stub agents ignore it, LLM agents (step 10) use ctx.model
+    provider = _worker_provider(args.model)  # $MAS_MODEL_WORKER; stub agents ignore it, the llm agent uses ctx.model
+    agent = _agent(args.agent, stub_sleep=args.stub_sleep, provider=provider)
+    exec_factory = _exec_backend_factory(args.exec_backend) if args.agent == "llm" else None
     ws = _workspace(args.workspace)
     print(
         f"  workspace={ws.name}"
         + (f"  repos={settings().repo_root}  worktrees={settings().worktree_root}" if ws.name == "git" else "")
     )
     workers = [
-        Worker(f"worker-{i + 1}", sorted(caps), agent, poll_s=0.1, run_id=run.id, workspace=ws, provider=provider)
+        Worker(
+            f"worker-{i + 1}",
+            sorted(caps),
+            agent,
+            poll_s=0.1,
+            run_id=run.id,
+            workspace=ws,
+            provider=provider,
+            exec_backend_factory=exec_factory,
+        )
         for i in range(args.workers)
     ]
     threads = [run_worker_thread(w, stop) for w in workers]
@@ -400,10 +412,38 @@ def _worker_provider(spec: str | None):
     return providers.from_spec(spec) if spec else None
 
 
+def _agent(kind: str, *, stub_sleep: float, provider) -> Any:
+    """--agent stub (default; no model needed) | llm (needs a model: bounded tool-call loop, mas/workers/llm.py)."""
+    if kind == "stub":
+        return StubAgent(default_script={"sleep_s": stub_sleep})
+    if kind == "llm":
+        if provider is None:
+            raise SystemExit("--agent llm needs a model: pass --model <provider>:<model> or set MAS_MODEL_WORKER")
+        from mas.workers.llm import LLMAgent
+
+        return LLMAgent()
+    raise SystemExit(f"unknown agent {kind!r}")
+
+
+def _exec_backend_factory(kind: str | None):
+    """MAS_EXEC_BACKEND / --exec-backend: sandbox (default; one hardened container per attempt, needs Docker) | none.
+    Never 'local' — that backend is test-only. Without Docker the sandbox is unavailable → no command tools (fail closed)."""
+    from mas.workers.execution import SandboxExecutionBackend, sandbox_spec_from_settings
+
+    kind = (kind or settings().exec_backend).strip().lower()
+    if kind in ("none", "off", ""):
+        return None
+    if kind != "sandbox":
+        raise SystemExit(f"unknown execution backend {kind!r} (sandbox | none)")
+    if shutil.which(settings().exec_docker or "docker") is None:
+        print("warning: docker not found; command tools disabled for this worker (MAS_EXEC_BACKEND=sandbox)", file=sys.stderr)
+        return None
+    spec = sandbox_spec_from_settings()
+    return lambda worktree, attempt_id: SandboxExecutionBackend(worktree, attempt_id=attempt_id, spec=spec)
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
-    if not args.stub:
-        print("only --stub workers exist until roadmap step 10 (the model layer is in; the LLM agent is next)", file=sys.stderr)
-        return 2
+    kind = "stub" if args.stub and args.agent is None else (args.agent or "stub")
     caps = [c.strip() for c in (args.capabilities or ",".join(settings().worker_capabilities)).split(",") if c.strip()]
     wid = args.id or f"worker-{socket.gethostname()}-{os.getpid()}"
     pools = _pools(args.pool)
@@ -412,14 +452,15 @@ def cmd_worker(args: argparse.Namespace) -> int:
     w = Worker(
         wid,
         caps,
-        StubAgent(default_script={"sleep_s": args.stub_sleep}),
+        _agent(kind, stub_sleep=args.stub_sleep, provider=provider),
         poll_s=settings().worker_poll_s,
         pools=pools,
         workspace=ws,
         provider=provider,
+        exec_backend_factory=_exec_backend_factory(args.exec_backend) if kind == "llm" else None,
     )
     model = f"{provider.name}:{provider.model}" if provider else "none"
-    print(f"{wid}: capabilities={caps} pools={pools} model={model} (Ctrl-C to stop)")
+    print(f"{wid}: agent={kind} capabilities={caps} pools={pools} model={model} (Ctrl-C to stop)")
     stop = threading.Event()
     try:
         w.run_forever(stop)
@@ -541,6 +582,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--max-wallclock-s", type=int, default=300, help="run budget; the run ABORTS with a verdict when exceeded")
     r.add_argument("--max-attempt-runtime-s", type=int, default=120)
     r.add_argument("--stub-sleep", type=float, default=0.5, help="simulated work per attempt (s)")
+    r.add_argument("--agent", default="stub", choices=["stub", "llm"], help="stub (no model) | llm (bounded tool-call loop)")
+    r.add_argument("--model", default=None, help="<provider>:<model> for --agent llm (default: $MAS_MODEL_WORKER)")
+    r.add_argument("--exec-backend", default=None, help="sandbox (default, needs Docker) | none — command tools for llm agents")
     r.add_argument("--chaos-kill-after", type=float, default=None, help="kill a busy worker after N seconds (A5 demo)")
     r.add_argument("--verifier-fail", action="store_true", help="stub verifier returns FAIL")
     r.add_argument(
@@ -610,7 +654,11 @@ def build_parser() -> argparse.ArgumentParser:
     vf.set_defaults(fn=cmd_verify)
 
     w = sub.add_parser("worker", help="worker service")
-    w.add_argument("--stub", action="store_true")
+    w.add_argument("--stub", action="store_true", help="alias for --agent stub")
+    w.add_argument(
+        "--agent", default=None, choices=["stub", "llm"], help="stub (default, no model) | llm (bounded tool-call loop)"
+    )
+    w.add_argument("--exec-backend", default=None, help="sandbox (default, needs Docker) | none — command tools for llm agents")
     w.add_argument(
         "--model",
         default=None,

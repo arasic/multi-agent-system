@@ -266,6 +266,9 @@ class LocalExecutionBackend:
     def close(self) -> None:
         shutil.rmtree(self._home, ignore_errors=True)
 
+    def identity(self) -> dict[str, Any]:
+        return {"backend": self.name, "confined": False, "python": sys.executable}
+
 
 @dataclass(frozen=True)
 class SandboxSpec:
@@ -287,6 +290,7 @@ def sandbox_spec_from_settings(cfg: Any = None) -> SandboxSpec:
 
     c = cfg or settings()
     return SandboxSpec(
+        docker=c.exec_docker,
         image=c.exec_image,
         cpus=c.exec_cpus,
         memory_mb=c.exec_memory_mb,
@@ -312,6 +316,8 @@ class SandboxExecutionBackend:
         self._started = False
         self._lock = threading.Lock()
         self.commands = 0
+        self.image_id: str | None = None  # docker image Id (sha256 of the image config) — pinned identity for the trace
+        self.repo_digest: str | None = None  # registry digest, when the image came from one (local builds: None)
 
     # ------------------------------------------------------------------ container lifecycle
 
@@ -360,6 +366,7 @@ class SandboxExecutionBackend:
                 "none",
                 "--stop-timeout",
                 "1",
+                "--rm",  # a worker that dies leaves nothing behind once the outer sleep ends
                 "-v",
                 f"{self.root}:/work:rw",
                 "-w",
@@ -389,6 +396,30 @@ class SandboxExecutionBackend:
             if cp.returncode != 0:
                 raise ExecutionError(f"cannot start sandbox: {cp.stderr.strip()[:500]}")
             self._started = True
+            if self.image_id is None:
+                self.image_id, self.repo_digest = self._image_identity()
+
+    def _image_identity(self) -> tuple[str | None, str | None]:
+        try:
+            cp = self._docker("image", "inspect", "--format", '{{.Id}}|{{join .RepoDigests ","}}', self.spec.image, timeout=30)
+        except Exception:
+            return None, None
+        if cp.returncode != 0:
+            return None, None
+        image_id, _, digests = cp.stdout.strip().partition("|")
+        first = digests.split(",")[0].strip() if digests.strip() else None
+        return image_id or None, first or None
+
+    def identity(self) -> dict[str, Any]:
+        """What ran the commands — recorded in the attempt's execution trace (a mutable tag alone is not evidence)."""
+        return {
+            "backend": self.name,
+            "image": self.spec.image,
+            "image_id": self.image_id,
+            "repo_digest": self.repo_digest,
+            "container": self.container,
+            "commands": self.commands,
+        }
 
     def _exec(self, inner: list[str], *, timeout_s: float, cancel: threading.Event | None) -> CommandResult:
         self._ensure()
