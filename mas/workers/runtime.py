@@ -26,7 +26,7 @@ from mas.artifacts import store
 from mas.db.connection import Conn, connect
 from mas.models.types import Task
 from mas.orchestrator import leases
-from mas.orchestrator.leases import Claim, StaleAttempt
+from mas.orchestrator.leases import ArtifactSpec, Claim, StaleAttempt
 from mas.workers.base import Agent, AgentResult, ArtifactOut, TaskContext
 from mas.workers.workspace import NullWorkspace, Workspace, WorkspaceError, WorkspaceHandle, since_for
 
@@ -41,6 +41,7 @@ class _Heartbeat(threading.Thread):
         self.lease_s = lease_s
         self.cancel = cancel
         self._stop = threading.Event()
+        self.settled = threading.Event()  # set by the worker right after the report commits
         self.beats = 0
 
     def stop(self) -> None:
@@ -64,7 +65,10 @@ class _Heartbeat(threading.Thread):
                     continue
                 self.beats += 1
                 if not alive:
-                    log.warning("attempt %s no longer RUNNING — signalling cancel", self.attempt_id)
+                    # settled by our own worker a moment ago? then this is expected, not a reap/cancel
+                    if self.settled.is_set() or self._stop.wait(0.2) or self.settled.is_set():
+                        return
+                    log.warning("attempt %s no longer RUNNING (reaped/cancelled) - signalling cancel", self.attempt_id)
                     self.cancel.set()
                     return
         finally:
@@ -170,11 +174,15 @@ class Worker:
         return True
 
     def _process(self, claim: Claim) -> None:
+        """One attempt, end to end. The heartbeat runs until the attempt is SETTLED (report committed) — covering
+        workspace creation, agent execution, git commit, artifact publication and settlement — so a slow publish can
+        never be reaped as ABANDONED. Only a deliberate simulated death stops without reporting."""
         lease_s = self.lease_s if self.lease_s is not None else claim.run.budgets.lease_s
         cancel = threading.Event()
         hb = _Heartbeat(self.database_url, claim.attempt.id, lease_s, cancel)
         hb.start()
         handle: WorkspaceHandle | None = None
+        died = False
         try:
             inputs = _dependency_outputs(self.conn, claim.task)
             try:
@@ -199,61 +207,55 @@ class Worker:
                 except Exception as e:  # agent bug → FAILED attempt, never a hung task
                     log.exception("agent crashed on %s", claim.task.key)
                     result = AgentResult(success=False, failure_reason=f"agent crashed: {e!r}")
+
+            if result.simulate_death or self.dead.is_set():
+                # crash simulation: walk away without reporting. Lease expires → reaper → ABANDONED → task READY.
+                # The worktree is left behind on purpose (a real crash could not clean up); pruned on the next attempt.
+                died = True
+                self.stats.died += 1
+                self.dead.set()
+                log.warning("worker %s simulating death on %s#%s", self.worker_id, claim.task.key, claim.attempt.attempt_number)
+                return
+
+            # commit what the agent left in the worktree; the sha is the git_commit artifact
+            outs = list(result.artifacts)
+            if handle is not None:
+                try:
+                    sha = self.workspace.publish(
+                        handle,
+                        f"{claim.task.key}#{claim.attempt.attempt_number}: {getattr(self.agent, 'name', 'agent')}",
+                        since=since_for(claim.task),
+                    )
+                except WorkspaceError as e:
+                    log.exception("publish failed for %s", claim.task.key)
+                    sha, result = None, AgentResult(success=False, failure_reason=f"workspace publish: {e}", usage=result.usage)
+                outs = _resolve_refs(outs, sha)
+                if sha and not any(a.type == "git_commit" and a.ref == sha for a in outs):
+                    outs.append(
+                        ArtifactOut(
+                            type="git_commit",
+                            ref=sha,
+                            meta={"branch": handle.branch, "base": handle.base_sha, "merged": handle.merged},
+                        )
+                    )
+            result.artifacts = outs
+            self._report(claim, result)  # one transaction: artifacts + contract + settlement
+            hb.settled.set()
         finally:
-            hb.stop()
+            hb.stop()  # only now — after settlement — does the lease stop being renewed
+            if not died:
+                try:
+                    self.workspace.cleanup(handle)
+                except Exception:
+                    log.warning("workspace cleanup failed for %s", claim.task.key, exc_info=True)
 
-        if result.simulate_death or self.dead.is_set():
-            # crash simulation: walk away. Lease expires → reaper → ABANDONED → task READY again.
-            # The worktree is left behind on purpose; ensure_repo() prunes it on the next attempt.
-            self.stats.died += 1
-            self.dead.set()
-            log.warning("worker %s simulating death on %s#%s", self.worker_id, claim.task.key, claim.attempt.attempt_number)
-            return
-
-        # commit what the agent left in the worktree; the sha is the git_commit artifact
-        outs = list(result.artifacts)
-        if handle is not None:
-            try:
-                sha = self.workspace.publish(
-                    handle,
-                    f"{claim.task.key}#{claim.attempt.attempt_number}: {getattr(self.agent, 'name', 'agent')}",
-                    since=since_for(claim.task),
-                )
-            except WorkspaceError as e:
-                log.exception("publish failed for %s", claim.task.key)
-                sha, result = None, AgentResult(success=False, failure_reason=f"workspace publish: {e}", usage=result.usage)
-            outs = _resolve_refs(outs, sha)
-            if sha and not any(a.type == "git_commit" and a.ref == sha for a in outs):
-                outs.append(
-                    ArtifactOut(
-                        type="git_commit",
-                        ref=sha,
-                        meta={"branch": handle.branch, "base": handle.base_sha, "merged": handle.merged},
-                    )
-                )
-        result.artifacts = outs
-
-        self._publish_and_report(claim, result)
-        self.workspace.cleanup(handle)
-
-    def _publish_and_report(self, claim: Claim, result: AgentResult) -> None:
-        conn = self.conn
+    def _report(self, claim: Claim, result: AgentResult) -> None:
         try:
-            with conn.transaction():
-                for a in result.artifacts:
-                    store.publish(
-                        conn,
-                        run_id=claim.run.id,
-                        task_id=claim.task.id,
-                        attempt_id=claim.attempt.id,
-                        type=a.type,
-                        ref=a.ref,
-                        meta=a.meta,
-                    )
             task = leases.report(
-                conn,
+                self.conn,
                 claim.attempt.id,
                 success=result.success,
+                artifacts=[ArtifactSpec(type=a.type, ref=a.ref, meta=dict(a.meta)) for a in result.artifacts],
                 failure_reason=result.failure_reason,
                 usage=result.usage or None,
                 new_work_required=result.new_work_required,

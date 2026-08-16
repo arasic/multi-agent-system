@@ -10,11 +10,12 @@ Rules (numbering follows architecture.md):
   7  task count exceeds max_tasks; per-task max_attempts outside [1, max_attempts_per_task]  ✔
   8  estimated cost exceeds remaining budget – roadmap step 12 (no cost model yet)
   9  amendment rules                         – roadmap step 13
-Extra: duplicate ids, empty DAG, blank capability.
+Extra: duplicate ids, unsafe ids, empty DAG, blank capability.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from graphlib import CycleError, TopologicalSorter
 
@@ -25,6 +26,8 @@ from mas.planner.dag import DagSpec, TaskSpec
 
 AUTO_INTEGRATION_ID = "T_integrate"
 ToolRegistry = dict[str, frozenset[str]]
+# task ids: short, filesystem/ref/URL-safe, planner-controlled → strict (defense in depth even though ids are never paths)
+SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,8 @@ def validate(
         if i in seen:
             errors.append(ValidationError("duplicate", f"duplicate task id {i!r}", i))
         seen.add(i)
+        if not SAFE_TASK_ID.match(i) or ".." in i:
+            errors.append(ValidationError("id", f"unsafe task id {i!r} (allowed: [A-Za-z0-9][A-Za-z0-9_.-]{{0,63}}, no '..')", i))
     idset = set(ids)
 
     for t in tasks:

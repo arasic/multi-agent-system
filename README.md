@@ -154,7 +154,7 @@ docker compose up -d postgres
 .venv/Scripts/mas migrate
 .venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3
 .venv/Scripts/mas replay <run_id>
-.venv/Scripts/python -m pytest -q                                   # 73 tests, no API key; uses its own temp DB
+.venv/Scripts/python -m pytest -q                                   # 80 tests, no API key; uses its own temp DB
 ```
 
 Runs are tagged with a **pool**: `mas run` uses a private `local:<pid>` pool, the compose services serve `default`, so they never take each other's work even on the same database. Tests are isolated too — each pytest process creates and drops its own `mas_test_<pid>` database, so concurrent test runs can't collide.
@@ -171,7 +171,7 @@ docker kill multi-agent-system-worker-2      # the reaper reassigns its task; th
 
 **M1 substrate — mostly done (2026-08-16).** Schema, state machines, deterministic orchestrator on hand-written DAGs, leases/heartbeat/reaper/retry, Compose workers as real processes, immutable artifacts (DB-enforced), verifier stage (stub), clarifying questions + assumptions (ADR-006), tool allow-lists, metrics, replay — all LLM-free and covered by 64 tests.
 
-**Step 6 done (2026-08-16):** one bare git repo per run + one worktree per attempt, inputs assembled by merge, conflicts surfaced (never averaged away), the runtime commits and mints `git_commit` / `<sha>:path` artifacts, integration = the merge commit, `run/<run>/integration` promoted on PASS, `context_spec` enforced (rule 10), worker containers non-root / read-only / no egress / no caps. `mas artifacts <run_id>` shows what a run produced. 73 tests.
+**Step 6 done (2026-08-16):** one bare git repo per run + one worktree per attempt, inputs assembled by merge, conflicts surfaced (never averaged away), the runtime commits and mints `git_commit` / `<sha>:path` artifacts, integration = the merge commit, `run/<run>/integration` promoted on PASS, `context_spec` enforced (rule 10), worker containers non-root / read-only / no egress / no caps. `mas artifacts <run_id>` shows what a run produced. Stabilized after review (heartbeat through settlement, atomic report, one lock order `run → task → attempt`) and gated by `scripts/stress_step6.py` (170 runs, 0 deadlocks). 80 tests.
 
 **Still missing before an LLM goes in:** the fail-closed acceptance runner + first trusted adapters (step 7 / ADR-007), and concurrent run ticking in the orchestrator service. See [docs/roadmap.md](docs/roadmap.md).
 

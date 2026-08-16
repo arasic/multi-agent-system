@@ -100,7 +100,7 @@ def install_dag(
     Raises InvalidDag if validation fails (run is moved to FAILED so it always has a verdict).
     """
     with conn.transaction():
-        run = sm.get_run(conn, run_id)
+        run = sm.lock_run(conn, run_id)  # lock order: run before task inserts
         if run.status is RunStatus.CREATED:
             sm.transition_run(conn, run_id, RunStatus.PLANNING)
         existing = conn.execute("SELECT count(*) AS n FROM tasks WHERE run_id = %s", (run_id,)).fetchone()["n"]  # type: ignore[index]
@@ -215,7 +215,7 @@ def ask_questions(conn: Conn, run_id: UUID, questions: Questions, *, planner: st
     """
     qs = [q.strip() for q in questions.questions if q and q.strip()]
     with conn.transaction():
-        run = sm.get_run(conn, run_id)
+        run = sm.lock_run(conn, run_id)  # lock order: run before artifact/event inserts
         if run.status not in {RunStatus.PLANNING, RunStatus.REPLANNING}:
             raise sm.IllegalTransition("run", run_id, run.status, RunStatus.AWAITING_INPUT)
         if not qs:
@@ -238,7 +238,7 @@ def ask_questions(conn: Conn, run_id: UUID, questions: Questions, *, planner: st
 def answer(conn: Conn, run_id: UUID, text: str, *, by: str = "human") -> Run:
     """Record the human's answer to the pending batch and send the run back to (re)planning."""
     with conn.transaction():
-        run = sm.get_run(conn, run_id)
+        run = sm.lock_run(conn, run_id)
         if run.status is not RunStatus.AWAITING_INPUT:
             raise NotAwaitingInput(f"run {run_id} is {run.status.value}, not AWAITING_INPUT")
         n = run.questions_asked

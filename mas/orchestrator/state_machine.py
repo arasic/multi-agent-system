@@ -9,6 +9,12 @@ THIS IS THE ONLY MODULE THAT WRITES `status` COLUMNS. Every transition:
 Agents never call this directly; the worker runtime reports and the orchestrator transitions.
 Composite operations (settle a failed attempt, abort a run, ...) live at the bottom so that
 callers never have to sequence primitives themselves.
+
+LOCK ORDER (every transaction, no exceptions):  run -> task -> attempt -> inserts (artifacts, events).
+Levels may be skipped, never reversed. Row locks are FOR NO KEY UPDATE, which does not conflict with the
+FOR KEY SHARE locks that inserts referencing these rows take - so a tick holding the run row never blocks a
+worker inserting an event, and no lock cycle can form through foreign keys. Use lock_run/lock_task/lock_attempt
+at the top of a transaction; the transition primitives re-lock (same tx, no-op) and check the transition table.
 """
 
 from __future__ import annotations
@@ -84,6 +90,36 @@ class IllegalTransition(Exception):
         super().__init__(f"illegal {entity} transition {from_status} -> {to_status} ({entity_id})")
 
 
+# --------------------------------------------------------------------------- row locks (lock order: run -> task -> attempt)
+
+
+def lock_run(conn: Conn, run_id: UUID) -> Run:
+    row = conn.execute("SELECT * FROM runs WHERE id = %s FOR NO KEY UPDATE", (run_id,)).fetchone()
+    if row is None:
+        raise LookupError(f"run {run_id} not found")
+    return Run.from_row(row)
+
+
+def lock_task(conn: Conn, task_id: UUID, *, skip_locked: bool = False) -> Task | None:
+    q = "SELECT * FROM tasks WHERE id = %s FOR NO KEY UPDATE" + (" SKIP LOCKED" if skip_locked else "")
+    row = conn.execute(q, (task_id,)).fetchone()
+    if row is None:
+        if skip_locked:
+            return None
+        raise LookupError(f"task {task_id} not found")
+    return Task.from_row(row)
+
+
+def lock_attempt(conn: Conn, attempt_id: UUID, *, skip_locked: bool = False) -> Attempt | None:
+    q = "SELECT * FROM attempts WHERE id = %s FOR NO KEY UPDATE" + (" SKIP LOCKED" if skip_locked else "")
+    row = conn.execute(q, (attempt_id,)).fetchone()
+    if row is None:
+        if skip_locked:
+            return None
+        raise LookupError(f"attempt {attempt_id} not found")
+    return Attempt.from_row(row)
+
+
 def can_run(a: RunStatus, b: RunStatus) -> bool:
     return b in RUN_TRANSITIONS[a]
 
@@ -111,7 +147,7 @@ def transition_run(
     verdict: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> Run:
-    row = conn.execute("SELECT * FROM runs WHERE id = %s FOR UPDATE", (run_id,)).fetchone()
+    row = conn.execute("SELECT * FROM runs WHERE id = %s FOR NO KEY UPDATE", (run_id,)).fetchone()
     if row is None:
         raise LookupError(f"run {run_id} not found")
     cur = RunStatus(row["status"])
@@ -141,7 +177,7 @@ def transition_task(
     worker_id: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> Task:
-    row = conn.execute("SELECT * FROM tasks WHERE id = %s FOR UPDATE", (task_id,)).fetchone()
+    row = conn.execute("SELECT * FROM tasks WHERE id = %s FOR NO KEY UPDATE", (task_id,)).fetchone()
     if row is None:
         raise LookupError(f"task {task_id} not found")
     cur = TaskStatus(row["status"])
@@ -172,7 +208,7 @@ def transition_attempt(
     row = conn.execute(
         """
         SELECT a.*, t.run_id, t.key FROM attempts a JOIN tasks t ON t.id = a.task_id
-        WHERE a.id = %s FOR UPDATE OF a
+        WHERE a.id = %s FOR NO KEY UPDATE OF a
         """,
         (attempt_id,),
     ).fetchone()
@@ -217,7 +253,7 @@ def transition_artifact(
     superseded_by: UUID | None = None,
     payload: dict[str, Any] | None = None,
 ) -> Artifact:
-    row = conn.execute("SELECT * FROM artifacts WHERE id = %s FOR UPDATE", (artifact_id,)).fetchone()
+    row = conn.execute("SELECT * FROM artifacts WHERE id = %s FOR NO KEY UPDATE", (artifact_id,)).fetchone()
     if row is None:
         raise LookupError(f"artifact {artifact_id} not found")
     cur = ArtifactStatus(row["status"])
@@ -253,6 +289,10 @@ def transition_artifact(
 
 def complete_attempt(conn: Conn, attempt_id: UUID, *, usage: dict[str, Any] | None = None) -> Task:
     """attempt → SUCCESS, task → COMPLETED. Caller has already checked the output contract."""
+    att0 = conn.execute("SELECT task_id FROM attempts WHERE id = %s", (attempt_id,)).fetchone()
+    if att0 is None:
+        raise LookupError(f"attempt {attempt_id} not found")
+    lock_task(conn, att0["task_id"])  # lock order: task before attempt
     if usage:
         _record_usage(conn, attempt_id, usage)
     att = transition_attempt(conn, attempt_id, AttemptStatus.SUCCESS)
@@ -273,11 +313,15 @@ def settle_failed_attempt(
     """
     if status not in {AttemptStatus.FAILED, AttemptStatus.TIMEOUT, AttemptStatus.ABANDONED, AttemptStatus.CANCELLED}:
         raise ValueError(f"not a failure status: {status}")
+    # lock order: task before attempt (callers already holding the run lock are fine)
+    att0 = conn.execute("SELECT task_id FROM attempts WHERE id = %s", (attempt_id,)).fetchone()
+    if att0 is None:
+        raise LookupError(f"attempt {attempt_id} not found")
+    task_row = conn.execute("SELECT * FROM tasks WHERE id = %s FOR NO KEY UPDATE", (att0["task_id"],)).fetchone()
+    assert task_row is not None
     if usage:
         _record_usage(conn, attempt_id, usage)
     att = transition_attempt(conn, attempt_id, status, failure_reason=reason)
-    task_row = conn.execute("SELECT * FROM tasks WHERE id = %s FOR UPDATE", (att.task_id,)).fetchone()
-    assert task_row is not None
     if TaskStatus(task_row["status"]) is not TaskStatus.RUNNING:
         # e.g. task was CANCELLED while the attempt was live — nothing more to settle
         return Task.from_row(task_row)
@@ -328,19 +372,20 @@ def _record_usage(conn: Conn, attempt_id: UUID, usage: dict[str, Any]) -> None:
 
 
 def _cancel_live_work(conn: Conn, run_id: UUID, reason: str) -> None:
+    """Caller holds the run lock. Lock order inside: tasks, then attempts."""
+    open_tasks = conn.execute(
+        "SELECT id FROM tasks WHERE run_id = %s AND status <> ALL(%s) ORDER BY created_at, key FOR NO KEY UPDATE",
+        (run_id, [s.value for s in TASK_TERMINAL]),
+    ).fetchall()
     live = conn.execute(
         """
         SELECT a.id FROM attempts a JOIN tasks t ON t.id = a.task_id
-        WHERE t.run_id = %s AND a.status = 'RUNNING' FOR UPDATE OF a
+        WHERE t.run_id = %s AND a.status = 'RUNNING' ORDER BY a.started_at FOR NO KEY UPDATE OF a
         """,
         (run_id,),
     ).fetchall()
     for r in live:
         transition_attempt(conn, r["id"], AttemptStatus.CANCELLED, failure_reason=reason)
-    open_tasks = conn.execute(
-        "SELECT id FROM tasks WHERE run_id = %s AND status <> ALL(%s) FOR UPDATE",
-        (run_id, [s.value for s in TASK_TERMINAL]),
-    ).fetchall()
     for r in open_tasks:
         transition_task(conn, r["id"], TaskStatus.CANCELLED, payload={"reason": reason})
 
@@ -418,6 +463,9 @@ __all__ = [
     "get_attempt",
     "get_run",
     "get_task",
+    "lock_attempt",
+    "lock_run",
+    "lock_task",
     "pass_run",
     "settle_failed_attempt",
     "tasks_for_run",

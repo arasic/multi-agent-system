@@ -66,7 +66,7 @@ def test_repo_and_worktree_lifecycle(conn, gws):
     assert gws.ensure_repo(run.id) == repo and gws.base_sha(run.id) == base  # idempotent
     att = Attempt(id=t1.id, task_id=t1.id, attempt_number=1, status=AttemptStatus.RUNNING)  # any uuid works for the path
     h = gws.create(run, t1, att, inputs=[])
-    assert h.path.exists() and h.start_sha == base and h.branch.endswith("/T1/1")
+    assert h.path.exists() and h.start_sha == base and h.branch.endswith(f"/{t1.id}/1") and h.meta["task_key"] == "T1"
     (h.path / "docs").mkdir()
     (h.path / "docs" / "design.md").write_text("hello", encoding="utf-8")
     assert gws.publish(h, "nothing yet", since="start") is not None  # something was written → a commit
@@ -242,3 +242,141 @@ def test_handle_dataclass_defaults():
 
 def _unused(run: Run, task: Task):  # keep imports honest for type checkers
     return run, task
+
+
+# ----------------------------------------------------------------------------- stabilization (M1 follow-up)
+
+
+def test_two_root_tasks_initialize_the_same_repo_concurrently(conn, gws):
+    """Race: two workers create worktrees for two independent root tasks of a brand-new run at the same time.
+    Both must succeed, one repo must exist, both must start from the same base."""
+    import concurrent.futures as cf
+
+    d = DagSpec.from_dict(
+        {
+            "tasks": [
+                {
+                    "id": "A",
+                    "capability": "implementation",
+                    "goal": "",
+                    "depends_on": [],
+                    "output_contract": {"artifacts": ["git_commit"]},
+                },
+                {
+                    "id": "B",
+                    "capability": "implementation",
+                    "goal": "",
+                    "depends_on": [],
+                    "output_contract": {"artifacts": ["git_commit"]},
+                },
+                {
+                    "id": "I",
+                    "capability": "integration",
+                    "goal": "",
+                    "depends_on": ["A", "B"],
+                    "output_contract": {"artifacts": ["git_commit"]},
+                },
+            ]
+        }
+    )
+    for _ in range(3):  # repeat with fresh runs: the race window is small
+        run = runs_mod.create_run_from_dag(conn, d, budgets=default_budgets(), capabilities=set(CAPS))
+        tasks = {t.key: t for t in sm.tasks_for_run(conn, run.id)}
+
+        def make(key, run=run, tasks=tasks):
+            t = tasks[key]
+            att = Attempt(id=t.id, task_id=t.id, attempt_number=1, status=AttemptStatus.RUNNING)
+            h = gws.create(run, t, att, inputs=[])
+            (h.path / f"{key}.txt").write_text(key, encoding="utf-8")
+            sha = gws.publish(h, key)
+            gws.cleanup(h)
+            return h.base_sha, sha
+
+        with cf.ThreadPoolExecutor(2) as ex:
+            (base_a, sha_a), (base_b, sha_b) = list(ex.map(make, ["A", "B"]))
+        assert base_a == base_b == gws.base_sha(run.id)
+        assert sha_a and sha_b and sha_a != sha_b
+        assert not list(gws.repo_root.glob(f"{run.id}.init-*"))  # no leftover temp init dirs
+
+
+def test_unsafe_task_ids_are_rejected():
+    for bad in ["../x", "a/b", "a b", "", ".hidden", "x" * 65, "T1;rm", "a..b"]:
+        d = diamond()
+        d.tasks[1].id = bad
+        d.tasks[4].depends_on = [x if x != "T2" else bad for x in d.tasks[4].depends_on]
+        r = validate(d)
+        assert any(e.rule == "id" for e in r.errors), bad
+    d = diamond()
+    d.tasks[1].id = "task_2.v1-final"
+    d.tasks[4].depends_on = [x if x != "T2" else "task_2.v1-final" for x in d.tasks[4].depends_on]
+    assert not any(e.rule == "id" for e in validate(d).errors)
+
+
+def test_slow_publish_is_not_reaped(conn, gws):
+    """Heartbeat must run through settlement: a workspace whose publish() sleeps longer than the lease
+    must still complete SUCCESS (no ABANDONED, no stale report)."""
+    import time as _time
+
+    class SlowPublish(GitWorkspace):
+        def publish(self, handle, message, *, since="start"):
+            _time.sleep(2.6)  # > 2 leases of 1 s
+            return super().publish(handle, message, since=since)
+
+    slow = SlowPublish(gws.repo_root, gws.worktree_root)
+    d = DagSpec.from_dict(
+        {
+            "tasks": [
+                {
+                    "id": "A",
+                    "capability": "implementation",
+                    "goal": "",
+                    "depends_on": [],
+                    "output_contract": {"artifacts": ["git_commit"]},
+                },
+                {
+                    "id": "I",
+                    "capability": "integration",
+                    "goal": "",
+                    "depends_on": ["A"],
+                    "output_contract": {"artifacts": ["git_commit"]},
+                },
+            ]
+        }
+    )
+    run = runs_mod.create_run_from_dag(conn, d, budgets=default_budgets(lease_s=1), capabilities=set(CAPS))
+    stop = threading.Event()
+    w = Worker(
+        "w-slow", list(CAPS), StubAgent({"sleep_s": 0.05}), database_url=DB_URL, poll_s=0.05, run_id=run.id, workspace=slow
+    )
+    t = run_worker_thread(w, stop)
+    try:
+        final = scheduler.run_until_terminal(conn, run.id, verifier=StubVerifier(True), workspace=slow, tick_s=0.1, timeout_s=60)
+    finally:
+        stop.set()
+        wait_all([t], 10)
+    assert final.status is RunStatus.PASSED
+    atts = sm.attempts_for_run(conn, run.id)
+    assert [a.status for a in atts] == [AttemptStatus.SUCCESS, AttemptStatus.SUCCESS]
+    assert w.stats.stale == 0 and w.stats.completed == 2
+
+
+def test_report_is_atomic_stale_publishes_nothing(conn):
+    """If the attempt was reaped before the report lands, the report publishes NO artifacts and settles nothing."""
+    from mas.orchestrator import leases
+
+    run = runs_mod.create_run_from_dag(conn, diamond(), budgets=default_budgets(lease_s=1), capabilities=set(CAPS))
+    scheduler.tick(conn, run.id)
+    c = leases.claim_task(conn, worker_id="w", capabilities=list(CAPS), lease_s=1)
+    assert c is not None
+    with conn.transaction():
+        conn.execute("UPDATE attempts SET lease_until = now() - interval '5 seconds' WHERE id = %s", (c.attempt.id,))
+    assert leases.reap_expired(conn, run.id) == [(c.attempt.id, AttemptStatus.ABANDONED)]
+    with pytest.raises(leases.StaleAttempt):
+        leases.report(
+            conn,
+            c.attempt.id,
+            success=True,
+            artifacts=[leases.ArtifactSpec(type="document", ref="stub:late", meta={"name": "design.md"})],
+        )
+    assert store.for_attempt(conn, c.attempt.id) == []  # nothing leaked from the aborted transaction
+    assert sm.get_attempt(conn, c.attempt.id).status is AttemptStatus.ABANDONED

@@ -247,6 +247,10 @@ Content never changes. Artifacts from `FAILED/TIMEOUT/ABANDONED` attempts remain
 
 ## 5. Task leasing and failure recovery
 
+**Lock order (every transaction): `run → task → attempt → inserts (artifacts, events)`.** Levels may be skipped, never reversed. Row locks are `FOR NO KEY UPDATE`, which does not conflict with the `FOR KEY SHARE` locks that inserts referencing those rows take — so an orchestrator holding the run row never blocks a worker inserting an event, and no lock cycle can form through foreign keys. Claiming scans unlocked, then per candidate: lock run → check RUNNING + `max_concurrency` → lock task (`SKIP LOCKED`) → claim. The reaper scans unlocked, then per attempt: lock task → lock attempt (`SKIP LOCKED`) → re-check expiry → settle. Reporting is **one transaction**: lock run → task → attempt, verify still `RUNNING` (else `StaleAttempt`, nothing published), publish artifacts, check the output contract, settle. Nothing can be reaped between "artifacts published" and "attempt settled" because they are the same commit.
+
+**The heartbeat runs until the attempt is settled** — through workspace creation, agent execution, git commit, artifact publication and the report commit. A slow publish can never be reaped as ABANDONED. Only a deliberate simulated death stops without reporting.
+
 Worker loop:
 
 ```

@@ -48,7 +48,7 @@ def _promote_ready(conn: Conn, run_id: UUID) -> list[str]:
               SELECT 1 FROM task_dependencies d JOIN tasks u ON u.id = d.depends_on_task_id
               WHERE d.task_id = t.id AND u.status <> 'COMPLETED')
         ORDER BY t.created_at, t.key
-        FOR UPDATE OF t SKIP LOCKED
+        FOR NO KEY UPDATE OF t SKIP LOCKED
         """,
         (run_id,),
     ).fetchall()
@@ -65,7 +65,7 @@ def _block_unreachable(conn: Conn, run_id: UUID) -> list[str]:
           AND EXISTS (
               SELECT 1 FROM task_dependencies d JOIN tasks u ON u.id = d.depends_on_task_id
               WHERE d.task_id = t.id AND u.status = ANY(%s))
-        FOR UPDATE OF t SKIP LOCKED
+        FOR NO KEY UPDATE OF t SKIP LOCKED
         """,
         (run_id, [s.value for s in TASK_UPSTREAM_BLOCKING]),
     ).fetchall()
@@ -129,6 +129,9 @@ def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None 
         else:
             result_passed, report = result.passed, dict(result.report)
         with conn.transaction():
+            locked = sm.lock_run(conn, run_id)  # lock order: run first, then artifact rows / inserts
+            if locked.status is not RunStatus.VERIFYING:
+                return locked
             n = conn.execute(
                 "SELECT count(*) AS n FROM artifacts WHERE run_id = %s AND type = 'verification'", (run_id,)
             ).fetchone()["n"]  # type: ignore[index]
@@ -193,7 +196,7 @@ def tick(
 
     do_verify = False
     with conn.transaction():
-        row = conn.execute("SELECT * FROM runs WHERE id = %s FOR UPDATE", (run_id,)).fetchone()
+        row = conn.execute("SELECT * FROM runs WHERE id = %s FOR NO KEY UPDATE", (run_id,)).fetchone()
         if row is None:
             raise LookupError(f"run {run_id} not found")
         run = Run.from_row(row)

@@ -2,7 +2,8 @@
 
 GitWorkspace
     repos/<run_id>.git                        one shared bare repository per run (volume shared by all workers)
-    worktrees/<run_id>/<task>-<attempt>/      one git worktree per attempt, branch run/<run>/<task>/<attempt>
+    worktrees/<run_id>/<task_uuid>-<attempt>/ one git worktree per attempt, branch run/<run>/<task_uuid>/<attempt>
+    (task UUIDs, never planner-controlled keys, in any path or ref)
 
     create()   worktree from the run's base commit, then *input assembly*: the dependency tasks' git_commit outputs
                are merged in (sequentially, --no-ff) so the worktree contains what the task depends on. A merge
@@ -26,6 +27,7 @@ import logging
 import os
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -93,7 +95,10 @@ def _git(
     e = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"}
     if env:
         e.update(env)
-    p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=e)
+    try:
+        p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=e)
+    except OSError as ex:  # git missing, bad cwd, permission problems — always a WorkspaceError to callers
+        raise WorkspaceError(f"git {' '.join(args)} could not run: {ex}") from ex
     if check and p.returncode != 0:
         raise WorkspaceError(f"git {' '.join(args)} failed ({p.returncode}): {p.stderr.strip() or p.stdout.strip()}")
     return p
@@ -121,8 +126,11 @@ class GitWorkspace:
         """Idempotent, race-safe: bare repo with a deterministic base commit on `main` (or fetched from base_ref)."""
         repo = self.repo_path(run_id)
         if not (repo / "HEAD").exists():
-            repo.parent.mkdir(parents=True, exist_ok=True)
-            tmp = repo.with_suffix(f".init-{os.getpid()}")
+            try:
+                repo.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as ex:
+                raise WorkspaceError(f"cannot create repo root {repo.parent}: {ex}") from ex
+            tmp = repo.with_suffix(f".init-{uuid.uuid4().hex}")  # never PID: every container may be PID 1
             try:
                 _git("init", "--bare", "-q", "--initial-branch=main", str(tmp))
                 _git("config", "gc.auto", "0", cwd=tmp)
@@ -159,26 +167,30 @@ class GitWorkspace:
 
     # ------------------------------------------------------------------ per attempt
 
-    def worktree_path(self, run_id: UUID, task_key: str, attempt_number: int) -> Path:
-        return self.worktree_root / str(run_id) / f"{task_key}-{attempt_number}"
+    def worktree_path(self, run_id: UUID, task_id: UUID, attempt_number: int) -> Path:
+        # task UUID, never the planner-controlled task key (no path traversal, no odd characters)
+        return self.worktree_root / str(run_id) / f"{task_id}-{attempt_number}"
 
     @staticmethod
-    def branch_name(run_id: UUID, task_key: str, attempt_number: int) -> str:
-        return f"run/{run_id}/{task_key}/{attempt_number}"
+    def branch_name(run_id: UUID, task_id: UUID, attempt_number: int) -> str:
+        return f"run/{run_id}/{task_id}/{attempt_number}"
 
     def create(self, run: Run, task: Task, attempt: Attempt, inputs: list[Artifact]) -> WorkspaceHandle:
-        repo = self.ensure_repo(run.id, run.base_ref)
-        base = self.base_sha(run.id)
-        path = self.worktree_path(run.id, task.key, attempt.attempt_number)
-        branch = self.branch_name(run.id, task.key, attempt.attempt_number)
-        if path.exists():  # a previous incarnation of this attempt (should not happen); start clean
-            _git("worktree", "remove", "--force", str(path), cwd=repo, check=False)
-            shutil.rmtree(path, ignore_errors=True)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            repo = self.ensure_repo(run.id, run.base_ref)
+            base = self.base_sha(run.id)
+            path = self.worktree_path(run.id, task.id, attempt.attempt_number)
+            branch = self.branch_name(run.id, task.id, attempt.attempt_number)
+            if path.exists():  # a previous incarnation of this attempt (dead worker); start clean
+                _git("worktree", "remove", "--force", str(path), cwd=repo, check=False)
+                shutil.rmtree(path, ignore_errors=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            raise WorkspaceError(f"cannot prepare workspace: {ex}") from ex
         # branch may exist if a dead worker created it before dying; reset it to base
         _git("branch", "-f", branch, base, cwd=repo, check=False)
         _git("worktree", "add", "-q", "-f", str(path), branch, cwd=repo)
-        handle = WorkspaceHandle(path=path, repo=repo, branch=branch, base_sha=base, start_sha=base)
+        handle = WorkspaceHandle(path=path, repo=repo, branch=branch, base_sha=base, start_sha=base, meta={"task_key": task.key})
         # input assembly: merge dependency git_commit outputs, in order; leave conflicts for the agent
         shas: list[str] = []
         for a in inputs:
@@ -220,7 +232,10 @@ class GitWorkspace:
     def cleanup(self, handle: WorkspaceHandle | None) -> None:
         if handle is None or self.keep_worktrees:
             return
-        _git("worktree", "remove", "--force", str(handle.path), cwd=handle.repo, check=False)
+        try:
+            _git("worktree", "remove", "--force", str(handle.path), cwd=handle.repo, check=False)
+        except WorkspaceError:
+            log.debug("worktree remove failed; falling back to rmtree", exc_info=True)
         shutil.rmtree(handle.path, ignore_errors=True)
 
     # ------------------------------------------------------------------ run-level
