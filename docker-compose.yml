@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mas
+      POSTGRES_PASSWORD: mas
+      POSTGRES_DB: mas
+    ports:
+      - "${MAS_PG_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mas -d mas"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # Deterministic control plane. Ticks every non-terminal run: readiness, reaper, budgets, verifier stage.
+  orchestrator:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MAS_DATABASE_URL: postgresql://mas:mas@postgres:5432/mas
+    command: ["mas", "orchestrate", "--watch"]
+
+  # Disposable workers. Scale with: docker compose up -d --scale worker=3
+  # Stub agents until roadmap step 10 (LLM worker).
+  worker:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MAS_DATABASE_URL: postgresql://mas:mas@postgres:5432/mas
+      MAS_WORKER_CAPABILITIES: architecture,implementation,testing,integration,solve
+    command: ["mas", "worker", "--stub", "--stub-sleep", "${MAS_STUB_SLEEP:-0.5}"]
+
+volumes:
+  pgdata:

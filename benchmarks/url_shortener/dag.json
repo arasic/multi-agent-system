@@ -1,0 +1,54 @@
+{
+  "goal": "Build a working URL-shortener service with persistent storage, HTTP API, tests, Dockerfile and documentation. Stop only when the acceptance suite passes.",
+  "benchmark": "url_shortener",
+  "tasks": [
+    {
+      "id": "T1",
+      "capability": "architecture",
+      "goal": "Decide storage, module layout and the HTTP API contract; write design.md",
+      "depends_on": [],
+      "output_contract": {"artifacts": ["document:design.md"]},
+      "context_spec": {"paths": ["spec/**"]}
+    },
+    {
+      "id": "T2",
+      "capability": "architecture",
+      "goal": "Write the OpenAPI/HTTP contract for shorten/resolve/stats endpoints",
+      "depends_on": ["T1"],
+      "output_contract": {"artifacts": ["document:api.md"]},
+      "context_spec": {"artifacts_from": ["T1"]}
+    },
+    {
+      "id": "T3",
+      "capability": "implementation",
+      "goal": "Implement the HTTP API against the contract",
+      "depends_on": ["T2"],
+      "output_contract": {"artifacts": ["git_commit"]},
+      "context_spec": {"artifacts_from": ["T1", "T2"]}
+    },
+    {
+      "id": "T4",
+      "capability": "implementation",
+      "goal": "Implement the persistent storage layer",
+      "depends_on": ["T2"],
+      "output_contract": {"artifacts": ["git_commit"]},
+      "context_spec": {"artifacts_from": ["T1", "T2"]}
+    },
+    {
+      "id": "T5",
+      "capability": "testing",
+      "goal": "Write the service's own test suite (advisory; the external acceptance suite decides)",
+      "depends_on": ["T2"],
+      "output_contract": {"artifacts": ["git_commit"]},
+      "context_spec": {"artifacts_from": ["T2"]}
+    },
+    {
+      "id": "T6",
+      "capability": "integration",
+      "goal": "Merge API, storage and tests; add Dockerfile and README; produce the integration commit",
+      "depends_on": ["T3", "T4", "T5"],
+      "output_contract": {"artifacts": ["git_commit"]},
+      "context_spec": {"artifacts_from": ["T3", "T4", "T5"]}
+    }
+  ]
+}
