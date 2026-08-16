@@ -29,6 +29,12 @@ class Settings:
     repo_root: str = field(default_factory=lambda: _env("MAS_REPO_ROOT", ".mas/repos"))
     worktree_root: str = field(default_factory=lambda: _env("MAS_WORKTREE_ROOT", ".mas/worktrees"))
     keep_worktrees: bool = field(default_factory=lambda: _env("MAS_KEEP_WORKTREES", "0") in {"1", "true", "yes"})
+    acceptance_root: str = field(default_factory=lambda: _env("MAS_ACCEPTANCE_ROOT", "acceptance"))
+    verifier_image: str = field(default_factory=lambda: _env("MAS_VERIFIER_IMAGE", "mas-verifier:latest"))
+    verifier_timeout_s: int = field(default_factory=lambda: int(_env("MAS_VERIFIER_TIMEOUT_S", "30")))
+    verifier_cpus: float = field(default_factory=lambda: float(_env("MAS_VERIFIER_CPUS", "1.0")))
+    verifier_memory_mb: int = field(default_factory=lambda: int(_env("MAS_VERIFIER_MEMORY_MB", "256")))
+    verifier_pids: int = field(default_factory=lambda: int(_env("MAS_VERIFIER_PIDS", "128")))
 
 
 def settings() -> Settings:

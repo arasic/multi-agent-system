@@ -313,7 +313,7 @@ def test_verifier_crash_is_a_fail_not_a_hang(conn):
     class Boom:
         name = "boom"
 
-        def verify(self, conn, run):
+        def verify(self, request):
             raise RuntimeError("kaboom")
 
     out = execute(conn, diamond(), workers=2, stub_sleep=0.05, verifier=Boom())

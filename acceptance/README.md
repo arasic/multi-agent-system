@@ -1,10 +1,16 @@
-# acceptance/
+# Fixed acceptance suites
 
-Fixed external acceptance suites, one directory per benchmark (`acceptance/<benchmark>/`).
+This directory is trusted verifier input, never agent output. Each benchmark has a
+`suite.json` manifest and a deterministic runner. The directory is hashed before every
+verification and mounted read-only in the sandbox. Workers must never receive write
+access to it.
 
-Rules (ADR-003):
-- Written by humans **before** a run. Never generated, moved, or modified by agents.
-- Mounted **read-only** into every worker. Only `mas/verifier/` executes them.
-- The verdict comes from here and nowhere else.
+Build the small, dependency-free sandbox image once:
 
-Populated at roadmap step 7 (`url_shortener/`, later `adapters/`).
+```sh
+docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
+```
+
+The URL-shortener contract is intentionally narrow for the first PoC: the integration
+commit must contain a root `app.py` accepting `--port` and `--db`. It must implement the
+health, shorten, resolve and stats behaviours exercised by the fixed suite.

@@ -11,7 +11,9 @@ DAG = "benchmarks/url_shortener/dag.json"
 
 def test_migrate_and_run_and_status_and_replay(conn, capsys):
     assert main(["migrate"]) == 0
-    rc = main(["run", "--dag", DAG, "--workers", "3", "--stub-sleep", "0.05", "--lease-s", "2"])
+    rc = main(
+        ["run", "--dag", DAG, "--workers", "3", "--stub-sleep", "0.05", "--lease-s", "2", "--stub-verifier"]
+    )
     out = capsys.readouterr().out
     assert rc == 0, out
     assert "PASSED  verdict=PASS" in out
@@ -27,7 +29,22 @@ def test_migrate_and_run_and_status_and_replay(conn, capsys):
 
 
 def test_run_with_chaos_kill_recovers(conn, capsys):
-    rc = main(["run", "--dag", DAG, "--workers", "3", "--stub-sleep", "0.8", "--lease-s", "1", "--chaos-kill-after", "0.3"])
+    rc = main(
+        [
+            "run",
+            "--dag",
+            DAG,
+            "--workers",
+            "3",
+            "--stub-sleep",
+            "0.8",
+            "--lease-s",
+            "1",
+            "--chaos-kill-after",
+            "0.3",
+            "--stub-verifier",
+        ]
+    )
     out = capsys.readouterr().out
     assert rc == 0, out
     assert "[chaos] killed worker-" in out and "while on T" in out  # a busy worker was killed

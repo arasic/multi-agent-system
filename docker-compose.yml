@@ -34,7 +34,9 @@ services:
     environment:
       MAS_DATABASE_URL: postgresql://mas:mas@postgres:5432/mas
       MAS_POOL: ${MAS_POOL:-default}
-    command: ["mas", "orchestrate", "--watch"]
+    # This Compose profile is the LLM-free substrate demo: stub workers require an explicit stub verifier.
+    # Real verification is run by a host orchestrator with Docker access; never mount docker.sock here.
+    command: ["mas", "orchestrate", "--watch", "--stub-verifier"]
     volumes:
       - masdata:/data
     networks: [backend]

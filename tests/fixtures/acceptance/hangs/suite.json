@@ -1,0 +1,6 @@
+{
+  "protocol_version": 1,
+  "command": ["python", "/acceptance/run.py"],
+  "expected_checks": ["never_finishes"],
+  "timeout_s": 2
+}

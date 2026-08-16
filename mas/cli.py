@@ -32,6 +32,7 @@ from mas.orchestrator import runs as runs_mod
 from mas.orchestrator import scheduler
 from mas.planner.dag import DagSpec
 from mas.planner.planner import StubPlanner
+from mas.verifier.acceptance import AcceptanceVerifier, SandboxLimits
 from mas.verifier.stub import StubVerifier
 from mas.workers.runtime import Worker, run_worker_thread
 from mas.workers.stub import StubAgent
@@ -128,7 +129,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         threading.Thread(target=_chaos, daemon=True).start()
 
-    verifier = StubVerifier(passed=not args.verifier_fail)
+    verifier = (
+        StubVerifier(passed=not args.verifier_fail)
+        if args.stub_verifier or args.verifier_fail
+        else _acceptance_verifier()
+    )
     timeout = args.timeout if args.timeout is not None else args.max_wallclock_s + 60
     t0 = time.monotonic()
     try:
@@ -212,7 +217,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 def cmd_orchestrate(args: argparse.Namespace) -> int:
     conn = connect()
     migrate(conn)
-    verifier = StubVerifier(passed=True)
+    verifier = StubVerifier(passed=True) if args.stub_verifier else _acceptance_verifier()
     if args.run:
         final = scheduler.run_until_terminal(conn, UUID(args.run), verifier=verifier, tick_s=args.tick_s)
         print(f"{final.status.value} verdict={final.verdict}")
@@ -226,6 +231,20 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     return 0
+
+
+def _acceptance_verifier() -> AcceptanceVerifier:
+    s = settings()
+    return AcceptanceVerifier(
+        s.acceptance_root,
+        image=s.verifier_image,
+        limits=SandboxLimits(
+            timeout_s=s.verifier_timeout_s,
+            cpus=s.verifier_cpus,
+            memory_mb=s.verifier_memory_mb,
+            pids=s.verifier_pids,
+        ),
+    )
 
 
 def _workspace(arg: str | None):
@@ -369,6 +388,11 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--stub-sleep", type=float, default=0.5, help="simulated work per attempt (s)")
     r.add_argument("--chaos-kill-after", type=float, default=None, help="kill a busy worker after N seconds (A5 demo)")
     r.add_argument("--verifier-fail", action="store_true", help="stub verifier returns FAIL")
+    r.add_argument(
+        "--stub-verifier",
+        action="store_true",
+        help="explicit test mode: use the passing stub instead of the fixed acceptance suite",
+    )
     r.add_argument("--timeout", type=float, default=None, help="client-side guard; default max_wallclock_s + 60")
     r.add_argument(
         "--ask", default=None, help="ADR-006 demo: planner asks these ';'-separated questions first; answer via `mas answer`"
@@ -406,6 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--run", default=None)
     o.add_argument("--tick-s", type=float, default=settings().orchestrator_tick_s)
     o.add_argument("--pool", default=None, help="comma-separated pools to serve; '*' = all (default: $MAS_POOL or 'default')")
+    o.add_argument("--stub-verifier", action="store_true", help="explicit test mode only; never use for real verdicts")
     o.set_defaults(fn=cmd_orchestrate)
 
     w = sub.add_parser("worker", help="worker service")

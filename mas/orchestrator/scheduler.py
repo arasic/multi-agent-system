@@ -33,8 +33,7 @@ from mas.orchestrator import budgets as budget_rules
 from mas.orchestrator import state_machine as sm
 from mas.orchestrator.leases import reap_expired
 from mas.planner.planner import Planner
-from mas.verifier.base import Verifier
-from mas.verifier.stub import StubVerifier
+from mas.verifier.base import MissingVerifier, VerificationRequest, VerificationResult, VerificationStatus, Verifier
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +109,26 @@ def _verify_unlock(conn: Conn, run_id: UUID) -> None:
         log.debug("advisory unlock failed", exc_info=True)
 
 
+def _verification_request(conn: Conn, run: Run, workspace: Any | None) -> VerificationRequest:
+    """Resolve mutable DB/workspace state before crossing the verifier boundary.
+
+    The verifier gets no connection and cannot publish evidence or transition state. A
+    missing/ambiguous integration commit remains explicit in the request and the real
+    verifier rejects it; the explicit test stub may ignore it.
+    """
+    integ = _integration_task(conn, run.id)
+    commits = [] if integ is None else [a.ref for a in store.outputs_of_task(conn, integ["id"]) if a.type == "git_commit"]
+    sha = commits[0] if len(commits) == 1 else None
+    repository = None
+    repo_path = getattr(workspace, "repo_path", None)
+    if callable(repo_path):
+        try:
+            repository = repo_path(run.id)
+        except Exception:
+            log.warning("could not resolve verification repository for run %s", run.id, exc_info=True)
+    return VerificationRequest(run_id=run.id, benchmark=run.benchmark, repository=repository, commit_sha=sha)
+
+
 def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None = None) -> Run:
     """Verifier stage (ADR-003). Re-entrant: any orchestrator that finds the run in VERIFYING may run it,
     guarded by a session advisory lock so only one does at a time. If the process holding the lock dies,
@@ -122,12 +141,17 @@ def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None 
         if run.status is not RunStatus.VERIFYING:
             return run  # someone finished it between our tick and our lock
         try:
-            result = verifier.verify(conn, run)
+            result = verifier.verify(_verification_request(conn, run, workspace))
+            if not isinstance(result, VerificationResult):
+                raise TypeError(f"verifier returned {type(result).__name__}, expected VerificationResult")
         except Exception as e:  # verifier crash is a FAIL with a reason, never a hang
             log.exception("verifier crashed")
-            result_passed, report = False, {"error": f"verifier crashed: {e!r}"}
-        else:
-            result_passed, report = result.passed, dict(result.report)
+            result = VerificationResult.fail(
+                f"verifier crashed: {e!r}",
+                status=VerificationStatus.ERROR,
+                evidence={"run_id": str(run_id), "error": f"verifier crashed: {e!r}"},
+            )
+        result_passed, report = result.passed, dict(result.report)
         with conn.transaction():
             locked = sm.lock_run(conn, run_id)  # lock order: run first, then artifact rows / inserts
             if locked.status is not RunStatus.VERIFYING:
@@ -140,7 +164,12 @@ def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None 
                 run_id=run_id,
                 type="verification",
                 ref=f"verify:{run_id}:{n + 1}",
-                meta={"passed": result_passed, "verifier": getattr(verifier, "name", "?"), "report": report},
+                meta={
+                    "passed": result_passed,
+                    "status": result.status.value,
+                    "verifier": getattr(verifier, "name", "?"),
+                    "report": report,
+                },
             )
             emit(
                 conn,
@@ -176,7 +205,7 @@ def tick(
     """One orchestrator step for a run. `planner` is optional: when given, PLANNING runs are planned here
     (ADR-006 driver); when None, someone else drives planning (e.g. create_run_from_dag) and PLANNING is left alone.
     """
-    verifier = verifier or StubVerifier(passed=True)
+    verifier = verifier or MissingVerifier()
     reap_expired(conn, run_id)
 
     # planning happens outside the run-row lock: the planner may take a while (LLM at step 11)

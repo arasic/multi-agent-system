@@ -1,0 +1,12 @@
+{
+  "protocol_version": 1,
+  "command": ["python", "/acceptance/run.py"],
+  "expected_checks": [
+    "service_starts",
+    "shorten_returns_201",
+    "resolve_redirects",
+    "stats_available",
+    "restart_persists"
+  ],
+  "timeout_s": 20
+}

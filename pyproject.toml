@@ -35,6 +35,7 @@ timeout = 120
 addopts = "-ra"
 markers = [
     "db: requires a reachable PostgreSQL (MAS_DATABASE_URL)",
+    "docker: executes the hardened acceptance sandbox using Docker",
 ]
 
 [tool.ruff]

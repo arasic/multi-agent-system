@@ -4,7 +4,8 @@ Isolation: every pytest process gets its OWN throwaway database (`mas_test_<pid>
 from the server in MAS_DATABASE_URL and dropped at session end. So two test runs at once, or tests while the
 compose orchestrator/workers are up on the `mas` database, never interfere. Tables are truncated between tests.
 
-The whole suite runs with NO API key — stub workers and stub verifier only (CLAUDE.md rule).
+The whole suite runs with NO API key — stub workers; explicit stub verification for substrate tests and the real
+Docker acceptance runner for Step 7 fixtures (CLAUDE.md rule).
 """
 
 from __future__ import annotations

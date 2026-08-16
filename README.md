@@ -152,9 +152,10 @@ Design changes go through an ADR. Nothing about the design lives only in chat.
 python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"     # POSIX: .venv/bin/pip
 docker compose up -d postgres
 .venv/Scripts/mas migrate
-.venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3
+.venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3 --stub-verifier
 .venv/Scripts/mas replay <run_id>
-.venv/Scripts/python -m pytest -q                                   # 80 tests, no API key; uses its own temp DB
+docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
+.venv/Scripts/python -m pytest -q                                   # 87 tests, no API key; uses its own temp DB
 ```
 
 Runs are tagged with a **pool**: `mas run` uses a private `local:<pid>` pool, the compose services serve `default`, so they never take each other's work even on the same database. Tests are isolated too — each pytest process creates and drops its own `mas_test_<pid>` database, so concurrent test runs can't collide.
@@ -169,11 +170,13 @@ docker kill multi-agent-system-worker-2      # the reaper reassigns its task; th
 
 ## Status
 
-**M1 substrate — mostly done (2026-08-16).** Schema, state machines, deterministic orchestrator on hand-written DAGs, leases/heartbeat/reaper/retry, Compose workers as real processes, immutable artifacts (DB-enforced), verifier stage (stub), clarifying questions + assumptions (ADR-006), tool allow-lists, metrics, replay — all LLM-free and covered by 64 tests.
+**M1 substrate — mostly done (2026-08-16).** Schema, state machines, deterministic orchestrator on hand-written DAGs, leases/heartbeat/reaper/retry, Compose workers as real processes, immutable artifacts (DB-enforced), fail-closed verifier stage, clarifying questions + assumptions (ADR-006), tool allow-lists, metrics, replay — all LLM-free and covered by 87 tests.
 
 **Step 6 done (2026-08-16):** one bare git repo per run + one worktree per attempt, inputs assembled by merge, conflicts surfaced (never averaged away), the runtime commits and mints `git_commit` / `<sha>:path` artifacts, integration = the merge commit, `run/<run>/integration` promoted on PASS, `context_spec` enforced (rule 10), worker containers non-root / read-only / no egress / no caps. `mas artifacts <run_id>` shows what a run produced. Stabilized after review (heartbeat through settlement, atomic report, one lock order `run → task → attempt`) and gated by `scripts/stress_step6.py` (170 runs, 0 deadlocks). 80 tests.
 
-**Still missing before an LLM goes in:** the fail-closed acceptance runner + first trusted adapters (step 7 / ADR-007), and concurrent run ticking in the orchestrator service. See [docs/roadmap.md](docs/roadmap.md).
+**Step 7A done (2026-08-16):** the verifier receives no database connection, resolves one exact integration SHA, hashes a human-owned suite, and runs both in an ephemeral Docker sandbox with no network, read-only mounts/rootfs, no capabilities, no-new-privileges, and hard time/CPU/memory/PID/output limits. Missing suite/commit/image/check, malformed output, crash, timeout, and failed checks all fail closed. Five real fixtures plus a worker→Git→verifier→verdict test exercise the path. `StubVerifier` is explicit test mode only.
+
+**Still missing before an LLM goes in:** the broader trusted adapter set (`http_status`, `build_succeeds`, `restart_persists`, `tests_required`) and concurrent run ticking in the orchestrator service. The hardened Compose orchestrator intentionally has no Docker socket; use a host orchestrator for real verification until a separate verifier service/runner API exists. See [docs/roadmap.md](docs/roadmap.md).
 
 ## Later
 

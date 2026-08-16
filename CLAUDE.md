@@ -98,6 +98,13 @@ Tests and lint (no API key needed; DB tests skip if Postgres is unreachable):
 .venv/Scripts/ruff check mas tests && .venv/Scripts/ruff format mas tests
 ```
 
+Verifier/sandbox changes additionally require Docker and the five-fixture gate:
+
+```
+docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
+.venv/Scripts/python -m pytest tests/test_acceptance.py -q
+```
+
 ## How to make a design change
 
 1. Check `docs/invariants.md` — if the change breaks an invariant, it needs a very good reason.
