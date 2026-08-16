@@ -400,6 +400,17 @@ This is one of the economic claims under test — measure input tokens per attem
 
 ---
 
+## 10b. Tool layer and execution boundary (step 10)
+
+An agent acts on the world only through `mas/workers/tools.py`, constructed per attempt from `ctx.tools` (the family allow-list validated by rule 4). Two mechanisms, stated precisely:
+
+- **Filesystem tools are path-jailed in-process** (`Jail`): `read_file` / `write_file` / `list_files` take relative paths only — no absolute paths, no `..`, no symlink escape (resolved and checked against the worktree), `.git/` reserved (the runtime owns commits), `acceptance/` never writable (I-3); reads narrowed further by `context_spec.paths` globs (§10). Size caps on read/write/list.
+- **Command tools never run in the worker process.** `run_command` / `run_python` / `run_pytest` go through an `ExecutionBackend` (`mas/workers/execution.py`); without one they are not offered to the model at all (fail closed). `SandboxExecutionBackend` = **one hardened container per attempt**: exactly the attempt's worktree mounted RW at `/work`, nothing else of the host (no shared `/data`), `--network none`, read-only rootfs, tmpfs `/tmp`, non-root, `--cap-drop ALL`, `no-new-privileges`, pids/memory/cpu limits, `--init`, container-side `timeout -s KILL` per command, an outer `max_life_s`, and `docker rm -f` at close — cancel / timeout / output overflow reset the container, so no descendant outlives the attempt. The image is the verifier image (python, pytest, sh, coreutils). `LocalExecutionBackend` is **test-only** (`unsafe_ok=True` required; the runtime and CLI never pass it): bounded — sanitized environment allow-list, output cap that kills the flood, hard timeout clamped to the attempt deadline, cooperative cancel, process-tree termination — but *not confined*.
+- `git_status` / `git_diff` are read-only fixed-argv host commands with jailed path arguments. `model` is not a tool (it is `ctx.model`).
+- Tool output is data: every result is text handed back as a tool result; denials and failures are error results, not instructions (antipatterns B12).
+
+**Deployment.** Whoever owns Docker constructs the sandbox: host-side workers (`mas run`, development) do it directly. Hardened compose workers have no `docker.sock` by design, so for them command execution moves to a trusted **execution-runner service** (the verifier-service pattern: it receives an attempt identity and a command, resolves the worktree itself, runs the same `SandboxExecutionBackend`, and removes the container at settlement / cancellation / worker death). Until that runner exists, compose LLM workers have filesystem and read-only git tools only.
+
 ## 11. Model providers, roles and per-call telemetry (step 9)
 
 `ModelProvider.complete(messages, *, max_tokens, tools=None, temperature=None) -> Completion` — `Completion(text, usage: Usage, tool_calls: [ToolCall(id, name, input)], stop_reason ∈ {end_turn, tool_use, max_tokens, refusal, other}, request_id, raw)`; `Usage(model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, priced)`. Messages and tools are **provider-neutral shapes** (`mas/providers/base.py`: `system|user|assistant(+tool_calls)|tool` messages, `{name, description, input_schema}` tools); each concrete provider translates. Errors are typed: `ProviderRateLimited` / `ProviderUnavailable` (retryable) vs `ProviderRequestError` (not).

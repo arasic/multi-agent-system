@@ -54,6 +54,15 @@ class Settings:
     # token budget caps it further.
     attempt_max_calls: int = field(default_factory=lambda: int(_env("MAS_ATTEMPT_MAX_CALLS", "40")))
     attempt_max_tokens: int = field(default_factory=lambda: int(_env("MAS_ATTEMPT_MAX_TOKENS", "300000")))
+    # Execution sandbox for command tools (step 10): one hardened container per attempt (mas/workers/execution.py).
+    # Default image = the verifier image (python + pytest + sh + coreutils timeout, non-root). Workers without Docker
+    # get NO command tools (fail closed) until the execution-runner service exists.
+    exec_image: str = field(default_factory=lambda: _env("MAS_EXEC_IMAGE", _env("MAS_VERIFIER_IMAGE", "mas-verifier:latest")))
+    exec_cpus: float = field(default_factory=lambda: float(_env("MAS_EXEC_CPUS", "1.0")))
+    exec_memory_mb: int = field(default_factory=lambda: int(_env("MAS_EXEC_MEMORY_MB", "512")))
+    exec_pids: int = field(default_factory=lambda: int(_env("MAS_EXEC_PIDS", "256")))
+    exec_tmpfs_mb: int = field(default_factory=lambda: int(_env("MAS_EXEC_TMPFS_MB", "256")))
+    exec_max_life_s: int = field(default_factory=lambda: int(_env("MAS_EXEC_MAX_LIFE_S", "1800")))
 
 
 def settings() -> Settings:
