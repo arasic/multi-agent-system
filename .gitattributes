@@ -1,0 +1,9 @@
+# Normalize to LF everywhere (Windows checkout and Linux containers must see identical files).
+* text=auto eol=lf
+
+# Binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.pdf binary
+*.zip binary
