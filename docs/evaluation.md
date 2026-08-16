@@ -78,13 +78,15 @@ Comparisons: **A vs D** — is MAS worth more than one cheap agent? **B vs D** �
 - C and D are the same code path with one knob. Never two implementations.
 - Same acceptance suite version across all configs and all N.
 - Each (config, N) cell run ≥ 5 times; report distributions, not single runs.
+- Clarifying questions (ADR-006): every config may ask through the same channel; a fixed, pre-written answer key per benchmark is used so answers are identical across configs. Report `questions` and `human_wait_s` separately and compare on `machine_s` — a config is not "faster" because a human answered quickly, nor "slower" because it asked a good question.
 
 ---
 
 ## 4. Metrics (recorded per run from `attempts` + `events`)
 
-Outcome: verdict · acceptance pass rate · human interventions (must be 0).
-Time: wall-clock · critical-path duration · parallelism efficiency (sum of attempt durations / wall-clock).
+Outcome: verdict · acceptance pass rate · human interventions other than answering questions (must be 0).
+Time: total (creation→finish) · machine time (total − human wait) · wall-clock of the execution phase · human wait · critical-path duration · parallelism efficiency (sum of attempt durations / wall-clock).
+Questions: batches asked · assumptions recorded (planner proceeded without asking).
 Cost: input tokens · output/thinking tokens · total USD · tokens-in per attempt (context-scoping claim).
 Structure: tasks created · attempts · retries · re-plans · plan-attempts · agent calls · worker utilisation.
 Failures: acceptance failures · integration failures · planning/validation failures · abandoned attempts.

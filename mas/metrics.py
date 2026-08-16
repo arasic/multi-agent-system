@@ -15,7 +15,11 @@ class RunMetrics:
     run_id: str
     status: str
     verdict: str | None
-    wall_clock_s: float | None
+    wall_clock_s: float | None  # started_at → finished_at (execution phase)
+    total_s: float | None  # created_at → finished_at (includes planning and any human wait)
+    human_wait_s: float  # time spent AWAITING_INPUT (ADR-006) — reported separately so comparisons aren't confounded
+    machine_s: float | None  # total_s − human_wait_s
+    questions: int
     tasks: int
     tasks_by_status: dict[str, int]
     attempts: int
@@ -90,11 +94,33 @@ def compute(conn: Conn, run_id: UUID) -> RunMetrics:
 
     n_events = conn.execute("SELECT count(*) AS n FROM events WHERE run_id = %s", (run_id,)).fetchone()["n"]  # type: ignore[index]
 
+    # human wait: sum of intervals spent in AWAITING_INPUT (run.awaiting_input → next run.* transition)
+    human_wait = 0.0
+    trans = conn.execute("SELECT type, ts FROM events WHERE run_id = %s AND type LIKE 'run.%%' ORDER BY id", (run_id,)).fetchall()
+    waiting_since = None
+    for e in trans:
+        if e["type"] == "run.awaiting_input":
+            waiting_since = e["ts"]
+        elif waiting_since is not None:
+            human_wait += (e["ts"] - waiting_since).total_seconds()
+            waiting_since = None
+    if waiting_since is not None:  # still waiting right now
+        now_row = conn.execute("SELECT now() AS n").fetchone()
+        human_wait += (now_row["n"] - waiting_since).total_seconds()  # type: ignore[index]
+
+    total = None
+    if run.created_at and run.finished_at:
+        total = (run.finished_at - run.created_at).total_seconds()
+
     return RunMetrics(
         run_id=str(run.id),
         status=run.status.value,
         verdict=run.verdict,
         wall_clock_s=round(wall, 3) if wall is not None else None,
+        total_s=round(total, 3) if total is not None else None,
+        human_wait_s=round(human_wait, 3),
+        machine_s=round(total - human_wait, 3) if total is not None else None,
+        questions=run.questions_asked,
         tasks=len(tasks),
         tasks_by_status=tasks_by,
         attempts=len(attempts),

@@ -11,6 +11,7 @@ from enum import StrEnum
 class RunStatus(StrEnum):
     CREATED = "CREATED"
     PLANNING = "PLANNING"
+    AWAITING_INPUT = "AWAITING_INPUT"  # planner asked clarifying questions; waiting for an answer (ADR-006)
     RUNNING = "RUNNING"
     VERIFYING = "VERIFYING"
     REPLANNING = "REPLANNING"

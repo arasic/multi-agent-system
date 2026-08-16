@@ -133,6 +133,29 @@ def test_task_max_attempts_cannot_exceed_run_retry_budget():
     assert validate(d, budgets=Budgets(max_attempts_per_task=1)).ok  # no override → inherits the run budget
 
 
+def test_rule4_tools_default_filled_and_bounded_by_capability():
+    """Rule 4: requested tools ⊆ allowed(capability); unknown/forbidden rejected; default filled when omitted."""
+    from mas.planner.capabilities import DEFAULT_CAPABILITY_TOOLS
+
+    r = validate(diamond())
+    assert r.ok
+    for t in r.dag.tasks:  # defaults filled from the registry
+        assert t.tools == sorted(DEFAULT_CAPABILITY_TOOLS[t.capability])
+    d = diamond()
+    d.by_id()["T1"].tools = ["filesystem", "git"]  # architecture may not commit
+    r = validate(d)
+    assert any(e.rule == "4" and e.task_id == "T1" and "'git' not allowed" in e.message for e in r.errors)
+    d = diamond()
+    d.by_id()["T2"].tools = ["filesystem", "laser"]
+    assert any(e.rule == "4" and "'laser' is not available" in e.message for e in validate(d).errors)
+    d = diamond()
+    d.by_id()["T2"].tools = ["network"]
+    assert any(e.rule == "4" and "prohibited by policy" in e.message for e in validate(d).errors)
+    d = diamond()
+    d.by_id()["T2"].tools = ["filesystem", "python"]  # a subset is fine
+    assert validate(d).ok and validate(d).dag.by_id()["T2"].tools == ["filesystem", "python"]
+
+
 def test_synthesized_integration_task_capability_is_validated():
     """Gap: the auto-appended integration sink must also have a registered worker, else the run would stall on a
     READY task nobody can claim."""

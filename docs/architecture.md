@@ -97,12 +97,14 @@ runs
   max_wallclock_s       int
   max_attempt_runtime_s int         -- per-attempt runtime → TIMEOUT via reaper
   lease_s               int         -- default lease length for attempts (heartbeat extends)
+  max_questions         int         -- clarifying-question batches the planner may ask (ADR-006)
   deadline_at           timestamptz
   -- usage
   tokens_used           bigint      default 0
   cost_used_usd         numeric     default 0
   replans_used          int         default 0
   tasks_created         int         default 0
+  questions_asked       int         default 0
   -- outcome
   verdict               text        -- PASS | FAIL:<reason> | ABORTED:<reason>
   created_at, started_at, finished_at timestamptz
@@ -118,6 +120,7 @@ tasks
   output_contract       jsonb       -- artifact types/paths the attempt must publish
   context_spec          jsonb       -- artifact ids / paths / globs the worker receives (nothing else)
   meta                  jsonb       -- free-form, never load-bearing (e.g. stub-agent script in tests)
+  tools                 jsonb       -- allow-list for the agent; validator rule 4 fills/validates from capability→tools
   max_attempts          int         -- ≤ runs.max_attempts_per_task
   created_by            text        -- planner | replan:<n> | system
   created_at, updated_at timestamptz
@@ -174,16 +177,21 @@ All transitions are performed by the orchestrator (or the worker runtime under o
 
 ```
 CREATED ──► PLANNING ──► RUNNING ──► VERIFYING ──► PASSED
-               │            ▲            │
-               │            │            ├──► REPLANNING ──► RUNNING   (replans_used < max_replans)
-               │            │            │
-               │            │            └──► FAILED                   (no replans left)
-               │            │
-               └──► FAILED  (validator rejected max_plan_attempts times)
+               │  ▲         ▲            │
+               │  │         │            ├──► REPLANNING ──► RUNNING   (replans_used < max_replans)
+               │  │         │            │        │  ▲
+               │  │         │            └──► FAILED                   (no replans left)
+               │  │         │                     │  │
+               ▼  │         │                     ▼  │
+        AWAITING_INPUT ─────┘ (answer → PLANNING, or → REPLANNING if tasks exist)     ADR-006
+               │
+               └──► FAILED  (planner exceeded max_questions / empty batch / validator rejected max_plan_attempts times)
 
-any non-terminal ──► ABORTED   (budget/deadline exceeded, or operator abort)
+any non-terminal ──► ABORTED   (budget/deadline exceeded, or operator abort — the clock runs from creation)
 ```
 
+- `PLANNING → AWAITING_INPUT`: planner returned `Questions` instead of a DAG; `question` artifact + `plan.questions` event; `questions_asked += 1` (bounded by `max_questions`).
+- `AWAITING_INPUT → PLANNING | REPLANNING`: `answer` artifact + `plan.answered`; the planner is re-invoked with the full Q&A history.
 - `PLANNING → RUNNING`: validator accepted a DAG; tasks inserted.
 - `RUNNING → VERIFYING`: the integration task is `COMPLETED`.
 - `RUNNING → REPLANNING`: any task reaches `FAILED` (retries exhausted) or a worker reports `new_work_required`, and replans remain. If no replans remain → `FAILED`.
@@ -270,9 +278,13 @@ Per-attempt limits: `max_runtime_s`, `max_tokens`. Exceeding runtime → `TIMEOU
 
 ## 6. Workspaces and artifacts
 
-- One git worktree per attempt: `worktrees/<run>/<task>-<attempt>/`, branch `run/<run>/<task>/<attempt>`, created from `runs.base_ref` (or from the current integration branch when the task's `input_contract` says so).
-- Workers only write inside their worktree. `acceptance/` is mounted **read-only**; `main` is never touched.
-- Publishing = commit inside the worktree → insert `artifacts` row `type=git_commit, ref=<sha>, status=candidate`. Non-code outputs (design docs, decisions) are committed files plus an artifact row (`type=document|decision`, `ref=<sha>:<path>`).
+- **One shared bare repository per run** — `repos/<run>.git` on a volume every worker and the orchestrator mount (`MAS_REPO_ROOT`); created idempotently and race-safely on first use with a deterministic base commit on `main` (or fetched from `runs.base_ref`). Multi-host would push/fetch to a remote instead; the MVP is one host / one volume.
+- **One git worktree per attempt**: `worktrees/<run>/<task>-<attempt>/`, branch `run/<run>/<task>/<attempt>`, created from base. Then **input assembly**: the dependency tasks' `git_commit` outputs (as narrowed by `context_spec`) are merged in, in order, so the worktree contains what the task depends on. A merge conflict is left in place and handed to the agent as `ctx.conflicts` — resolving it is the agent's job (the integration agent's above all); the stub agent fails such an attempt visibly (`unresolved merge conflicts in [...]`). Nothing from earlier attempts of the *same* task is inherited.
+- Workers only write inside their worktree. `acceptance/` is mounted **read-only**; `main` is never touched. Worker containers run **non-root** (uid 1000), with a **read-only root filesystem** (`/data` and `/tmp` writable), **no capabilities**, and on an **internal network with no egress** — they can reach Postgres and nothing else (§13).
+- Publishing is done by the **runtime, not the agent**: it stages and commits whatever the agent left in the worktree; if HEAD moved, the commit becomes the `git_commit` artifact (`status=candidate`). Ordinary tasks must move HEAD past their assembled start point; for the integration task the assembled merge itself is the output. Agents name file artifacts `path:<relpath>`; after the commit they are rewritten to `<sha>:<relpath>` (`type=document|decision|…`). No commit → no artifact → the output contract fails → the attempt fails.
+- After publishing, the worktree is removed; every attempt's branch and commits stay in the bare repo (audit). Worktrees left by dead workers are pruned on the next attempt.
+- On verifier PASS the orchestrator **promotes `run/<run>/integration`** to the accepted integration commit (convenience ref; the artifact row is the truth).
+- `mas artifacts <run_id>` lists what a run produced; `git -C repos/<run>.git log --graph --all` shows the whole story.
 - Artifacts are **immutable and attempt-versioned**. A better version is a *new* artifact; the old one gets `superseded_by`. See ADR-002.
 - Retry semantics: attempt *k+1* starts from a clean worktree; it **may read** attempt *k*'s candidate artifacts (listed in context as hints) but **does not inherit** them. Only `accepted` artifacts are authoritative inputs.
 - **Conflict representation (MVP):** two `candidate` artifacts for the same output slot (same task output, or two tasks answering the same question) *are* a conflict. Resolution produces a `decision` artifact naming winner, loser(s), and rationale; losers become `superseded` or `rejected`. Disagreement stays visible in the store. No claims table (ADR-004).
@@ -294,9 +306,11 @@ Per-attempt limits: `max_runtime_s`, `max_tokens`. Exceeding runtime → `TIMEOU
 
 ## 8. Planning and re-planning
 
-**Planner input:** goal, benchmark constraints, list of registered capabilities and tools, remaining budgets, (on re-plan) current DAG + artifact index + failure report.
+**Planner input:** goal, benchmark constraints, list of registered capabilities and tools, remaining budgets, the Q&A history so far, (on re-plan) current DAG + artifact index + failure report.
 
-**Planner output — typed JSON only:**
+**Planner output — typed JSON only, a union of two shapes (ADR-006):** either a **DAG** (below) or a **question batch** `{"questions": ["…"], "context": "…"}` when it needs information before it can plan. Questions move the run to `AWAITING_INPUT`; a human answers with `mas answer`; the planner is called again with the Q&A. Bounded by `max_questions`; the wall-clock keeps running. The single-agent baseline goes through the same driver, so it has the same right to ask.
+
+**DAG shape:**
 
 ```json
 {
@@ -321,10 +335,11 @@ Per-attempt limits: `max_runtime_s`, `max_tokens`. Exceeding runtime → `TIMEOU
 1. the graph has a cycle
 2. any `depends_on` references a non-existent task
 3. any `capability` has no registered worker — checked **after** the integration sink is auto-appended, so a synthesized `T_integrate` is covered too
-4. any required tool is unavailable, or any permission is prohibited by policy
+4. any requested tool is unavailable, not in the capability's allow-list (`mas/planner/capabilities.py`), or prohibited by policy (`FORBIDDEN_TOOLS`); when a task requests none, the capability's default set is filled in and stored on the task — the agent receives it as `ctx.tools`
 5. any task lacks an `output_contract`
 6. there is not exactly one `integration` sink (orchestrator may auto-append; validator re-checks)
 7. task count exceeds `max_tasks` (cumulative across re-plans), or a task's `max_attempts` override lies outside `[1, max_attempts_per_task]` (no bypassing the retry budget)
+10. `context_spec.artifacts_from` names a task that is not a (transitive) dependency — a task may not read what it does not depend on
 8. estimated cost exceeds remaining budget
 9. an amendment would exceed `max_replans`, or removes/alters a task that is `COMPLETED`
 
@@ -352,7 +367,10 @@ The orchestrator checks budgets on every transition and on a timer. Exceeding an
 
 ## 10. Context scoping
 
-A worker receives only what `task.context_spec` names: specific accepted artifacts, paths/globs, and the task's goal + contracts. Never "the whole repo" by default. This is one of the economic claims under test — measure input tokens per attempt.
+A worker receives only what `task.context_spec` names — never "the whole run":
+- **artifacts:** by default the outputs of its *direct* dependencies; `context_spec.artifacts_from: [keys]` narrows that to the listed tasks (validator rule 10: they must be dependencies, transitively). Only these are assembled into the worktree and listed in `ctx.inputs`.
+- **paths:** `context_spec.paths` (globs) is passed as `ctx.paths`; the tool layer (step 10) restricts what the agent may read to those paths.
+This is one of the economic claims under test — measure input tokens per attempt.
 
 ---
 
@@ -373,7 +391,12 @@ MVP roles (three, no dynamic routing): **planner** → strong model; **worker** 
 
 ## 13. Deployment (MVP)
 
-`docker-compose.yml`: `postgres`, `orchestrator`, `worker` (scale ×N). Workers poll Postgres; no queue. Verifier: ephemeral container started by the orchestrator (or isolated subprocess early on). Worktrees on a shared volume per worker or per-worker local disk with commits pushed to a shared bare repo — decide at roadmap step 6, record in ADR if it deviates from "one bare repo volume".
+`docker-compose.yml`: `postgres`, `orchestrator`, `worker` (scale ×N). Workers poll Postgres; no queue. Verifier: ephemeral container started by the orchestrator (or isolated subprocess early on).
+
+- **Shared volume `masdata:/data`** holds `repos/` (bare repo per run) and `worktrees/` — mounted by workers and the orchestrator (one host / one volume in the MVP).
+- **Networks:** `backend` is `internal: true` — workers and orchestrator have **no egress**; Postgres also joins `frontend` so the host reaches the published port.
+- **Worker/orchestrator containers:** `USER mas` (uid 1000), `read_only: true` rootfs, `tmpfs /tmp`, `cap_drop: [ALL]`, `no-new-privileges`, `./acceptance:/app/acceptance:ro`. Verified: cannot write `/app`, cannot reach the internet, can reach Postgres and `/data`.
+- Later (step 10): the LLM worker needs a model-API egress — give *that* service a proxy/allow-list, not the network; agent tools stay sandboxed to the worktree.
 
 ---
 

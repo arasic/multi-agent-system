@@ -24,6 +24,7 @@ class Budgets:
     max_wallclock_s: int = 3600
     max_attempt_runtime_s: int = 600
     lease_s: int = 30
+    max_questions: int = 3  # clarifying-question batches the planner may ask (ADR-006)
     deadline_at: datetime | None = None
 
 
@@ -41,6 +42,7 @@ class Run:
     cost_used_usd: float = 0.0
     replans_used: int = 0
     tasks_created: int = 0
+    questions_asked: int = 0
     verdict: str | None = None
     created_at: datetime | None = None
     started_at: datetime | None = None
@@ -67,12 +69,14 @@ class Run:
                 max_wallclock_s=r["max_wallclock_s"],
                 max_attempt_runtime_s=r["max_attempt_runtime_s"],
                 lease_s=r["lease_s"],
+                max_questions=r.get("max_questions", 3),
                 deadline_at=r.get("deadline_at"),
             ),
             tokens_used=r["tokens_used"],
             cost_used_usd=float(r["cost_used_usd"]),
             replans_used=r["replans_used"],
             tasks_created=r["tasks_created"],
+            questions_asked=r.get("questions_asked", 0),
             verdict=r.get("verdict"),
             created_at=r.get("created_at"),
             started_at=r.get("started_at"),
@@ -92,6 +96,7 @@ class Task:
     output_contract: dict[str, Any] = field(default_factory=dict)
     context_spec: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
+    tools: list[str] = field(default_factory=list)  # allow-list for this task's agent (validator rule 4)
     max_attempts: int = 3
     created_by: str = "planner"
     created_at: datetime | None = None
@@ -110,6 +115,7 @@ class Task:
             output_contract=r.get("output_contract") or {},
             context_spec=r.get("context_spec") or {},
             meta=r.get("meta") or {},
+            tools=list(r.get("tools") or []),
             max_attempts=r["max_attempts"],
             created_by=r["created_by"],
             created_at=r.get("created_at"),

@@ -1,3 +1,11 @@
+# Networks: `backend` is internal (no egress). Workers and the orchestrator live only there — they can reach
+# Postgres, nothing else (invariant I-11; antipatterns A8/B12 containment). Postgres also sits on the default
+# network so the host can reach it on the published port.
+networks:
+  backend:
+    internal: true
+  frontend: {}
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -14,8 +22,10 @@ services:
       retries: 30
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks: [backend, frontend]
 
-  # Deterministic control plane. Ticks every non-terminal run: readiness, reaper, budgets, verifier stage.
+  # Deterministic control plane. Ticks every open run in its pool: readiness, reaper, budgets, verifier stage.
+  # Shares the workspace volume so it can promote run/<run>/integration on PASS.
   orchestrator:
     build: .
     depends_on:
@@ -23,10 +33,18 @@ services:
         condition: service_healthy
     environment:
       MAS_DATABASE_URL: postgresql://mas:mas@postgres:5432/mas
+      MAS_POOL: ${MAS_POOL:-default}
     command: ["mas", "orchestrate", "--watch"]
+    volumes:
+      - masdata:/data
+    networks: [backend]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
 
   # Disposable workers. Scale with: docker compose up -d --scale worker=3
-  # Stub agents until roadmap step 10 (LLM worker).
+  # Non-root, read-only rootfs, no egress, acceptance/ read-only; the only writable places are /data (worktrees) and /tmp.
   worker:
     build: .
     depends_on:
@@ -35,7 +53,18 @@ services:
     environment:
       MAS_DATABASE_URL: postgresql://mas:mas@postgres:5432/mas
       MAS_WORKER_CAPABILITIES: architecture,implementation,testing,integration,solve
+      MAS_POOL: ${MAS_POOL:-default}
+      MAS_WORKSPACE: git
     command: ["mas", "worker", "--stub", "--stub-sleep", "${MAS_STUB_SLEEP:-0.5}"]
+    volumes:
+      - masdata:/data
+      - ./acceptance:/app/acceptance:ro
+    networks: [backend]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
 
 volumes:
   pgdata:
+  masdata:

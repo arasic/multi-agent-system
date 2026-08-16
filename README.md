@@ -15,6 +15,21 @@ The MVP answers two questions, kept deliberately separate (see [docs/evaluation.
 
 We do not need MAS to win everywhere. We need to know *where* it wins.
 
+## What it will do — and won't (honest scope)
+
+The product promise this architecture can justify:
+
+> **Give it a bounded software goal with an approved, machine-checkable definition of done, and it can decompose, build, integrate, repair and verify the result using parallel workers — producing a verified repository.**
+
+| Requested result | Expected capability after M2 |
+|---|---|
+| CLI, API, small web application | Yes (a single strong agent may be as fast; the gain is reliability + audit) |
+| API + database + auth + UI + tests | Yes — likely the sweet spot: real width behind contracts |
+| Multi-service codebase / internal platform | Possible, with integration risk; the N-sweep shows where it stops paying |
+| Deploy and operate a production platform | **No.** Tool policy forbids deploy/network side effects; that needs secrets, migrations, observability, rollback and approval gates — none exist here |
+
+For ad-hoc goals the definition of done is an **approved, frozen acceptance contract** whose executable checks come from trusted adapters, templates or a human-owned suite — never from the planner ([ADR-007](docs/adr/007-acceptance-contract-freeze.md)).
+
 ## What this is not (yet)
 
 Not an Autonomous SOC. Not an autonomous company. Not an agent framework or marketplace. Not self-modifying. Not a swarm. No dozens of specialised agents, no long-term semantic memory, no vector DB, no RL, no autonomous deployment, no Kafka, no Kubernetes.
@@ -96,13 +111,13 @@ multi-agent-system/
 │   ├── models.md                 # dated model roles/prices (never load-bearing)
 │   └── adr/                      # architecture decision records
 ├── mas/
-│   ├── cli.py                    # mas migrate | run | submit | orchestrate | worker | status | replay
+│   ├── cli.py                    # mas migrate | run | submit | orchestrate | worker | status | answer | artifacts | replay
 │   ├── metrics.py                # wall-clock, max concurrency, parallelism efficiency, tokens/cost
 │   ├── models/                   # enums + row dataclasses: Run, Task, Attempt, Artifact, Event
 │   ├── db/                       # connection, migrations (SQL), events
 │   ├── orchestrator/             # state_machine (ONLY place statuses change), leases, budgets, scheduler, runs
 │   ├── planner/                  # dag spec + deterministic validator; LLM planner (step 11)
-│   ├── workers/                  # runtime loop, stub agent, workspace (git worktrees, step 6)
+│   ├── workers/                  # runtime loop, stub agent, workspace (bare repo per run, worktree per attempt)
 │   ├── artifacts/                # publish / accept / supersede / reject
 │   ├── verifier/                 # Verifier protocol, StubVerifier; acceptance runner (step 7)
 │   └── providers/                # ModelProvider interface; concrete providers (step 9)
@@ -124,6 +139,7 @@ Deterministic substrate first, LLMs last. Full checklist with milestones in [doc
 - [docs/architecture.md](docs/architecture.md) — how it works
 - [docs/invariants.md](docs/invariants.md) — what must never change
 - [docs/evaluation.md](docs/evaluation.md) — how we know it worked
+- [docs/antipatterns.md](docs/antipatterns.md) — how MAS projects fail, and what defends against each here
 - [docs/roadmap.md](docs/roadmap.md) — what we do next
 - [docs/adr/](docs/adr/) — why we decided what we decided
 - [docs/models.md](docs/models.md) — which models play which role (dated, non-load-bearing)
@@ -138,7 +154,7 @@ docker compose up -d postgres
 .venv/Scripts/mas migrate
 .venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3
 .venv/Scripts/mas replay <run_id>
-.venv/Scripts/python -m pytest -q                                   # 49 tests, no API key; uses its own temp DB
+.venv/Scripts/python -m pytest -q                                   # 73 tests, no API key; uses its own temp DB
 ```
 
 Runs are tagged with a **pool**: `mas run` uses a private `local:<pid>` pool, the compose services serve `default`, so they never take each other's work even on the same database. Tests are isolated too — each pytest process creates and drops its own `mas_test_<pid>` database, so concurrent test runs can't collide.
@@ -153,7 +169,11 @@ docker kill multi-agent-system-worker-2      # the reaper reassigns its task; th
 
 ## Status
 
-**M1 substrate — mostly done (2026-08-16).** Schema, state machines, deterministic orchestrator on hand-written DAGs, leases/heartbeat/reaper/retry, Compose workers as real processes, immutable artifacts (DB-enforced), verifier stage (stub), metrics, replay — all LLM-free and covered by 49 tests. Remaining in M1: git worktrees + real commit refs (step 6) and the fixed acceptance-suite verifier (step 7). See [docs/roadmap.md](docs/roadmap.md).
+**M1 substrate — mostly done (2026-08-16).** Schema, state machines, deterministic orchestrator on hand-written DAGs, leases/heartbeat/reaper/retry, Compose workers as real processes, immutable artifacts (DB-enforced), verifier stage (stub), clarifying questions + assumptions (ADR-006), tool allow-lists, metrics, replay — all LLM-free and covered by 64 tests.
+
+**Step 6 done (2026-08-16):** one bare git repo per run + one worktree per attempt, inputs assembled by merge, conflicts surfaced (never averaged away), the runtime commits and mints `git_commit` / `<sha>:path` artifacts, integration = the merge commit, `run/<run>/integration` promoted on PASS, `context_spec` enforced (rule 10), worker containers non-root / read-only / no egress / no caps. `mas artifacts <run_id>` shows what a run produced. 73 tests.
+
+**Still missing before an LLM goes in:** the fail-closed acceptance runner + first trusted adapters (step 7 / ADR-007), and concurrent run ticking in the orchestrator service. See [docs/roadmap.md](docs/roadmap.md).
 
 ## Later
 

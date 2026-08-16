@@ -1,15 +1,51 @@
-"""LLM planner — roadmap step 11. Not implemented in M1.
+"""Planner contract (docs/architecture.md §8, ADR-006).
 
-Contract (see docs/architecture.md §8): given goal, constraints, registered capabilities/tools and remaining
-budgets, return a DagSpec (typed JSON). On re-plan, additionally receives the current DAG, the artifact index
-and the failure report, and returns an amendment. Output always goes through mas.planner.validator.
+`plan()` returns either a DagSpec or a Questions batch. It receives the goal, the registered capabilities,
+the Q&A history so far, and remaining budgets. Output always goes through mas.planner.validator (DAG) or
+runs.ask_questions (Questions) — the planner has no authority (ADR-001).
+
+The LLM planner arrives at roadmap step 11. StubPlanner lets the whole flow be tested without a model.
 """
 
 from __future__ import annotations
 
-from mas.planner.dag import DagSpec
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+from mas.planner.dag import QA, DagSpec, Questions
 
 
-class Planner:
-    def plan(self, goal: str, *, capabilities: set[str]) -> DagSpec:  # pragma: no cover - placeholder
-        raise NotImplementedError("LLM planner arrives at roadmap step 11; use a hand-written DAG file for now")
+@dataclass(frozen=True)
+class PlanRequest:
+    goal: str
+    capabilities: frozenset[str]
+    qa: tuple[QA, ...] = ()
+    remaining: dict[str, Any] = field(default_factory=dict)  # budgets left (tasks, questions, tokens, …)
+    plan_attempt: int = 1  # increments when the validator rejected the previous DAG
+    validation_errors: tuple[str, ...] = ()  # why the previous DAG was rejected, if any
+
+
+class Planner(Protocol):
+    name: str
+
+    def plan(self, req: PlanRequest) -> DagSpec | Questions: ...
+
+
+class StubPlanner:
+    """Scripted planner: asks the given question batches first (one per call), then returns the DAG."""
+
+    name = "stub"
+
+    def __init__(self, dag: DagSpec, questions: list[list[str]] | None = None):
+        self.dag = dag
+        self.questions = [list(q) for q in (questions or [])]
+        self.requests: list[PlanRequest] = []
+
+    def plan(self, req: PlanRequest) -> DagSpec | Questions:
+        self.requests.append(req)
+        asked = len(req.qa)
+        if asked < len(self.questions):
+            return Questions(
+                questions=self.questions[asked], context=f"stub planner needs input ({asked + 1}/{len(self.questions)})"
+            )
+        return self.dag

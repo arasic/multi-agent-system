@@ -2,10 +2,11 @@
 
     loop:
         claim READY task  →  attempt + lease
-        workspace          (step 6)
-        scoped context     (dependency outputs only)
+        scoped inputs      (dependency outputs, narrowed by context_spec)
+        workspace          (git worktree from base + input assembly; conflicts handed to the agent)
         heartbeat thread   (extends lease; detects reaping/cancel → cancel event)
         agent.execute
+        commit worktree    →  git_commit artifact (+ path:→sha: refs)
         publish artifacts  →  report result   (orchestrator transitions the task)
 
 The worker never decides its task's outcome. It reports; the state machine decides. A stale report
@@ -23,10 +24,11 @@ from uuid import UUID
 
 from mas.artifacts import store
 from mas.db.connection import Conn, connect
+from mas.models.types import Task
 from mas.orchestrator import leases
 from mas.orchestrator.leases import Claim, StaleAttempt
-from mas.workers.base import Agent, AgentResult, TaskContext
-from mas.workers.workspace import NullWorkspace, Workspace
+from mas.workers.base import Agent, AgentResult, ArtifactOut, TaskContext
+from mas.workers.workspace import NullWorkspace, Workspace, WorkspaceError, WorkspaceHandle, since_for
 
 log = logging.getLogger(__name__)
 
@@ -172,30 +174,67 @@ class Worker:
         cancel = threading.Event()
         hb = _Heartbeat(self.database_url, claim.attempt.id, lease_s, cancel)
         hb.start()
-        ws_path = None
+        handle: WorkspaceHandle | None = None
         try:
-            ws_path = self.workspace.create(claim.run.id, claim.task.key, claim.attempt.attempt_number)
-            inputs = _dependency_outputs(self.conn, claim.task.id)
-            ctx = TaskContext(
-                run=claim.run, task=claim.task, attempt=claim.attempt, inputs=inputs, workspace=ws_path, cancel=cancel
-            )
+            inputs = _dependency_outputs(self.conn, claim.task)
             try:
-                result = self.agent.execute(ctx)
-            except Exception as e:  # agent bug → FAILED attempt, never a hung task
-                log.exception("agent crashed on %s", claim.task.key)
-                result = AgentResult(success=False, failure_reason=f"agent crashed: {e!r}")
+                handle = self.workspace.create(claim.run, claim.task, claim.attempt, inputs)
+            except WorkspaceError as e:  # cannot even build the workspace → failed attempt, with the reason
+                log.exception("workspace creation failed for %s", claim.task.key)
+                result = AgentResult(success=False, failure_reason=f"workspace: {e}")
+            else:
+                ctx = TaskContext(
+                    run=claim.run,
+                    task=claim.task,
+                    attempt=claim.attempt,
+                    inputs=inputs,
+                    workspace=handle.path if handle else None,
+                    cancel=cancel,
+                    tools=list(claim.task.tools),
+                    paths=list((claim.task.context_spec or {}).get("paths", []) or []),
+                    conflicts=list(handle.conflicts) if handle else [],
+                )
+                try:
+                    result = self.agent.execute(ctx)
+                except Exception as e:  # agent bug → FAILED attempt, never a hung task
+                    log.exception("agent crashed on %s", claim.task.key)
+                    result = AgentResult(success=False, failure_reason=f"agent crashed: {e!r}")
         finally:
             hb.stop()
 
         if result.simulate_death or self.dead.is_set():
             # crash simulation: walk away. Lease expires → reaper → ABANDONED → task READY again.
+            # The worktree is left behind on purpose; ensure_repo() prunes it on the next attempt.
             self.stats.died += 1
             self.dead.set()
             log.warning("worker %s simulating death on %s#%s", self.worker_id, claim.task.key, claim.attempt.attempt_number)
             return
 
+        # commit what the agent left in the worktree; the sha is the git_commit artifact
+        outs = list(result.artifacts)
+        if handle is not None:
+            try:
+                sha = self.workspace.publish(
+                    handle,
+                    f"{claim.task.key}#{claim.attempt.attempt_number}: {getattr(self.agent, 'name', 'agent')}",
+                    since=since_for(claim.task),
+                )
+            except WorkspaceError as e:
+                log.exception("publish failed for %s", claim.task.key)
+                sha, result = None, AgentResult(success=False, failure_reason=f"workspace publish: {e}", usage=result.usage)
+            outs = _resolve_refs(outs, sha)
+            if sha and not any(a.type == "git_commit" and a.ref == sha for a in outs):
+                outs.append(
+                    ArtifactOut(
+                        type="git_commit",
+                        ref=sha,
+                        meta={"branch": handle.branch, "base": handle.base_sha, "merged": handle.merged},
+                    )
+                )
+        result.artifacts = outs
+
         self._publish_and_report(claim, result)
-        self.workspace.cleanup(ws_path)
+        self.workspace.cleanup(handle)
 
     def _publish_and_report(self, claim: Claim, result: AgentResult) -> None:
         conn = self.conn
@@ -229,12 +268,37 @@ class Worker:
             self.stats.failed += 1
 
 
-def _dependency_outputs(conn: Conn, task_id: UUID) -> list[Any]:
-    """Outputs of upstream tasks (store.outputs_of_dependencies): SUCCESS attempts' candidate/accepted artifacts.
+def _dependency_outputs(conn: Conn, task: Task | UUID) -> list[Any]:
+    """Scoped inputs (invariant I-7/I-9; antipatterns A7, B10): outputs of upstream tasks, narrowed by context_spec.
 
-    Later (step 6+) context_spec narrows this further (specific artifacts / paths). Never the whole run.
+    - default: outputs (SUCCESS attempts' candidate/accepted artifacts) of *direct* dependencies
+    - `context_spec.artifacts_from: [keys]`: only those tasks' outputs (validator checks they are dependencies)
+    Never "the whole run".
     """
-    return store.outputs_of_dependencies(conn, task_id)
+    if not isinstance(task, Task):
+        return store.outputs_of_dependencies(conn, task)
+    outs = store.outputs_of_dependencies(conn, task.id)
+    wanted = (task.context_spec or {}).get("artifacts_from")
+    if not wanted:
+        return outs
+    keys = {str(k) for k in wanted}
+    rows = conn.execute("SELECT id FROM tasks WHERE run_id = %s AND key = ANY(%s)", (task.run_id, list(keys))).fetchall()
+    allowed_ids = {r["id"] for r in rows}
+    return [a for a in outs if a.task_id in allowed_ids]
+
+
+def _resolve_refs(outs: list[ArtifactOut], sha: str | None) -> list[ArtifactOut]:
+    """Agents in a git workspace name file artifacts as `path:<relpath>`; after the commit they become `<sha>:<relpath>`.
+    If nothing was committed, path-refs cannot be resolved and are dropped (the contract check will then fail)."""
+    resolved: list[ArtifactOut] = []
+    for a in outs:
+        if a.ref.startswith("path:"):
+            if not sha:
+                continue
+            resolved.append(ArtifactOut(type=a.type, ref=f"{sha}:{a.ref[len('path:') :]}", meta=a.meta))
+        else:
+            resolved.append(a)
+    return resolved
 
 
 def run_worker_thread(worker: Worker, stop: threading.Event) -> threading.Thread:

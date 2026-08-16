@@ -24,6 +24,11 @@ class Settings:
     orchestrator_tick_s: float = field(default_factory=lambda: float(_env("MAS_ORCHESTRATOR_TICK_S", "0.5")))
     # Pool served by long-running services (compose worker/orchestrator). In-process `mas run` uses local:<pid>.
     pool: str = field(default_factory=lambda: _env("MAS_POOL", "default"))
+    # Workspaces (ADR-002): "git" = bare repo per run + worktree per attempt; "none" = no filesystem (stub/unit tests)
+    workspace: str = field(default_factory=lambda: _env("MAS_WORKSPACE", "git"))
+    repo_root: str = field(default_factory=lambda: _env("MAS_REPO_ROOT", ".mas/repos"))
+    worktree_root: str = field(default_factory=lambda: _env("MAS_WORKTREE_ROOT", ".mas/worktrees"))
+    keep_worktrees: bool = field(default_factory=lambda: _env("MAS_KEEP_WORKTREES", "0") in {"1", "true", "yes"})
 
 
 def settings() -> Settings:

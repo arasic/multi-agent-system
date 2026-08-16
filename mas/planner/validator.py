@@ -4,10 +4,10 @@ Rules (numbering follows architecture.md):
   1  cycle                                   ✔ implemented
   2  dependency references a missing task    ✔
   3  capability has no registered worker     ✔ when `capabilities` is provided
-  4  tool unavailable / permission prohibited  – roadmap step 12 (tool layer does not exist yet)
+  4  tool unavailable / not allowed for capability / prohibited by policy  ✔ (policy half; tool impls at step 10)
   5  task lacks an output_contract           ✔
-  6  exactly one `integration` sink          ✔ (auto-append when allowed)
-  7  task count exceeds max_tasks            ✔
+  6  exactly one `integration` sink          ✔ (auto-append when allowed; capability re-checked after)
+  7  task count exceeds max_tasks; per-task max_attempts outside [1, max_attempts_per_task]  ✔
   8  estimated cost exceeds remaining budget – roadmap step 12 (no cost model yet)
   9  amendment rules                         – roadmap step 13
 Extra: duplicate ids, empty DAG, blank capability.
@@ -20,9 +20,11 @@ from graphlib import CycleError, TopologicalSorter
 
 from mas.models.enums import INTEGRATION_CAPABILITY
 from mas.models.types import Budgets
+from mas.planner.capabilities import FORBIDDEN_TOOLS, KNOWN_TOOLS, allowed_tools
 from mas.planner.dag import DagSpec, TaskSpec
 
 AUTO_INTEGRATION_ID = "T_integrate"
+ToolRegistry = dict[str, frozenset[str]]
 
 
 @dataclass(frozen=True)
@@ -53,11 +55,12 @@ def validate(
     capabilities: set[str] | frozenset[str] | None = None,
     existing_task_count: int = 0,
     auto_integration: bool = True,
+    tool_registry: ToolRegistry | None = None,
 ) -> ValidationResult:
     budgets = budgets or Budgets()
     errors: list[ValidationError] = []
     tasks = [TaskSpec.from_dict(t.to_dict()) for t in dag.tasks]  # defensive copy
-    result = DagSpec(tasks=tasks, goal=dag.goal, benchmark=dag.benchmark)
+    result = DagSpec(tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions))
 
     if not tasks:
         errors.append(ValidationError("empty", "DAG has no tasks"))
@@ -143,9 +146,50 @@ def validate(
             if t.capability not in capabilities:
                 errors.append(ValidationError("3", f"capability {t.capability!r} has no registered worker", t.id))
 
+    # 4 — tools: requested ⊆ allowed(capability); nothing forbidden; fill the default when none requested
+    for t in tasks:
+        allowed = allowed_tools(t.capability, tool_registry)
+        if t.tools is None:
+            t.tools = sorted(allowed)
+            continue
+        for tool in t.tools:
+            if tool in FORBIDDEN_TOOLS:
+                errors.append(ValidationError("4", f"tool {tool!r} is prohibited by policy", t.id))
+            elif tool not in KNOWN_TOOLS:
+                errors.append(ValidationError("4", f"tool {tool!r} is not available", t.id))
+            elif tool not in allowed:
+                errors.append(ValidationError("4", f"tool {tool!r} not allowed for capability {t.capability!r}", t.id))
+
+    # 10 — context scoping: artifacts_from may only name tasks this task (transitively) depends on
+    deps_of = {t.id: list(t.depends_on) for t in tasks}
+
+    def ancestors(tid: str) -> set[str]:
+        seen: set[str] = set()
+        stack = list(deps_of.get(tid, []))
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(deps_of.get(cur, []))
+        return seen
+
+    for t in tasks:
+        wanted = (t.context_spec or {}).get("artifacts_from")
+        if not wanted:
+            continue
+        anc = ancestors(t.id)
+        for k in wanted:
+            if str(k) not in idset:
+                errors.append(ValidationError("10", f"context_spec.artifacts_from names unknown task {k!r}", t.id))
+            elif str(k) not in anc:
+                errors.append(ValidationError("10", f"context_spec.artifacts_from names {k!r}, which is not a dependency", t.id))
+
     # 7 — task count
     total = existing_task_count + len(tasks)
     if total > budgets.max_tasks:
         errors.append(ValidationError("7", f"task count {total} exceeds max_tasks {budgets.max_tasks}"))
 
-    return ValidationResult(DagSpec(tasks=tasks, goal=dag.goal, benchmark=dag.benchmark), errors, auto_added)
+    return ValidationResult(
+        DagSpec(tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions)), errors, auto_added
+    )

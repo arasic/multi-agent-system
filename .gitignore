@@ -10,7 +10,8 @@ build/
 .ruff_cache/
 .mypy_cache/
 
-# runtime
+# runtime (per-run bare repos + per-attempt worktrees; see mas/workers/workspace.py)
+.mas/
 worktrees/
 .env
 *.log

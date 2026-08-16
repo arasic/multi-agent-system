@@ -75,6 +75,21 @@ def test_run_happy_path_and_guards():
     assert not can_run(RunStatus.PASSED, RunStatus.RUNNING)
 
 
+def test_awaiting_input_state_adr006():
+    # planner may ask during (re)planning; an answer sends the run back to (re)planning; budgets can still end it
+    assert can_run(RunStatus.PLANNING, RunStatus.AWAITING_INPUT)
+    assert can_run(RunStatus.REPLANNING, RunStatus.AWAITING_INPUT)
+    assert can_run(RunStatus.AWAITING_INPUT, RunStatus.PLANNING)
+    assert can_run(RunStatus.AWAITING_INPUT, RunStatus.REPLANNING)
+    assert can_run(RunStatus.AWAITING_INPUT, RunStatus.FAILED)
+    assert can_run(RunStatus.AWAITING_INPUT, RunStatus.ABORTED)
+    # never straight to work or to a verdict without planning
+    assert not can_run(RunStatus.AWAITING_INPUT, RunStatus.RUNNING)
+    assert not can_run(RunStatus.AWAITING_INPUT, RunStatus.PASSED)
+    assert not can_run(RunStatus.RUNNING, RunStatus.AWAITING_INPUT)
+    assert not RunStatus.AWAITING_INPUT.terminal
+
+
 def test_task_paths():
     assert can_task(TaskStatus.PENDING, TaskStatus.READY)
     assert can_task(TaskStatus.PENDING, TaskStatus.BLOCKED)

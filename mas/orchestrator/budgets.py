@@ -18,8 +18,13 @@ def violation(run: Run, *, now: datetime | None = None) -> str | None:
         return f"max_tasks exceeded ({run.tasks_created} > {b.max_tasks})"
     if run.replans_used > b.max_replans:
         return f"max_replans exceeded ({run.replans_used} > {b.max_replans})"
-    if run.started_at is not None:
-        elapsed = (now - run.started_at).total_seconds()
+    if run.questions_asked > b.max_questions:
+        return f"max_questions exceeded ({run.questions_asked} > {b.max_questions})"
+    # wall-clock runs from CREATION, always: queueing, planning, waiting for a human, executing — one clock (I-4).
+    # (Measuring from started_at once RUNNING would silently grant a second full budget after a long wait.)
+    t0 = run.created_at or run.started_at
+    if t0 is not None:
+        elapsed = (now - t0).total_seconds()
         if elapsed > b.max_wallclock_s:
             return f"max_wallclock_s exceeded ({elapsed:.1f}s > {b.max_wallclock_s}s)"
     if b.deadline_at is not None and now > b.deadline_at:

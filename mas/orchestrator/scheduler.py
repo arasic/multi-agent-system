@@ -32,6 +32,7 @@ from mas.models.types import Run
 from mas.orchestrator import budgets as budget_rules
 from mas.orchestrator import state_machine as sm
 from mas.orchestrator.leases import reap_expired
+from mas.planner.planner import Planner
 from mas.verifier.base import Verifier
 from mas.verifier.stub import StubVerifier
 
@@ -83,6 +84,19 @@ def _integration_task(conn: Conn, run_id: UUID) -> dict[str, Any] | None:
 VERIFY_LOCK_NS = 0x4D415356  # 'MASV': advisory-lock namespace for the verifier stage
 
 
+def _promote_integration_ref(run_id: UUID, sha: str, workspace: Any | None) -> None:
+    """On PASS, point run/<run>/integration at the accepted integration commit (convenience ref; the artifact is truth).
+    Deterministic filesystem/git op; skipped when this orchestrator has no workspace (e.g. no shared volume)."""
+    try:
+        if workspace is None:
+            from mas.workers.workspace import workspace_from_settings
+
+            workspace = workspace_from_settings()
+        workspace.promote(run_id, "integration", sha)
+    except Exception:  # never let a ref update fail a PASS
+        log.warning("could not promote integration ref for run %s", run_id, exc_info=True)
+
+
 def _try_verify_lock(conn: Conn, run_id: UUID) -> bool:
     """Session-level advisory lock: one verifier per run at a time; auto-released if this process dies."""
     row = conn.execute("SELECT pg_try_advisory_lock(%s, hashtext(%s)) AS ok", (VERIFY_LOCK_NS, str(run_id))).fetchone()
@@ -96,7 +110,7 @@ def _verify_unlock(conn: Conn, run_id: UUID) -> None:
         log.debug("advisory unlock failed", exc_info=True)
 
 
-def _verify(conn: Conn, run_id: UUID, verifier: Verifier) -> Run:
+def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None = None) -> Run:
     """Verifier stage (ADR-003). Re-entrant: any orchestrator that finds the run in VERIFYING may run it,
     guarded by a session advisory lock so only one does at a time. If the process holding the lock dies,
     Postgres releases the lock and the next tick retries — a run can never be stranded in VERIFYING.
@@ -138,6 +152,8 @@ def _verify(conn: Conn, run_id: UUID, verifier: Verifier) -> Run:
                     for a in store.outputs_of_task(conn, integ["id"]):
                         if a.status is ArtifactStatus.CANDIDATE:
                             store.accept(conn, a.id)
+                        if a.type == "git_commit":
+                            _promote_integration_ref(run_id, a.ref, workspace)
                 return sm.pass_run(conn, run_id)
             # TODO(step 13): if replans remain and a replanner is configured → REPLANNING with the report
             return sm.fail_run(conn, run_id, "verification failed")
@@ -145,9 +161,35 @@ def _verify(conn: Conn, run_id: UUID, verifier: Verifier) -> Run:
         _verify_unlock(conn, run_id)
 
 
-def tick(conn: Conn, run_id: UUID, *, verifier: Verifier | None = None) -> Run:
+def tick(
+    conn: Conn,
+    run_id: UUID,
+    *,
+    verifier: Verifier | None = None,
+    planner: Planner | None = None,
+    capabilities: set[str] | None = None,
+    workspace: Any | None = None,
+) -> Run:
+    """One orchestrator step for a run. `planner` is optional: when given, PLANNING runs are planned here
+    (ADR-006 driver); when None, someone else drives planning (e.g. create_run_from_dag) and PLANNING is left alone.
+    """
     verifier = verifier or StubVerifier(passed=True)
     reap_expired(conn, run_id)
+
+    # planning happens outside the run-row lock: the planner may take a while (LLM at step 11)
+    if planner is not None:
+        cur = sm.get_run(conn, run_id)
+        if cur.status in {RunStatus.CREATED, RunStatus.PLANNING}:
+            from mas.orchestrator import runs as runs_mod  # local import: runs imports this module's siblings
+
+            budget_reason = budget_rules.violation(cur)
+            if budget_reason:
+                with conn.transaction():
+                    return sm.abort_run(conn, run_id, budget_reason)
+            try:
+                runs_mod.plan_run(conn, run_id, planner, capabilities=capabilities or set())
+            except runs_mod.InvalidDag:
+                pass  # run is already FAILED with a verdict; fall through to the normal path
 
     do_verify = False
     with conn.transaction():
@@ -190,7 +232,7 @@ def tick(conn: Conn, run_id: UUID, *, verifier: Verifier | None = None) -> Run:
         # REPLANNING: step 13.
 
     if do_verify:
-        return _verify(conn, run_id, verifier)
+        return _verify(conn, run_id, verifier, workspace)
     return sm.get_run(conn, run_id)
 
 
@@ -211,9 +253,19 @@ def stall_report(conn: Conn, run_id: UUID) -> dict[str, Any]:
         (run_id,),
     ).fetchall()
     last = conn.execute("SELECT type, ts FROM events WHERE run_id = %s ORDER BY id DESC LIMIT 1", (run_id,)).fetchone()
+    run_row = conn.execute("SELECT status FROM runs WHERE id = %s", (run_id,)).fetchone()
+    pending: list[str] = []
+    if run_row and run_row["status"] == RunStatus.AWAITING_INPUT.value:
+        q = conn.execute(
+            "SELECT meta FROM artifacts WHERE run_id = %s AND type = 'question' ORDER BY created_at DESC, id DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        pending = list(q["meta"].get("questions", [])) if q else []
     return {
+        "status": run_row["status"] if run_row else None,
         "open_tasks": {r["key"]: r["status"] for r in tasks},
         "running_attempts": [dict(r) for r in atts],
+        "pending_questions": pending,
         "last_event": (last["type"], last["ts"].isoformat()) if last else None,
     }
 
@@ -223,6 +275,9 @@ def run_until_terminal(
     run_id: UUID,
     *,
     verifier: Verifier | None = None,
+    planner: Planner | None = None,
+    capabilities: set[str] | None = None,
+    workspace: Any | None = None,
     tick_s: float = 0.25,
     timeout_s: float | None = None,
     stall_warn_s: float = 20.0,
@@ -231,20 +286,22 @@ def run_until_terminal(
 
     Watchdog: if the event log has not advanced for `stall_warn_s`, log a WARNING with the open tasks and
     RUNNING attempts (lease left, running time). Budgets (I-4) are what actually end a stuck run; this only
-    makes a stall diagnosable.
+    makes a stall diagnosable. A run AWAITING_INPUT is not a stall — it is waiting on a human, on the clock.
     """
     t0 = time.monotonic()
     last_event_id = -1
     last_progress = time.monotonic()
     warned = False
     while True:
-        run = tick(conn, run_id, verifier=verifier)
+        run = tick(conn, run_id, verifier=verifier, planner=planner, capabilities=capabilities, workspace=workspace)
         if run.status.terminal:
             return run
         row = conn.execute("SELECT max(id) AS m FROM events WHERE run_id = %s", (run_id,)).fetchone()
         ev = int(row["m"] or 0) if row else 0
         if ev != last_event_id:
             last_event_id, last_progress, warned = ev, time.monotonic(), False
+        elif run.status is RunStatus.AWAITING_INPUT:
+            pass  # waiting on a human is not a stall; budgets bound it
         elif not warned and time.monotonic() - last_progress > stall_warn_s:
             warned = True
             log.warning("run %s: no events for %.0fs — %s", run_id, stall_warn_s, stall_report(conn, run_id))
@@ -273,12 +330,13 @@ def orchestrate_forever(
     tick_s: float = 0.5,
     stop=None,
     pools: list[str] | tuple[str, ...] | None = None,
+    workspace: Any | None = None,
 ) -> None:
     """Service mode (docker compose `orchestrator`): tick every open run in `pools` (None = all) until asked to stop."""
     while stop is None or not stop.is_set():
         for rid in open_runs(conn, pools):
             try:
-                tick(conn, rid, verifier=verifier)
+                tick(conn, rid, verifier=verifier, workspace=workspace)
             except Exception:
                 log.exception("tick failed for run %s", rid)
                 conn.rollback()

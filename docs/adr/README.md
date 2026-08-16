@@ -9,6 +9,8 @@ Design changes go through an ADR. Nothing about the design lives only in chat.
 | [003](003-external-verification.md) | Fixed external verifier; verification is a stage, never a task | Accepted |
 | [004](004-claims-deferred.md) | No claims/evidence tables in the MVP | Accepted |
 | [005](005-postgres-coordination.md) | Postgres as blackboard and coordination mechanism; no queue | Accepted |
+| [006](006-clarifying-questions.md) | Clarifying questions: planner may ask before it plans (`AWAITING_INPUT`) | Accepted |
+| [007](007-acceptance-contract-freeze.md) | Acceptance Contract Freeze: approved, frozen definition of done for ad-hoc goals; checks never planner-authored | Accepted |
 
 ## Adding one
 

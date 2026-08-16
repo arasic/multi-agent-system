@@ -31,10 +31,12 @@ from mas.models.types import Artifact, Attempt, Run, Task
 
 RUN_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.CREATED: frozenset({RunStatus.PLANNING, RunStatus.ABORTED}),
-    RunStatus.PLANNING: frozenset({RunStatus.RUNNING, RunStatus.FAILED, RunStatus.ABORTED}),
+    RunStatus.PLANNING: frozenset({RunStatus.RUNNING, RunStatus.AWAITING_INPUT, RunStatus.FAILED, RunStatus.ABORTED}),
+    # ADR-006: planner asked; a recorded answer sends the run back to (re)planning; budgets still end it
+    RunStatus.AWAITING_INPUT: frozenset({RunStatus.PLANNING, RunStatus.REPLANNING, RunStatus.FAILED, RunStatus.ABORTED}),
     RunStatus.RUNNING: frozenset({RunStatus.VERIFYING, RunStatus.REPLANNING, RunStatus.FAILED, RunStatus.ABORTED}),
     RunStatus.VERIFYING: frozenset({RunStatus.PASSED, RunStatus.REPLANNING, RunStatus.FAILED, RunStatus.ABORTED}),
-    RunStatus.REPLANNING: frozenset({RunStatus.RUNNING, RunStatus.FAILED, RunStatus.ABORTED}),
+    RunStatus.REPLANNING: frozenset({RunStatus.RUNNING, RunStatus.AWAITING_INPUT, RunStatus.FAILED, RunStatus.ABORTED}),
     RunStatus.PASSED: frozenset(),
     RunStatus.FAILED: frozenset(),
     RunStatus.ABORTED: frozenset(),

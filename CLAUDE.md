@@ -13,6 +13,7 @@ Source of truth, in order:
 3. [docs/adr/](docs/adr/) — decisions and their rationale
 4. [docs/evaluation.md](docs/evaluation.md) — pass criteria and benchmarks
 5. [docs/roadmap.md](docs/roadmap.md) — build order
+6. [docs/antipatterns.md](docs/antipatterns.md) — known MAS failure modes (MAST + our own history) → countermeasure → status. **When adding a mechanism, say which entry it addresses; when a change would weaken an entry's countermeasure, stop.**
 
 If code and docs disagree, the docs win until an ADR changes them. If you need to deviate, **write an ADR first** (see `docs/adr/README.md`), then change code.
 
@@ -44,7 +45,7 @@ If a task seems to need one of these, stop and say so — don't build it quietly
 - **Transactions:** connections are **autocommit**; every atomic unit is an explicit `with conn.transaction():` block. Never rely on implicit transactions — a bare `SELECT` on a non-autocommit connection opens one that never commits, and later `transaction()` blocks silently nest as savepoints (writes invisible to other connections — this bit us on day one). State-machine primitives assume the caller holds a transaction.
 - **Stale work:** anything that reports on an attempt must tolerate `StaleAttempt` (the attempt was reaped/cancelled). Log and drop; never retry the report.
 - **Runtime:** Docker Compose — `postgres`, `orchestrator`, `worker` (scaled ×N). Verifier runs in an ephemeral container (an isolated subprocess is acceptable in early steps as long as `acceptance/` stays read-only to workers).
-- **Workspaces:** one git worktree per attempt, branch `run/<run>/<task>/<attempt>`. Artifact of type `git_commit` = a SHA on that branch. Integration merges into `run/<run>/integration`.
+- **Workspaces:** one bare repo per run (`$MAS_REPO_ROOT/<run>.git`, default `.mas/repos`, git-ignored) and one worktree per attempt (`$MAS_WORKTREE_ROOT`), branch `run/<run>/<task>/<attempt>`, created from base + **input assembly** (dependency `git_commit` outputs merged in; conflicts handed to the agent via `ctx.conflicts`). The **runtime** commits and mints `git_commit` artifacts; agents name file artifacts `path:<relpath>` → rewritten to `<sha>:<relpath>`. Roots are resolved to absolute paths (git runs with `cwd=<bare repo>`; a relative worktree path would land inside it — this bit us). `--workspace none` for pure in-memory stub tests.
 - **Tests:** `pytest`. Unit tests for state machine and validator are mandatory. End-to-end tests use stub workers and a real Postgres. **Each pytest process creates its own database `mas_test_<pid>`** (from the server in `MAS_DATABASE_URL`) and drops it at the end — so concurrent test runs, or tests while the compose services are up, never collide. Never point tests at the shared `mas` database.
 - **Pools:** every run has a `pool`; workers and orchestrators serve only their pool(s). In-process `mas run` uses `local:<pid>` (its own workers are additionally pinned by `run_id`), the compose services serve `$MAS_POOL` (`default`), `mas submit --pool` targets a pool, `--pool '*'` serves everything. So the containers never touch a local demo run, and vice versa, on the same database.
 - **Config:** environment variables + a small typed settings object. Budgets are per-run parameters, never hard-coded.
@@ -70,8 +71,13 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 .venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3
 .venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3 --stub-sleep 1.5 --lease-s 2 --chaos-kill-after 2.2
 .venv/Scripts/mas run --dag ... --max-concurrency 1              # config C shape
-.venv/Scripts/mas status <run_id> [--json]                       # metrics (evaluation.md §4)
+.venv/Scripts/mas status <run_id> [--json]                       # metrics (evaluation.md §4); pending questions if AWAITING_INPUT
 .venv/Scripts/mas replay <run_id>                                # event timeline (I-12)
+.venv/Scripts/mas run --dag ... --ask "Which DB?;Which Python?"  # ADR-006 demo: planner asks first, run waits (on the clock)
+.venv/Scripts/mas answer <run_id> "sqlite; 3.12"                 # ...answer from another terminal; run continues
+.venv/Scripts/mas artifacts <run_id>                             # git_commit shas, <sha>:path documents, verification
+git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's whole history (one branch per attempt)
+.venv/Scripts/mas run --dag ... --workspace none                 # no filesystem (fastest; opaque stub refs)
 ```
 
 Distributed (real separate processes):

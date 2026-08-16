@@ -254,11 +254,11 @@ def test_verifying_is_reentrant_after_orchestrator_crash(conn, monkeypatch):
     real_verify = sched._verify
     calls = {"n": 0}
 
-    def crash_once(conn_, run_id, verifier):
+    def crash_once(conn_, run_id, verifier, workspace=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("orchestrator process died mid-verification")
-        return real_verify(conn_, run_id, verifier)
+        return real_verify(conn_, run_id, verifier, workspace)
 
     monkeypatch.setattr(sched, "_verify", crash_once)
     with pytest.raises(RuntimeError, match="died mid-verification"):
@@ -394,3 +394,25 @@ def test_worker_threads_stop_when_run_terminates(conn):
     time.sleep(0.2)
     assert all(not t.is_alive() for t in out.threads)
     assert threading.active_count() < 20
+
+
+def test_wallclock_budget_is_one_clock_from_creation(conn):
+    """A long wait before RUNNING must not grant a fresh execution budget (budget defect, 2026-08-16)."""
+    from datetime import UTC, datetime, timedelta
+
+    from mas.orchestrator import budgets as budget_rules
+
+    run = runs_mod.create_run_from_dag(conn, diamond(), budgets=default_budgets(max_wallclock_s=10), capabilities=set(CAPS))
+    # simulate: created 9s ago, started running just now
+    with conn.transaction():
+        conn.execute("UPDATE runs SET created_at = now() - interval '9 seconds', started_at = now() WHERE id = %s", (run.id,))
+    r = sm.get_run(conn, run.id)
+    assert budget_rules.violation(r, now=datetime.now(UTC)) is None
+    assert "max_wallclock_s" in (budget_rules.violation(r, now=datetime.now(UTC) + timedelta(seconds=2)) or "")
+    # a run that started 2s ago but was created 12s ago is over budget
+    with conn.transaction():
+        conn.execute(
+            "UPDATE runs SET created_at = now() - interval '12 seconds', started_at = now() - interval '2 seconds' WHERE id = %s",
+            (run.id,),
+        )
+    assert "max_wallclock_s" in (budget_rules.violation(sm.get_run(conn, run.id)) or "")
