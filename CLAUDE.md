@@ -80,6 +80,7 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 .venv/Scripts/mas artifacts <run_id>                             # git_commit shas, <sha>:path documents, verification
 git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's whole history (one branch per attempt)
 .venv/Scripts/mas run --dag ... --workspace none                 # no filesystem (fastest; opaque stub refs)
+.venv/Scripts/mas contract acceptance/url_shortener_contract/contract.json   # validate an ADR-007 contract; prints suite digest
 ```
 
 Distributed (real separate processes):

@@ -1,0 +1,1 @@
+{"protocol_version": 1, "command": ["python", "/opt/mas/adapters/runner.py", "/acceptance/contract.json"], "expected_checks": ["vibes"], "timeout_s": 30}

@@ -8,6 +8,7 @@ mas worker --stub [--capabilities ...]   worker service (compose)
 mas status RUN_ID                        summary + metrics (+ pending questions when AWAITING_INPUT)
 mas answer RUN_ID "text"                 answer the planner's clarifying questions (ADR-006)
 mas artifacts RUN_ID                     list artifacts (git_commit shas, sha:path documents, decisions, verification)
+mas contract FILE                        validate an acceptance contract against the trusted adapters (ADR-007)
 mas replay RUN_ID                        event timeline (invariant I-12)
 """
 
@@ -21,6 +22,7 @@ import socket
 import sys
 import threading
 import time
+from pathlib import Path
 from uuid import UUID
 
 from mas import metrics
@@ -277,6 +279,35 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_contract(args: argparse.Namespace) -> int:
+    """Validate an ADR-007 acceptance contract with the trusted adapter schema; print its check ids and, if the
+    contract sits inside an acceptance suite dir, the suite digest a freeze would pin. Unmappable → exit 2."""
+    from mas.verifier.acceptance import AcceptanceVerifier, InvalidSuite
+    from mas.verifier.adapters import InvalidContract, parse_contract
+
+    path = Path(args.file)
+    try:
+        contract = parse_contract(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"cannot read contract: {e}", file=sys.stderr)
+        return 2
+    except InvalidContract as e:
+        print(f"UNMAPPABLE: {e}", file=sys.stderr)
+        return 2
+    print(f"contract ok: {len(contract.checks)} check(s): {contract.check_ids}")
+    if contract.service:
+        print(f"  service: {' '.join(contract.service.start)}  health={contract.service.health} port={contract.service.port}")
+    suite_dir = path.parent
+    if (suite_dir / "suite.json").exists():
+        try:
+            digest = AcceptanceVerifier(suite_dir.parent).suite_digest(suite_dir.name)
+        except InvalidSuite as e:
+            print(f"suite invalid: {e}", file=sys.stderr)
+            return 2
+        print(f"  suite {suite_dir.name}: sha256={digest}  (this is what an approved contract pins)")
+    return 0
+
+
 def _pools(arg: str | None) -> list[str] | None:
     """--pool 'a,b' → ['a','b']; --pool '*' → None (serve every pool); default → [MAS_POOL]."""
     raw = arg if arg is not None else settings().pool
@@ -395,6 +426,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r.add_argument("--workspace", default=None, choices=["git", "none"], help="git worktrees (default) or no filesystem")
     r.set_defaults(fn=cmd_run)
+
+    ct = sub.add_parser("contract", help="validate an ADR-007 acceptance contract (trusted adapters only)")
+    ct.add_argument("file", help="path to contract.json (inside an acceptance suite dir to also get the suite digest)")
+    ct.set_defaults(fn=cmd_contract)
 
     ar = sub.add_parser("artifacts", help="list a run's artifacts (type, status, ref, task#attempt)")
     ar.add_argument("run_id")

@@ -1,0 +1,1 @@
+{"protocol_version": 1, "checks": [{"id": "vibes", "type": "llm_judgement", "prompt": "does this look right?"}]}

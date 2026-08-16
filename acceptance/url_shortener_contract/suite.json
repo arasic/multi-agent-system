@@ -1,0 +1,6 @@
+{
+  "protocol_version": 1,
+  "command": ["python", "/opt/mas/adapters/runner.py", "/acceptance/contract.json"],
+  "expected_checks": ["compiles", "tests_pass", "health_ok", "shorten_created", "resolve_redirects", "survives_restart"],
+  "timeout_s": 180
+}

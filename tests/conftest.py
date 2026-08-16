@@ -11,9 +11,12 @@ Docker acceptance runner for Step 7 fixtures (CLAUDE.md rule).
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -32,6 +35,7 @@ from mas.workers.runtime import Worker, run_worker_thread, wait_all
 from mas.workers.stub import StubAgent
 
 CAPS = ("architecture", "implementation", "testing", "integration", "solve")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 BASE_URL = os.environ.get("MAS_DATABASE_URL", "postgresql://mas:mas@localhost:5432/mas")
 TEST_DB = f"mas_test_{os.getpid()}"
 
@@ -176,3 +180,27 @@ def execute(
         stop.set()
         wait_all(threads, 10)
     return Outcome(run=final, workers=ws, agent=agent, verifier=verifier, threads=threads)
+
+
+# ----------------------------------------------------------------------------- Docker sandbox image (Step 7 tests)
+
+
+@pytest.fixture(scope="session")
+def verifier_image():
+    if shutil.which("docker") is None:
+        pytest.skip("Docker CLI is unavailable")
+    ping = subprocess.run(["docker", "info"], capture_output=True, timeout=15, check=False)
+    if ping.returncode != 0:
+        pytest.skip("Docker daemon is unavailable")
+    image = f"mas-verifier-test:{os.getpid()}"
+    built = subprocess.run(
+        ["docker", "build", "-q", "-f", "acceptance/Dockerfile.verifier", "-t", image, "."],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert built.returncode == 0, built.stderr
+    yield image
+    subprocess.run(["docker", "image", "rm", "-f", image], capture_output=True, timeout=30, check=False)

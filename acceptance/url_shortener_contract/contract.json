@@ -1,0 +1,26 @@
+{
+  "protocol_version": 1,
+  "service": {
+    "start": ["python", "app.py", "--port", "{port}", "--db", "{state_dir}/urls.sqlite3"],
+    "health": "/health",
+    "port": 18080,
+    "startup_timeout_s": 5
+  },
+  "checks": [
+    {"id": "compiles", "type": "build_succeeds", "command": ["python", "-m", "py_compile", "app.py"], "timeout_s": 20},
+    {"id": "tests_pass", "type": "tests_required", "runner": "pytest", "args": ["-q"], "min_tests": 1, "timeout_s": 60},
+    {"id": "health_ok", "type": "http_status",
+     "request": {"method": "GET", "path": "/health"},
+     "expect": {"status": 200, "json_contains": {"ok": true}}, "timeout_s": 15},
+    {"id": "shorten_created", "type": "http_status",
+     "request": {"method": "POST", "path": "/shorten", "json": {"url": "https://example.com/a"}},
+     "expect": {"status": 201}, "timeout_s": 15},
+    {"id": "resolve_redirects", "type": "http_status",
+     "request": {"method": "GET", "path": "/abc123"},
+     "expect": {"status": 302, "header_equals": {"Location": "https://example.com/a"}}, "timeout_s": 15},
+    {"id": "survives_restart", "type": "restart_persists",
+     "setup": [{"method": "POST", "path": "/shorten", "json": {"url": "https://example.com/b"}}],
+     "verify": {"method": "GET", "path": "/stats"},
+     "expect": {"status": 200, "json_contains": {"urls": 1}}, "timeout_s": 30}
+  ]
+}

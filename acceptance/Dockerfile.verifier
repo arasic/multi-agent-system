@@ -1,6 +1,13 @@
 FROM python:3.12-slim
 
-RUN useradd --no-create-home --uid 10001 --shell /usr/sbin/nologin verifier
+# pytest for tests_required contracts; nothing else. Agent code that needs more must vendor it (or fail honestly).
+RUN pip install --no-cache-dir --root-user-action=ignore pytest==8.* \
+ && useradd --no-create-home --uid 10001 --shell /usr/sbin/nologin verifier
+
+# Trusted adapters (ADR-007 §4a): the only executable checks a contract-based suite can run. Baked into the image so
+# the image digest recorded in every verification artifact pins the adapter code too. Stdlib-only files.
+COPY mas/verifier/adapters/schema.py mas/verifier/adapters/runner.py /opt/mas/adapters/
+RUN chmod -R a=rX /opt/mas
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

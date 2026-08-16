@@ -48,27 +48,6 @@ def _fixture_commit(tmp_path: Path, fixture: str) -> tuple[Path, str]:
     return bare, sha
 
 
-@pytest.fixture(scope="session")
-def verifier_image():
-    if shutil.which("docker") is None:
-        pytest.skip("Docker CLI is unavailable")
-    ping = subprocess.run(["docker", "info"], capture_output=True, timeout=15, check=False)
-    if ping.returncode != 0:
-        pytest.skip("Docker daemon is unavailable")
-    image = f"mas-verifier-test:{os.getpid()}"
-    built = subprocess.run(
-        ["docker", "build", "-q", "-f", "acceptance/Dockerfile.verifier", "-t", image, "."],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-    )
-    assert built.returncode == 0, built.stderr
-    yield image
-    subprocess.run(["docker", "image", "rm", "-f", image], capture_output=True, timeout=30, check=False)
-
-
 def _request(repository: Path, sha: str, benchmark: str = "url_shortener") -> VerificationRequest:
     return VerificationRequest(run_id=uuid4(), benchmark=benchmark, repository=repository, commit_sha=sha)
 

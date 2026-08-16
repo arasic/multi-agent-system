@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mas.verifier.adapters import TRUSTED_RUNNER_COMMAND, InvalidContract, parse_contract
 from mas.verifier.base import CheckResult, CheckStatus, VerificationRequest, VerificationResult, VerificationStatus
 
 _SAFE_BENCHMARK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -32,7 +33,7 @@ _MAX_REPORT_BYTES = 256 * 1024
 
 @dataclass(frozen=True)
 class SandboxLimits:
-    timeout_s: int = 30
+    timeout_s: int = 300  # ceiling; each suite declares its own (smaller) timeout_s
     cpus: float = 1.0
     memory_mb: int = 256
     pids: int = 128
@@ -174,6 +175,23 @@ class AcceptanceVerifier:
         timeout_s = manifest["timeout_s"]
         if not isinstance(timeout_s, int) or not 1 <= timeout_s <= self.limits.timeout_s:
             raise InvalidSuite(f"suite timeout_s must be between 1 and {self.limits.timeout_s}")
+        # Contract-based suite (ADR-007 §4a): validate the contract on the host, force the trusted runner, and require
+        # expected_checks == the contract's check ids. Unknown criteria are unmappable → InvalidSuite (fail closed).
+        contract_path = suite / "contract.json"
+        if contract_path.exists():
+            try:
+                contract = parse_contract(json.loads(contract_path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise InvalidSuite(f"invalid acceptance contract: {exc}") from exc
+            except InvalidContract as exc:
+                raise InvalidSuite(f"unmappable acceptance contract: {exc}") from exc
+            if command != TRUSTED_RUNNER_COMMAND:
+                raise InvalidSuite("a contract-based suite must run the trusted adapter runner and nothing else")
+            if checks != contract.check_ids:
+                raise InvalidSuite("suite expected_checks must equal the contract's check ids, in order")
+            per_check = sum(int(getattr(c, "timeout_s", 0)) for c in contract.checks)
+            if per_check > timeout_s:
+                raise InvalidSuite(f"sum of per-check timeouts ({per_check}s) exceeds the suite timeout ({timeout_s}s)")
         return suite, manifest, _hash_tree(suite)
 
     def suite_digest(self, benchmark: str) -> str:

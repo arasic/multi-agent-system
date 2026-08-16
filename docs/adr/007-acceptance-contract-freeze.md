@@ -1,5 +1,5 @@
 # 007 — Acceptance Contract Freeze: an approved, machine-checkable definition of done for ad-hoc goals
-Status: Accepted
+Status: Accepted (adapters implemented 2026-08-16: `mas/verifier/adapters/`, four criterion types, trusted runner in the verifier image; freeze/approval flow arrives with the planner, step 11)
 Date: 2026-08-16
 
 ## Context

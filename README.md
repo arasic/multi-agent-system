@@ -155,7 +155,7 @@ docker compose up -d postgres
 .venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3 --stub-verifier
 .venv/Scripts/mas replay <run_id>
 docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
-.venv/Scripts/python -m pytest -q                                   # 89 tests, no API key; uses its own temp DB
+.venv/Scripts/python -m pytest -q                                   # 111 tests, no API key; uses its own temp DB
 ```
 
 Runs are tagged with a **pool**: `mas run` uses a private `local:<pid>` pool, the compose services serve `default`, so they never take each other's work even on the same database. Tests are isolated too — each pytest process creates and drops its own `mas_test_<pid>` database, so concurrent test runs can't collide.
@@ -176,7 +176,9 @@ docker kill multi-agent-system-worker-2      # the reaper reassigns its task; th
 
 **Step 7A done (2026-08-16):** the verifier receives no database connection, resolves one exact integration SHA, hashes a human-owned suite, and runs both in an ephemeral Docker sandbox with no network, read-only mounts/rootfs, no capabilities, no-new-privileges, and hard time/CPU/memory/PID/output limits. Missing suite/commit/image/check, malformed output, crash, timeout, and failed checks all fail closed. Five real fixtures plus a worker→Git→verifier→verdict test exercise the path. `StubVerifier` is explicit test mode only.
 
-**Still missing before an LLM goes in:** the broader trusted adapter set (`http_status`, `build_succeeds`, `restart_persists`, `tests_required`) and concurrent run ticking in the orchestrator service. The hardened Compose orchestrator intentionally has no Docker socket; use a host orchestrator for real verification until a separate verifier service/runner API exists. See [docs/roadmap.md](docs/roadmap.md).
+**Step 7B done:** trusted acceptance adapters (`build_succeeds`, `tests_required`, `http_status`, `restart_persists`) — typed contracts validated on the host and in the sandbox, executed by a trusted runner baked into the verifier image; unmappable criteria fail closed. `mas contract <file>` validates a contract and prints the suite digest a freeze pins.
+
+**Still missing before an LLM goes in:** concurrent run ticking in the orchestrator service and a verifier service so service-mode runs get real verdicts (7C). The hardened Compose orchestrator intentionally has no Docker socket; use a host orchestrator for real verification until a separate verifier service/runner API exists. See [docs/roadmap.md](docs/roadmap.md).
 
 ## Later
 

@@ -31,6 +31,7 @@ include = ["mas*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+norecursedirs = ["fixtures", ".venv", ".mas", "build", "dist"]  # tests/fixtures/** belong to sandboxed fixture apps, not to us
 timeout = 120
 addopts = "-ra"
 markers = [
