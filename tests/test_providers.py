@@ -135,7 +135,9 @@ def test_meter_records_prices_sums_and_enforces_call_budget():
     assert m.total.input_tokens == 200 and m.total.output_tokens == 20 and m.total.priced
     d = m.usage_dict()
     assert d["calls"] == 2 and d["input_tokens"] == 200 and d["model"] == "vendor-x" and abs(d["cost_usd"] - 0.0024) < 1e-9
-    assert [r.seq for r in sink.records] == [1, 2] and sink.records[1].meta["tools"] == 1
+    # two calls + the recorded refusal (status "budget", zero tokens, seq of the call that did not happen)
+    assert [r.seq for r in sink.records] == [1, 2, 3] and sink.records[1].meta["tools"] == 1
+    assert sink.records[2].status == "budget" and sink.records[2].input_tokens == 0 and "call budget" in sink.records[2].error
     r = sink.records[0]
     assert (r.run_id, r.task_id, r.attempt_id, r.role, r.provider, r.model, r.status) == (
         rid,
@@ -168,7 +170,8 @@ def test_meter_token_budget_errors_and_statuses():
     assert m.remaining_tokens == 0
     with pytest.raises(AttemptBudgetExceeded):
         m.complete([{"role": "user", "content": "5"}])
-    assert m.calls == 4 and len(sink.records) == 4  # the refused call is not a call
+    assert m.calls == 4 and len(sink.records) == 5  # the refused call is not a call — but it is on record
+    assert sink.records[4].status == "budget" and "token budget" in sink.records[4].error
     # unpriced provider stays unpriced without a price table (fake prices itself, so priced=True here)
     assert m.total.priced
 

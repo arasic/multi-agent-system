@@ -37,8 +37,9 @@ class RunMetrics:
     events: int
     per_task: dict[str, dict[str, Any]] = field(default_factory=dict)
     # step 9: per-call telemetry (model_calls) — evidence independent of settlement; unpriced calls are called out
-    model_calls: int = 0
+    model_calls: int = 0  # rows in model_calls: provider calls + refusals (cancelled/deadline/budget, zero tokens)
     model_call_errors: int = 0
+    model_call_refused: int = 0
     unpriced_calls: int = 0
     call_input_tokens: int = 0
     call_output_tokens: int = 0
@@ -160,6 +161,7 @@ def model_call_summary(conn: Conn, run_id: UUID) -> dict[str, Any]:
         SELECT provider, model, role,
                count(*)                                   AS calls,
                count(*) FILTER (WHERE status = 'error')   AS errors,
+               count(*) FILTER (WHERE status IN ('cancelled', 'deadline', 'budget')) AS refused,
                count(*) FILTER (WHERE NOT priced)         AS unpriced,
                coalesce(sum(input_tokens), 0)             AS input_tokens,
                coalesce(sum(output_tokens), 0)            AS output_tokens,
@@ -175,6 +177,7 @@ def model_call_summary(conn: Conn, run_id: UUID) -> dict[str, Any]:
     tot: dict[str, Any] = {
         "model_calls": 0,
         "model_call_errors": 0,
+        "model_call_refused": 0,
         "unpriced_calls": 0,
         "call_input_tokens": 0,
         "call_output_tokens": 0,
@@ -187,6 +190,7 @@ def model_call_summary(conn: Conn, run_id: UUID) -> dict[str, Any]:
         per_model[key] = {
             "calls": int(r["calls"]),
             "errors": int(r["errors"]),
+            "refused": int(r["refused"]),
             "unpriced": int(r["unpriced"]),
             "input_tokens": int(r["input_tokens"]),
             "output_tokens": int(r["output_tokens"]),
@@ -196,6 +200,7 @@ def model_call_summary(conn: Conn, run_id: UUID) -> dict[str, Any]:
         }
         tot["model_calls"] += int(r["calls"])
         tot["model_call_errors"] += int(r["errors"])
+        tot["model_call_refused"] += int(r["refused"])
         tot["unpriced_calls"] += int(r["unpriced"])
         tot["call_input_tokens"] += int(r["input_tokens"])
         tot["call_output_tokens"] += int(r["output_tokens"])

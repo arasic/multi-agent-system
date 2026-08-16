@@ -15,10 +15,14 @@ Nothing outside `mas/providers/` and config may name a model or a vendor (CLAUDE
 
 from __future__ import annotations
 
+import random
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 STOP_REASONS = ("end_turn", "tool_use", "max_tokens", "refusal", "other")
+MIN_CALL_S = 2.0  # below this much remaining time a request (or a retry) is not worth starting
 
 
 @dataclass(frozen=True)
@@ -115,6 +119,7 @@ class ModelProvider(Protocol):
         max_tokens: int = 4096,
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
+        timeout_s: float | None = None,  # total wall-clock budget for this call INCLUDING the provider's own retries
     ) -> Completion: ...
 
 
@@ -151,3 +156,50 @@ class ProviderRequestError(ProviderError):
     """4xx other than 429: bad request, auth, unknown model. Retrying the same request will not help."""
 
     retryable = False
+
+
+# ----------------------------------------------------------------------------- bounded retries
+
+
+def backoff_s(attempt: int) -> float:
+    return min(20.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0, 0.25)
+
+
+def call_with_retries(
+    attempt_fn: Callable[[float | None], Any],
+    *,
+    budget_s: float | None,
+    max_retries: int,
+    sleep: Callable[[float], None] = time.sleep,
+    min_call_s: float = MIN_CALL_S,
+) -> Any:
+    """Run `attempt_fn(remaining_s)` with bounded retries that can never outlive `budget_s`.
+
+    - `remaining_s` (None = unbounded) is recomputed immediately before every request;
+    - a retryable ProviderError is retried at most `max_retries` times, sleeping `retry_after_s` (rate limits) or an
+      exponential backoff — but only if the sleep AND a minimum viable call window still fit in the budget; otherwise
+      the error is raised right away (an excessive Retry-After therefore fails fast, it never sleeps past the deadline);
+    - a non-retryable error is raised immediately.
+    Providers use this so that hidden SDK/HTTP retries never silently exceed an attempt's deadline.
+    """
+    t0 = time.monotonic()
+    tries = 0
+    while True:
+        remaining = None if budget_s is None else budget_s - (time.monotonic() - t0)
+        if remaining is not None and remaining < min_call_s and tries > 0:
+            raise ProviderUnavailable(f"call budget exhausted after {tries} attempt(s) ({budget_s:.1f}s)", retryable=False)
+        try:
+            return attempt_fn(remaining)
+        except ProviderError as e:
+            tries += 1
+            if not e.retryable or tries > max_retries:
+                raise
+            delay = getattr(e, "retry_after_s", None)
+            if delay is None:
+                delay = backoff_s(tries)
+            if remaining is not None:
+                left = budget_s - (time.monotonic() - t0)  # type: ignore[operator]
+                if delay > max(0.0, left - min_call_s):
+                    e.retryable = False  # a retry cannot fit before the deadline; the caller must not loop on this
+                    raise
+            sleep(delay)

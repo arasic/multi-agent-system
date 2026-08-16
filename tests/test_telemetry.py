@@ -158,7 +158,9 @@ def test_attempt_call_budget_ends_a_runaway_agent(conn):
     a = attempts[0]
     assert a.status is AttemptStatus.FAILED and "call budget exhausted (3/3 calls)" in (a.failure_reason or "")
     assert (a.input_tokens, a.output_tokens) == (30, 3)  # exactly three calls were paid for
-    assert len([r for r in _calls(conn, final.id) if r["attempt_id"] == a.id]) == 3
+    rows = [r for r in _calls(conn, final.id) if r["attempt_id"] == a.id]
+    assert [r["status"] for r in rows] == ["ok", "ok", "ok", "budget"]  # 3 real calls + the refusal that ended it
+    assert metrics.compute(conn, final.id).model_call_refused == 1
 
 
 def test_run_token_budget_caps_the_attempt_budget(conn):
@@ -243,3 +245,29 @@ def test_memory_sink_meter_is_db_free():
     sink = MemorySink()
     m = MeteredProvider(FakeProvider("pong"), sink=sink, role="ping")
     assert m.complete([{"role": "user", "content": "ping"}]).text == "pong" and sink.records[0].role == "ping"
+
+
+def test_runtime_clamps_model_calls_to_the_attempt_runtime(conn):
+    """A provider call that would outlive max_attempt_runtime_s is cut by the meter's timeout, recorded as an unpriced
+    error, and the attempt ends — no billing continues after the orchestrator has given up on the attempt."""
+    provider = FakeProvider([{"text": "slow", "delay_s": 60}, "never reached"])
+    agent = ModelAgent(calls=2)
+    t0 = time.monotonic()
+    final, _ = _run(
+        conn,
+        diamond(),
+        agent=agent,
+        provider=provider,
+        budgets=default_budgets(max_attempt_runtime_s=3, max_attempts_per_task=1),
+        workers=1,
+    )
+    assert time.monotonic() - t0 < 60
+    a = sm.attempts_for_run(conn, final.id)[0]
+    assert a.status in {AttemptStatus.FAILED, AttemptStatus.TIMEOUT}, a  # worker reported the failure, or the reaper won the race
+    if a.status is AttemptStatus.FAILED:
+        assert "timed out" in (a.failure_reason or "")
+    rows = [r for r in _calls(conn, final.id) if r["attempt_id"] == a.id]
+    assert rows and rows[0]["status"] == "error" and not rows[0]["priced"] and "timed out" in rows[0]["error"]
+    assert rows[0]["meta"]["timeout_s"] <= 3.0
+    assert len(provider.calls) == 1 and provider.calls[0]["timeout_s"] <= 3.0  # the second scripted call never happened
+    assert final.status is RunStatus.FAILED

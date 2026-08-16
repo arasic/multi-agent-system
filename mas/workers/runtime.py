@@ -188,10 +188,11 @@ class Worker:
             self.current = None
         return True
 
-    def _metered(self, claim: Claim) -> MeteredProvider | None:
+    def _metered(self, claim: Claim, *, cancel: threading.Event, deadline: float) -> MeteredProvider | None:
         """The model handed to the agent for this attempt: telemetry to model_calls on the worker's own connection
         (idle while the agent runs; the heartbeat has its own), priced from config, bounded by the per-attempt budget
-        AND by what is left of the run's token budget (a run that is nearly out of tokens gets short attempts)."""
+        AND by what is left of the run's token budget (a run that is nearly out of tokens gets short attempts), and by
+        the attempt's deadline / cancel event: no model call — including provider retries — outlives the attempt."""
         if self.provider is None:
             return None
         remaining_run = max(0, claim.run.budgets.max_tokens - claim.run.tokens_used)
@@ -205,6 +206,9 @@ class Worker:
             task_id=claim.task.id,
             attempt_id=claim.attempt.id,
             budget=budget,
+            deadline=deadline,
+            cancel=cancel,
+            call_timeout_s=settings().provider_timeout_s,
         )
 
     def _process(self, claim: Claim) -> None:
@@ -213,6 +217,9 @@ class Worker:
         never be reaped as ABANDONED. Only a deliberate simulated death stops without reporting."""
         lease_s = self.lease_s if self.lease_s is not None else claim.run.budgets.lease_s
         cancel = threading.Event()
+        # the attempt's runtime deadline (the reaper enforces the same limit from the DB side); model calls and tools
+        # are clamped to it so nothing keeps working - or spending - after the orchestrator has given up on the attempt
+        deadline = time.monotonic() + float(claim.run.budgets.max_attempt_runtime_s)
         hb = _Heartbeat(self.database_url, claim.attempt.id, lease_s, cancel)
         hb.start()
         handle: WorkspaceHandle | None = None
@@ -220,7 +227,7 @@ class Worker:
         metered: MeteredProvider | None = None
         try:
             inputs = _dependency_outputs(self.conn, claim.task)
-            metered = self._metered(claim)
+            metered = self._metered(claim, cancel=cancel, deadline=deadline)
             try:
                 handle = self.workspace.create(claim.run, claim.task, claim.attempt, inputs)
             except WorkspaceError as e:  # cannot even build the workspace → failed attempt, with the reason

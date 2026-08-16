@@ -9,6 +9,13 @@ after each response and further calls are refused once the limit is reached: ove
 call (itself bounded by that call's `max_tokens`), and settlement then trips the run's token budget if it is exhausted.
 `AttemptBudgetExceeded` is terminal for the attempt — never a retry loop.
 
+The meter also owns the attempt's **deadline and cancellation** for model calls: before reserving a call it refuses
+(`AttemptCancelled` / `AttemptDeadlineExceeded` / `AttemptBudgetExceeded`, all `AttemptEnded`) when the cancel event
+is set, when less than a minimum viable window remains, or when the budget is gone; otherwise it hands the provider a
+`timeout_s` = min(caller's, per-call cap, remaining runtime) — the provider's own retries and backoff sleeps live
+inside that budget (`call_with_retries`), so no request or retry outlives the attempt. Refusals are recorded too
+(status cancelled | deadline | budget, zero tokens) — the evidence of why an attempt stopped calling.
+
 Agents get a metered provider from the runtime (`TaskContext.model`); they never construct providers themselves.
 """
 
@@ -23,7 +30,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from mas.db.connection import Conn, Jsonb
-from mas.providers.base import Completion, ModelProvider, ProviderError, Usage
+from mas.providers.base import MIN_CALL_S, Completion, ModelProvider, ProviderError, Usage
 from mas.providers.pricing import Pricing
 
 log = logging.getLogger(__name__)
@@ -145,11 +152,24 @@ class CallBudget:
     max_tokens: int | None = None
 
 
-class AttemptBudgetExceeded(ProviderError):
-    """Raised by MeteredProvider instead of making a call once the budget is exhausted (calls: strict; tokens: after the
-    response that crossed the line). Not retryable within the attempt."""
+class AttemptEnded(ProviderError):
+    """Base: the meter refused to start a call because the attempt is over for that purpose (budget, deadline, cancel).
+    Never retryable within the attempt; the agent must stop and report."""
 
     retryable = False
+
+
+class AttemptBudgetExceeded(AttemptEnded):
+    """Raised instead of making a call once the budget is exhausted (calls: strict; tokens: after the response that
+    crossed the line)."""
+
+
+class AttemptDeadlineExceeded(AttemptEnded):
+    """Raised instead of making a call when less than a minimum viable call window remains before the attempt deadline."""
+
+
+class AttemptCancelled(AttemptEnded):
+    """Raised instead of making a call once the attempt's cancel event is set (reaped / cancelled by the orchestrator)."""
 
 
 class MeteredProvider:
@@ -167,6 +187,10 @@ class MeteredProvider:
         task_id: UUID | None = None,
         attempt_id: UUID | None = None,
         budget: CallBudget | None = None,
+        deadline: float | None = None,  # time.monotonic() value: the attempt's runtime end; no call may outlive it
+        cancel: threading.Event | None = None,  # set by the runtime when the attempt was reaped / cancelled
+        call_timeout_s: float | None = None,  # per-call cap (provider timeout); further clamped to the remaining runtime
+        min_call_s: float = MIN_CALL_S,  # below this much remaining time a call is refused instead of started
     ):
         self.inner = inner
         self.sink: Sink = sink or NullSink()
@@ -176,6 +200,10 @@ class MeteredProvider:
         self.task_id = task_id
         self.attempt_id = attempt_id
         self.budget = budget or CallBudget()
+        self.deadline = deadline
+        self.cancel = cancel
+        self.call_timeout_s = call_timeout_s
+        self.min_call_s = min_call_s
         self.name = getattr(inner, "name", "unknown")
         self.model = getattr(inner, "model", "")
         self.total = Usage(model=self.model)
@@ -207,6 +235,46 @@ class MeteredProvider:
                 f"token budget exhausted ({self.total.total_tokens}/{self.budget.max_tokens} tokens over {self.calls} calls)"
             )
 
+    @property
+    def remaining_s(self) -> float | None:
+        if self.deadline is None:
+            return None
+        return max(0.0, self.deadline - time.monotonic())
+
+    def _preflight(self, timeout_s: float | None) -> float | None:
+        """Refuse before reserving a call when the attempt is cancelled / out of time / out of budget; otherwise return
+        the effective timeout for this call: min(caller's, per-call cap, remaining runtime). Caller holds the lock."""
+        if self.cancel is not None and self.cancel.is_set():
+            raise AttemptCancelled("attempt cancelled; no further model calls")
+        remaining = self.remaining_s
+        if remaining is not None and remaining < self.min_call_s:
+            raise AttemptDeadlineExceeded(
+                f"attempt deadline: {remaining:.1f}s left, less than the minimum call window ({self.min_call_s:.1f}s)"
+            )
+        self._check_budget()
+        candidates = [t for t in (timeout_s, self.call_timeout_s, remaining) if t is not None]
+        return min(candidates) if candidates else None
+
+    def _refused(self, exc: AttemptEnded, *, max_tokens: int, n_messages: int, n_tools: int) -> None:
+        """Telemetry for a call that never reached the provider — the evidence of *why* the attempt stopped calling."""
+        status = {AttemptCancelled: "cancelled", AttemptDeadlineExceeded: "deadline"}.get(type(exc), "budget")
+        self._emit(
+            CallRecord(
+                provider=self.name,
+                model=self.model,
+                role=self.role,
+                seq=self.calls + 1,
+                started_at=datetime.now(UTC),
+                duration_ms=0,
+                status=status,
+                run_id=self.run_id,
+                task_id=self.task_id,
+                attempt_id=self.attempt_id,
+                error=f"{type(exc).__name__}: {exc}"[:2000],
+                meta={"max_tokens": max_tokens, "messages": n_messages, "tools": n_tools, "remaining_s": self.remaining_s},
+            )
+        )
+
     # ------------------------------------------------------------------ the call
 
     def complete(
@@ -216,15 +284,25 @@ class MeteredProvider:
         max_tokens: int = 4096,
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
+        timeout_s: float | None = None,
     ) -> Completion:
+        refused: AttemptEnded | None = None
         with self._lock:
-            self._check_budget()
-            self.calls += 1
-            seq = self.calls
+            try:
+                effective_timeout = self._preflight(timeout_s)
+                self.calls += 1
+                seq = self.calls
+            except AttemptEnded as e:
+                refused = e
+        if refused is not None:
+            self._refused(refused, max_tokens=max_tokens, n_messages=len(messages), n_tools=len(tools or []))
+            raise refused
         started = datetime.now(UTC)
         t0 = time.perf_counter()
         try:
-            comp = self.inner.complete(messages, max_tokens=max_tokens, tools=tools, temperature=temperature)
+            comp = self.inner.complete(
+                messages, max_tokens=max_tokens, tools=tools, temperature=temperature, timeout_s=effective_timeout
+            )
         except Exception as e:
             dur = int((time.perf_counter() - t0) * 1000)
             with self._lock:
@@ -237,12 +315,18 @@ class MeteredProvider:
                     seq=seq,
                     started_at=started,
                     duration_ms=dur,
-                    status="error",
+                    status="error",  # priced=False: what the provider billed for a failed/timed-out request is unknowable here
                     run_id=self.run_id,
                     task_id=self.task_id,
                     attempt_id=self.attempt_id,
                     error=f"{type(e).__name__}: {e}"[:2000],
-                    meta={"max_tokens": max_tokens, "messages": len(messages), "tools": len(tools or [])},
+                    meta={
+                        "max_tokens": max_tokens,
+                        "messages": len(messages),
+                        "tools": len(tools or []),
+                        "timeout_s": effective_timeout,
+                        "remaining_s": self.remaining_s,
+                    },
                 )
             )
             raise

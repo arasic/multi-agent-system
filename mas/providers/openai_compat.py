@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import time
 import urllib.error
 import urllib.request
@@ -28,6 +27,7 @@ from mas.providers.base import (
     ProviderUnavailable,
     ToolCall,
     Usage,
+    call_with_retries,
 )
 
 log = logging.getLogger(__name__)
@@ -80,9 +80,10 @@ class OpenAICompatibleProvider:
         max_tokens: int = 4096,
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
+        timeout_s: float | None = None,
     ) -> Completion:
         body = self.build_body(messages, max_tokens=max_tokens, tools=tools, temperature=temperature)
-        status, headers, raw = self._post_with_retries(json.dumps(body).encode("utf-8"))
+        status, headers, raw = self._post_with_retries(json.dumps(body).encode("utf-8"), budget_s=timeout_s)
         try:
             data = json.loads(raw.decode("utf-8") or "{}")
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -98,29 +99,27 @@ class OpenAICompatibleProvider:
         h.update(self.extra_headers)
         return h
 
-    def _post_with_retries(self, body: bytes) -> tuple[int, dict[str, str], bytes]:
+    def _post_with_retries(self, body: bytes, *, budget_s: float | None = None) -> tuple[int, dict[str, str], bytes]:
+        """One call = bounded retries inside `budget_s`: the HTTP timeout of every request is clamped to the remaining
+        budget, and a backoff / Retry-After sleep happens only if it (plus a viable request) still fits."""
         url = f"{self.base_url}/chat/completions"
-        attempt = 0
-        while True:
-            attempt += 1
+
+        def attempt(remaining: float | None) -> tuple[int, dict[str, str], bytes]:
+            http_timeout = self.timeout_s if remaining is None else max(0.1, min(self.timeout_s, remaining))
             try:
-                status, headers, raw = self._transport(url, body, self._headers(), self.timeout_s)
+                status, headers, raw = self._transport(url, body, self._headers(), http_timeout)
             except (urllib.error.URLError, TimeoutError, OSError) as e:
-                if attempt > self.max_retries:
-                    raise ProviderUnavailable(f"connection error: {e}") from e
-                self._sleep(_backoff(attempt))
-                continue
+                raise ProviderUnavailable(f"connection error: {e}") from e
             if 200 <= status < 300:
                 return status, headers, raw
             message = _error_message(raw, status)
-            if status == 429 or status >= 500:
-                if attempt > self.max_retries:
-                    if status == 429:
-                        raise ProviderRateLimited(f"rate limited: {message}", retry_after_s=_retry_after(headers))
-                    raise ProviderUnavailable(f"api error {status}: {message}", status=status)
-                self._sleep(_retry_after(headers) or _backoff(attempt))
-                continue
+            if status == 429:
+                raise ProviderRateLimited(f"rate limited: {message}", retry_after_s=_retry_after(headers))
+            if status >= 500:
+                raise ProviderUnavailable(f"api error {status}: {message}", status=status)
             raise ProviderRequestError(f"request error {status}: {message}", status=status)
+
+        return call_with_retries(attempt, budget_s=budget_s, max_retries=self.max_retries, sleep=self._sleep)
 
     # ------------------------------------------------------------------ translation (pure; unit-tested offline)
 
@@ -247,10 +246,6 @@ def _retry_after(headers: dict[str, str]) -> float | None:
         return max(0.0, min(60.0, float(v)))
     except ValueError:
         return None
-
-
-def _backoff(attempt: int) -> float:
-    return min(20.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0, 0.25)
 
 
 __all__ = ["OpenAICompatibleProvider", "ProviderError", "to_openai_messages", "to_openai_tool", "response_to_completion"]

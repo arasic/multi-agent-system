@@ -25,6 +25,9 @@ from mas.providers.base import (
 from mas.providers.pricing import Price, Pricing
 from mas.providers.telemetry import (
     AttemptBudgetExceeded,
+    AttemptCancelled,
+    AttemptDeadlineExceeded,
+    AttemptEnded,
     CallBudget,
     CallRecord,
     DbSink,
@@ -36,6 +39,9 @@ from mas.providers.telemetry import (
 
 __all__ = [
     "AttemptBudgetExceeded",
+    "AttemptCancelled",
+    "AttemptDeadlineExceeded",
+    "AttemptEnded",
     "CallBudget",
     "CallRecord",
     "Completion",
@@ -147,9 +153,14 @@ def meter(
     task_id: UUID | None = None,
     attempt_id: UUID | None = None,
     budget: CallBudget | None = None,
+    deadline: float | None = None,
+    cancel: Any = None,
+    call_timeout_s: float | None = None,
     cfg: Settings | None = None,
 ) -> MeteredProvider:
-    """Wrap a provider for one unit of work (attempt / planning round) with telemetry, pricing and a call budget."""
+    """Wrap a provider for one unit of work (attempt / planning round) with telemetry, pricing, a call budget and the
+    unit's deadline / cancellation."""
+    cfg = cfg or settings()
     return MeteredProvider(
         provider,
         sink=sink,
@@ -159,4 +170,7 @@ def meter(
         task_id=task_id,
         attempt_id=attempt_id,
         budget=budget,
+        deadline=deadline,
+        cancel=cancel,
+        call_timeout_s=call_timeout_s if call_timeout_s is not None else cfg.provider_timeout_s,
     )

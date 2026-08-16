@@ -2,7 +2,9 @@
 
 Scripted like `StubAgent`: each call consumes the next script item —
     str                     → text completion
-    dict                    → {"text", "tool_calls": [{"id","name","input"}], "stop_reason"}
+    dict                    → {"text", "tool_calls": [{"id","name","input"}], "stop_reason", "delay_s"}
+                              (delay_s simulates latency; longer than the call's timeout_s → ProviderUnavailable, like a real
+                              request timing out — the sleep itself is capped at timeout_s)
     Exception instance      → raised (simulate rate limits / outages; wrap in ProviderError subclasses)
     callable(messages, tools) → any of the above, decided from the request
 When the script is exhausted the last item repeats (or "OK" if there was none). Usage is synthetic but stable
@@ -12,11 +14,12 @@ When the script is exhausted the last item repeats (or "OK" if there was none). 
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from mas.providers.base import Completion, ToolCall, Usage
+from mas.providers.base import Completion, ProviderUnavailable, ToolCall, Usage
 
 ScriptItem = str | dict[str, Any] | BaseException | Callable[..., Any] | Completion
 
@@ -77,13 +80,27 @@ class FakeProvider:
         max_tokens: int = 4096,
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
+        timeout_s: float | None = None,
     ) -> Completion:
-        self.calls.append({"messages": [dict(m) for m in messages], "tools": list(tools or []), "max_tokens": max_tokens})
+        self.calls.append(
+            {
+                "messages": [dict(m) for m in messages],
+                "tools": list(tools or []),
+                "max_tokens": max_tokens,
+                "timeout_s": timeout_s,
+            }
+        )
         item = self._next(messages, tools)
         if isinstance(item, BaseException):
             raise item
         if isinstance(item, Completion):
             return item
+        if isinstance(item, dict) and item.get("delay_s"):
+            delay = float(item["delay_s"])
+            if timeout_s is not None and delay > timeout_s:
+                time.sleep(max(0.0, timeout_s))
+                raise ProviderUnavailable(f"timed out after {timeout_s:.1f}s (fake latency {delay:.1f}s)")
+            time.sleep(delay)
         if isinstance(item, str):
             text, tcs, stop = item, [], "end_turn"
         elif isinstance(item, dict):

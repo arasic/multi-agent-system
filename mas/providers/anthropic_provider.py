@@ -10,6 +10,8 @@ Request shape (current models):
 - streaming (`messages.stream(...).get_final_message()`) when `max_tokens` is large, plain `create` otherwise;
 - optional server-side refusal fallbacks (beta) when `fallbacks` is set — opt-in, off by default, because it is a
   Claude-API-only beta we cannot exercise offline;
+- SDK retries are OFF (`max_retries=0`); retries run in `call_with_retries` so that a call's `timeout_s` budget bounds
+  every request and every backoff/Retry-After sleep — nothing can silently outlive the attempt's deadline;
 - `stop_reason == "refusal"` is surfaced as `Completion.stop_reason="refusal"` (empty text), never as an exception.
 
 Usage returned is *unpriced* (`priced=False`); the MeteredProvider prices it from `MAS_MODEL_PRICES`.
@@ -18,6 +20,7 @@ Usage returned is *unpriced* (`priced=False`); the MeteredProvider prices it fro
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from mas.providers.base import (
@@ -28,6 +31,7 @@ from mas.providers.base import (
     ProviderUnavailable,
     ToolCall,
     Usage,
+    call_with_retries,
 )
 
 log = logging.getLogger(__name__)
@@ -52,18 +56,23 @@ class AnthropicProvider:
         max_retries: int = 2,
         api_key: str | None = None,
         base_url: str | None = None,
+        sleep: Any = None,
     ):
         self.model = model
         self.thinking = thinking
         self.effort = effort or None
         self.fallbacks = fallbacks or None
+        self.timeout_s = float(timeout_s)
+        self.max_retries = max(0, int(max_retries))
+        self._sleep = sleep
         self._warned_temperature = False
         if client is None:
             try:
                 import anthropic
             except ImportError as e:  # pragma: no cover - environment
                 raise ProviderRequestError("the 'anthropic' package is not installed: pip install -e '.[llm]'") from e
-            kwargs: dict[str, Any] = {"timeout": timeout_s, "max_retries": max_retries}
+            # SDK retries are disabled: retries happen in call_with_retries, where they are bounded by the call budget
+            kwargs: dict[str, Any] = {"timeout": timeout_s, "max_retries": 0}
             if api_key:
                 kwargs["api_key"] = api_key
             if base_url:
@@ -80,28 +89,40 @@ class AnthropicProvider:
         max_tokens: int = 4096,
         tools: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
+        timeout_s: float | None = None,
     ) -> Completion:
         if temperature is not None and not self._warned_temperature:
             log.info("anthropic provider: ignoring temperature=%s (rejected by current models)", temperature)
             self._warned_temperature = True
         params = self.build_params(messages, max_tokens=max_tokens, tools=tools)
-        try:
-            if self.fallbacks:
-                params["extra_body"] = {"fallbacks": self.fallbacks}
-                params["extra_headers"] = {"anthropic-beta": _FALLBACK_BETA}
-                api = self.client.beta.messages
-            else:
-                api = self.client.messages
-            if max_tokens > STREAM_THRESHOLD_TOKENS:
-                with api.stream(**params) as stream:
-                    msg = stream.get_final_message()
-            else:
-                msg = api.create(**params)
-        except ProviderError:
-            raise
-        except Exception as e:  # translate SDK errors to provider-neutral ones (most specific first)
-            raise _translate(e) from e
+        if self.fallbacks:
+            params["extra_body"] = {"fallbacks": self.fallbacks}
+            params["extra_headers"] = {"anthropic-beta": _FALLBACK_BETA}
+
+        def attempt(remaining: float | None) -> Any:
+            per_request = self.timeout_s if remaining is None else max(0.1, min(self.timeout_s, remaining))
+            client = self._client_for(per_request)
+            api = client.beta.messages if self.fallbacks else client.messages
+            try:
+                if max_tokens > STREAM_THRESHOLD_TOKENS:
+                    with api.stream(**params) as stream:
+                        return stream.get_final_message()
+                return api.create(**params)
+            except ProviderError:
+                raise
+            except Exception as e:  # translate SDK errors to provider-neutral ones (most specific first)
+                raise _translate(e) from e
+
+        # timeout_s is the whole call's budget: per-request HTTP timeout AND retry sleeps must fit inside it
+        msg = call_with_retries(attempt, budget_s=timeout_s, max_retries=self.max_retries, sleep=self._sleep or time.sleep)
         return message_to_completion(msg)
+
+    def _client_for(self, per_request_timeout: float) -> Any:
+        """A view of the client with this request's timeout and NO SDK retries (fake test clients may lack with_options)."""
+        with_options = getattr(self.client, "with_options", None)
+        if with_options is None:
+            return self.client
+        return with_options(timeout=per_request_timeout, max_retries=0)
 
     # ------------------------------------------------------------------ translation (pure; unit-tested offline)
 
