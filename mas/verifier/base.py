@@ -47,6 +47,8 @@ class VerificationRequest:
     benchmark: str | None
     repository: Path | None
     commit_sha: str | None
+    # ADR-007: sha256 of the approved, frozen acceptance suite; when set, the suite on disk must hash to it
+    expected_suite_sha256: str | None = None
 
 
 @dataclass(frozen=True)

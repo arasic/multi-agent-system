@@ -129,11 +129,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         threading.Thread(target=_chaos, daemon=True).start()
 
-    verifier = (
-        StubVerifier(passed=not args.verifier_fail)
-        if args.stub_verifier or args.verifier_fail
-        else _acceptance_verifier()
-    )
+    verifier = StubVerifier(passed=not args.verifier_fail) if args.stub_verifier or args.verifier_fail else _acceptance_verifier()
     timeout = args.timeout if args.timeout is not None else args.max_wallclock_s + 60
     t0 = time.monotonic()
     try:

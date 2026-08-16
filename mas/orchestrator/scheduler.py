@@ -109,6 +109,17 @@ def _verify_unlock(conn: Conn, run_id: UUID) -> None:
         log.debug("advisory unlock failed", exc_info=True)
 
 
+def _truncate_report(report: dict[str, Any], limit: int = 8192) -> dict[str, Any]:
+    """The verification artifact holds the full report; the event log gets a bounded copy (long stdout/stderr cut)."""
+    out: dict[str, Any] = {}
+    for k, v in report.items():
+        if isinstance(v, str) and len(v) > limit:
+            out[k] = v[:limit] + f"…[truncated {len(v) - limit} chars; full text in the verification artifact]"
+        else:
+            out[k] = v
+    return out
+
+
 def _verification_request(conn: Conn, run: Run, workspace: Any | None) -> VerificationRequest:
     """Resolve mutable DB/workspace state before crossing the verifier boundary.
 
@@ -175,7 +186,7 @@ def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None 
                 conn,
                 run_id,
                 "verify.passed" if result_passed else "verify.failed",
-                payload={"verifier": getattr(verifier, "name", "?"), "report": report},
+                payload={"verifier": getattr(verifier, "name", "?"), "report": _truncate_report(report)},
             )
             if result_passed:
                 integ = _integration_task(conn, run_id)

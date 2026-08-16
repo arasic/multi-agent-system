@@ -182,9 +182,7 @@ def test_worker_commit_to_external_verdict_end_to_end(conn, tmp_path, verifier_i
     thread = run_worker_thread(worker, stop)
     verifier = AcceptanceVerifier(ROOT / "acceptance", image=verifier_image)
     try:
-        final = scheduler.run_until_terminal(
-            conn, run.id, verifier=verifier, workspace=workspace, tick_s=0.05, timeout_s=45
-        )
+        final = scheduler.run_until_terminal(conn, run.id, verifier=verifier, workspace=workspace, tick_s=0.05, timeout_s=45)
     finally:
         stop.set()
         wait_all([thread], 10)
@@ -198,3 +196,46 @@ def test_worker_commit_to_external_verdict_end_to_end(conn, tmp_path, verifier_i
     assert verification["meta"]["report"]["integration_sha"]
     accepted = store.accepted_for_run(conn, run.id)
     assert len(accepted) == 1 and accepted[0].type == "git_commit"
+
+
+@pytest.mark.docker
+def test_output_flood_is_capped_killed_and_never_reaches_host_disk(tmp_path, verifier_image):
+    """P1 from review: capture is bounded while capturing, not after. A 400 MB flood must produce INVALID quickly,
+    leave no container, and never create a capture file on the host (pipes + in-memory cap only)."""
+    import glob
+    import tempfile
+    import time
+
+    repo, sha = _fixture_commit(tmp_path, "known_good")
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "mas-verify-*")))
+    t0 = time.monotonic()
+    result = AcceptanceVerifier(SPECIAL_SUITES, image=verifier_image, limits=SandboxLimits(timeout_s=20)).verify(
+        _request(repo, sha, "floods")
+    )
+    elapsed = time.monotonic() - t0
+    assert result.status is VerificationStatus.INVALID
+    assert "output exceeded limit" in (result.reason or "")
+    assert result.evidence["stdout_bytes"] > result.evidence["output_cap"] == 256 * 1024
+    assert elapsed < 15, elapsed  # killed on overflow, well before the 20 s timeout
+    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "mas-verify-*"))) - before == set()
+    leftover = subprocess.run(
+        ["docker", "ps", "-a", "--filter", "name=mas-verify-", "-q"], capture_output=True, text=True, check=False
+    ).stdout.split()
+    assert leftover == []
+
+
+def test_expected_suite_hash_is_enforced_before_any_sandbox_work(tmp_path):
+    """ADR-007 pinning: a request carrying an approved suite hash that does not match the suite on disk is INVALID
+    before the runner is even inspected (no Docker needed)."""
+    repo, sha = _fixture_commit(tmp_path, "known_good")
+    v = AcceptanceVerifier(ROOT / "acceptance", image="image-does-not-matter")
+    good = v.suite_digest("url_shortener")
+    assert len(good) == 64
+    bad = VerificationRequest(uuid4(), "url_shortener", repo, sha, expected_suite_sha256="0" * 64)
+    result = v.verify(bad)
+    assert result.status is VerificationStatus.INVALID
+    assert "approved contract" in (result.reason or "")
+    assert result.evidence["suite_sha256"] == good
+    # with the right hash we get past pinning; the missing image is then the (ERROR) reason, proving order
+    ok = VerificationRequest(uuid4(), "url_shortener", repo, sha, expected_suite_sha256=good.upper())
+    assert v.verify(ok).status is VerificationStatus.ERROR

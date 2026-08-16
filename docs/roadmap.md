@@ -29,7 +29,7 @@ Also landed early (LLM-free): the **structural subset of the DAG validator** (ru
 1. ~~Fix the wall-clock budget defect~~ — done: one clock from creation (`budgets.violation`), regression test.
 2. ~~Write ADR-007 (Acceptance Contract Freeze)~~ — done.
 3. ~~Step 6: real worktrees + commits, `context_spec` enforcement, non-root/no-network workers~~ — built, stabilized (heartbeat through settlement, atomic report, one lock order), stress gate passed.
-4. ~~Step 7A: fail-closed acceptance runner~~ — done. Next: trusted adapter library, then concurrent run ticking.
+4. ~~Step 7A: fail-closed acceptance runner~~ — done (+ review fixes: bounded capture / kill-on-overflow / `--log-driver none`, `expected_suite_sha256` pinning, event report truncation). Next: trusted adapter library, then concurrent run ticking.
 5. Steps 9–10: model provider + LLM worker (tool layer bound to `ctx.tools`; artifacts rendered as data).
 6. Step 11: planner producing DAG + assumptions + **acceptance-contract proposal** (ADR-007) or questions (ADR-006).
 7. Step 13-lite: one bounded verifier-driven repair cycle.

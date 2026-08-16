@@ -80,6 +80,7 @@ Legend: ✅ enforced and tested today · 🟡 designed, not built yet (roadmap s
 | E4 | **Silent stalls** | Nothing progresses, nothing complains | Watchdog logs open tasks/attempts after 20 s of no events; budgets end it | ✅ (one unreproduced stall on record — roadmap) |
 | E5 | **Reaping live work** — a slow commit/publish outlives the lease and a healthy attempt is marked ABANDONED (found in review) | Duplicate work, stale reports, flaky runs | Heartbeat runs through settlement; report is one atomic transaction; the reaper re-checks expiry under the row lock | ✅ (tests: slow publish not reaped; deliberate deaths → exactly one abandonment) |
 | E6 | **Inconsistent lock order** → PostgreSQL deadlocks under load (found in review: claim took task→run, everything else run→task) | Random transaction aborts, lost reports | One order `run → task → attempt → inserts`; `FOR NO KEY UPDATE`; concurrency regression test + stress gate | ✅ |
+| E7 | **Unbounded output capture from sandboxed code** (found in review of the verifier) | Agent-authored code floods stdout; the host disk fills before any cap applies | Capture through pipes with an in-memory cap; kill on overflow → `INVALID`; `--log-driver none`; flood fixture in the suite | ✅ (peak host disk during a 400 MB flood: 285 MB → 0) |
 
 ---
 

@@ -155,7 +155,7 @@ docker compose up -d postgres
 .venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3 --stub-verifier
 .venv/Scripts/mas replay <run_id>
 docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
-.venv/Scripts/python -m pytest -q                                   # 87 tests, no API key; uses its own temp DB
+.venv/Scripts/python -m pytest -q                                   # 89 tests, no API key; uses its own temp DB
 ```
 
 Runs are tagged with a **pool**: `mas run` uses a private `local:<pid>` pool, the compose services serve `default`, so they never take each other's work even on the same database. Tests are isolated too — each pytest process creates and drops its own `mas_test_<pid>` database, so concurrent test runs can't collide.

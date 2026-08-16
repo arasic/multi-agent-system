@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -89,11 +90,21 @@ class AcceptanceVerifier:
 
         try:
             suite, manifest, suite_hash = self._load_suite(request.benchmark)
-            image_ref = self._image_ref()
         except InvalidSuite as exc:
             return self._failed(request, VerificationStatus.INVALID, str(exc), started)
+        # ADR-007: when the orchestrator carries a frozen, approved suite hash, the suite on disk must be that suite.
+        if request.expected_suite_sha256 and request.expected_suite_sha256.lower() != suite_hash:
+            return self._failed(
+                request,
+                VerificationStatus.INVALID,
+                "acceptance suite hash does not match the approved contract",
+                started,
+                suite_hash=suite_hash,
+            )
+        try:
+            image_ref = self._image_ref()
         except RunnerUnavailable as exc:
-            return self._failed(request, VerificationStatus.ERROR, str(exc), started)
+            return self._failed(request, VerificationStatus.ERROR, str(exc), started, suite_hash=suite_hash)
 
         with tempfile.TemporaryDirectory(prefix=f"mas-verify-{str(request.run_id)[:8]}-") as tmp:
             root = Path(tmp)
@@ -105,7 +116,7 @@ class AcceptanceVerifier:
                 status = VerificationStatus.INVALID if isinstance(exc, InvalidCommit) else VerificationStatus.ERROR
                 return self._failed(request, status, str(exc), started, suite_hash=suite_hash, image_ref=image_ref)
 
-            outcome = self._run_container(checkout, suite, manifest, request, suite_hash, image_ref, root)
+            outcome = self._run_container(checkout, suite, manifest, request, suite_hash, image_ref)
 
         # A writable or externally replaced suite is never silently accepted.
         if _hash_tree(suite) != suite_hash:
@@ -164,6 +175,11 @@ class AcceptanceVerifier:
         if not isinstance(timeout_s, int) or not 1 <= timeout_s <= self.limits.timeout_s:
             raise InvalidSuite(f"suite timeout_s must be between 1 and {self.limits.timeout_s}")
         return suite, manifest, _hash_tree(suite)
+
+    def suite_digest(self, benchmark: str) -> str:
+        """sha256 of the suite directory as the verifier hashes it — what an approved acceptance contract pins."""
+        _, _, digest = self._load_suite(benchmark)
+        return digest
 
     def _image_ref(self) -> str:
         try:
@@ -240,7 +256,6 @@ class AcceptanceVerifier:
         request: VerificationRequest,
         suite_hash: str,
         image_ref: str,
-        temp_root: Path,
     ) -> VerificationResult:
         name = f"mas-verify-{uuid.uuid4().hex[:16]}"
         timeout_s = int(manifest["timeout_s"])
@@ -281,24 +296,48 @@ class AcceptanceVerifier:
             self.image,
             *manifest["command"],
         ]
-        stdout_path, stderr_path = temp_root / "stdout", temp_root / "stderr"
+        # Bounded capture: stdout/stderr are drained through pipes by reader threads that keep at most
+        # max_output_bytes each and DISCARD the rest, so a flooding suite can neither block on a full pipe nor
+        # write past the cap onto the host. On overflow the container is killed and the verdict is INVALID.
+        # `--log-driver none`: the daemon must not keep a second, unbounded copy of the output either.
+        cmd[2:2] = ["--log-driver", "none"]
+        cap = self.limits.max_output_bytes
+        out = _BoundedCapture(cap)
+        err = _BoundedCapture(cap)
         started = time.monotonic()
         try:
-            with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-                proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert proc.stdout is not None and proc.stderr is not None
+            t_out = threading.Thread(target=out.pump, args=(proc.stdout,), daemon=True)
+            t_err = threading.Thread(target=err.pump, args=(proc.stderr,), daemon=True)
+            t_out.start()
+            t_err.start()
+            exit_code: int | None = None
+            while exit_code is None:
                 try:
-                    exit_code = proc.wait(timeout=timeout_s)
+                    exit_code = proc.wait(timeout=0.1)
                 except subprocess.TimeoutExpired:
-                    subprocess.run([self.docker, "rm", "-f", name], capture_output=True, timeout=15, check=False)
-                    proc.wait(timeout=15)
-                    return self._failed(
-                        request,
-                        VerificationStatus.TIMEOUT,
-                        f"acceptance suite exceeded hard timeout of {timeout_s}s",
-                        started,
-                        suite_hash=suite_hash,
-                        image_ref=image_ref,
-                    )
+                    if out.overflowed or err.overflowed:
+                        subprocess.run([self.docker, "rm", "-f", name], capture_output=True, timeout=15, check=False)
+                        proc.wait(timeout=15)
+                        evidence = self._evidence(request, started, suite_hash, image_ref)
+                        evidence.update({"stdout_bytes": out.seen, "stderr_bytes": err.seen, "output_cap": cap})
+                        return VerificationResult.fail(
+                            "acceptance output exceeded limit", status=VerificationStatus.INVALID, evidence=evidence
+                        )
+                    if time.monotonic() - started > timeout_s:
+                        subprocess.run([self.docker, "rm", "-f", name], capture_output=True, timeout=15, check=False)
+                        proc.wait(timeout=15)
+                        return self._failed(
+                            request,
+                            VerificationStatus.TIMEOUT,
+                            f"acceptance suite exceeded hard timeout of {timeout_s}s",
+                            started,
+                            suite_hash=suite_hash,
+                            image_ref=image_ref,
+                        )
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return self._failed(
                 request,
@@ -311,14 +350,14 @@ class AcceptanceVerifier:
         finally:
             subprocess.run([self.docker, "rm", "-f", name], capture_output=True, timeout=15, check=False)
 
-        stdout = _read_capped(stdout_path, self.limits.max_output_bytes)
-        stderr = _read_capped(stderr_path, self.limits.max_output_bytes)
         evidence = self._evidence(request, started, suite_hash, image_ref)
-        evidence.update({"exit_code": exit_code, "stderr": stderr})
-        if stdout_path.stat().st_size > self.limits.max_output_bytes or stderr_path.stat().st_size > self.limits.max_output_bytes:
+        evidence.update({"exit_code": exit_code, "stderr": err.text(), "stdout_bytes": out.seen, "stderr_bytes": err.seen})
+        if out.overflowed or err.overflowed:  # finished on its own but past the cap
+            evidence["output_cap"] = cap
             return VerificationResult.fail(
                 "acceptance output exceeded limit", status=VerificationStatus.INVALID, evidence=evidence
             )
+        stdout = out.text()
         if exit_code != 0:
             evidence["stdout"] = stdout
             return VerificationResult.fail(
@@ -345,12 +384,17 @@ class AcceptanceVerifier:
         checks: list[CheckResult] = []
         try:
             for row in rows:
-                if not isinstance(row, dict) or not {"id", "status"} <= set(row) or not set(row) <= {
-                    "id",
-                    "status",
-                    "detail",
-                    "duration_ms",
-                }:
+                if (
+                    not isinstance(row, dict)
+                    or not {"id", "status"} <= set(row)
+                    or not set(row)
+                    <= {
+                        "id",
+                        "status",
+                        "detail",
+                        "duration_ms",
+                    }
+                ):
                     raise ValueError("invalid check record")
                 checks.append(
                     CheckResult(
@@ -427,6 +471,38 @@ class RunnerUnavailable(Exception):
     pass
 
 
+class _BoundedCapture:
+    """Drains a pipe on a thread; keeps at most `cap` bytes, counts everything, never blocks the child."""
+
+    def __init__(self, cap: int):
+        self.cap = cap
+        self.buf = bytearray()
+        self.seen = 0
+        self.overflowed = False
+
+    def pump(self, stream) -> None:
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    return
+                self.seen += len(chunk)
+                if len(self.buf) < self.cap:
+                    self.buf.extend(chunk[: self.cap - len(self.buf)])
+                if self.seen > self.cap:
+                    self.overflowed = True  # keep draining (discarding) so the child cannot block on a full pipe
+        except (OSError, ValueError):
+            return
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def text(self) -> str:
+        return bytes(self.buf).decode("utf-8", errors="replace")
+
+
 def _hash_tree(root: Path) -> str:
     h = hashlib.sha256()
     for path in sorted(p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts):
@@ -437,8 +513,3 @@ def _hash_tree(root: Path) -> str:
         h.update(len(data).to_bytes(8, "big"))
         h.update(data)
     return h.hexdigest()
-
-
-def _read_capped(path: Path, limit: int) -> str:
-    with path.open("rb") as f:
-        return f.read(limit).decode("utf-8", errors="replace")

@@ -11,9 +11,7 @@ DAG = "benchmarks/url_shortener/dag.json"
 
 def test_migrate_and_run_and_status_and_replay(conn, capsys):
     assert main(["migrate"]) == 0
-    rc = main(
-        ["run", "--dag", DAG, "--workers", "3", "--stub-sleep", "0.05", "--lease-s", "2", "--stub-verifier"]
-    )
+    rc = main(["run", "--dag", DAG, "--workers", "3", "--stub-sleep", "0.05", "--lease-s", "2", "--stub-verifier"])
     out = capsys.readouterr().out
     assert rc == 0, out
     assert "PASSED  verdict=PASS" in out
