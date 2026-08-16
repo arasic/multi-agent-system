@@ -93,7 +93,7 @@ The MAS runtime built here is intended to become the reasoning/orchestration lay
 | **Tool** | Something an agent may call (filesystem, python, git, model). Scoped per task. |
 | **Verifier** | Deterministic code that runs the fixed acceptance suite on the integration artifact. Alone decides PASS/FAIL. |
 | **Policy / Budget** | Hard limits: tokens, cost, tasks, attempts, re-plans, deadline, concurrency. Enforced by the orchestrator. |
-| **ModelProvider** | Abstract LLM interface. Model names never appear in architecture code. |
+| **ModelProvider** | Abstract LLM interface (`anthropic` / `openai`-compatible / `fake` behind it, chosen by config). Model names never appear in architecture code. Every call is metered: telemetry row, price from config, per-attempt call budget. |
 
 ## Repository layout (target)
 
@@ -120,7 +120,7 @@ multi-agent-system/
 │   ├── workers/                  # runtime loop, stub agent, workspace (bare repo per run, worktree per attempt)
 │   ├── artifacts/                # publish / accept / supersede / reject
 │   ├── verifier/                 # Verifier protocol, StubVerifier; acceptance runner (step 7)
-│   └── providers/                # ModelProvider interface; concrete providers (step 9)
+│   └── providers/                # ModelProvider + anthropic / openai-compatible / fake providers, pricing, metering (step 9)
 ├── benchmarks/
 │   ├── url_shortener/            # smoke test: spec + fixtures for stub workers
 │   └── adapters/                 # width benchmark: N adapters vs fixed interface
@@ -155,7 +155,7 @@ docker compose up -d postgres
 .venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3 --stub-verifier
 .venv/Scripts/mas replay <run_id>
 docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
-.venv/Scripts/python -m pytest -q                                   # 117 tests, no API key; uses its own temp DB
+.venv/Scripts/python -m pytest -q                                   # 137 tests, no API key; uses its own temp DB
 ```
 
 Runs are tagged with a **pool**: `mas run` uses a private `local:<pid>` pool, the compose services serve `default`, so they never take each other's work even on the same database. Tests are isolated too — each pytest process creates and drops its own `mas_test_<pid>` database, so concurrent test runs can't collide.
@@ -182,7 +182,7 @@ docker kill multi-agent-system-worker-2      # the reaper reassigns its task; th
 
 **Step 7C done:** the orchestrator service ticks runs concurrently (bounded executor, per-run advisory locks, one connection per tick — a slow verification never blocks other runs) and defers verification (`--verifier external`) to a **verifier service** (`mas verify --watch`) that has sandbox access; service-mode runs now get real verdicts. Demonstrated fire-and-forget: submit through the services, kill a worker, kill the verifier mid-verification, restart → `PASS`.
 
-**M1 substrate is complete.** Next: models (M2) — `ModelProvider`, the LLM worker + tool layer, the LLM planner with questions/assumptions/acceptance-contract proposal, one bounded repair cycle; then the fair benchmark (M3). The hardened Compose orchestrator intentionally has no Docker socket; use a host orchestrator for real verification until a separate verifier service/runner API exists. See [docs/roadmap.md](docs/roadmap.md).
+**M1 substrate is complete.** **M2 step 9 done:** concrete `ModelProvider`s (`anthropic`, `openai`-compatible, `fake`) chosen by `MAS_MODEL_<ROLE>="<provider>:<model>"`, prices from `MAS_MODEL_PRICES`, and **per-call telemetry**: every model call is timed, priced and written to `model_calls` as it finishes (evidence that survives a dying worker), attempts settle from the meter, and a per-attempt call/token budget (capped by the run's remaining tokens) makes runaway agent loops impossible. `mas models --ping` is the provider smoke test; `mas status` shows per-model calls and flags unpriced usage. Next: the LLM worker + tool layer (step 10), the LLM planner with questions/assumptions/acceptance-contract proposal (11), one bounded repair cycle; then the fair benchmark (M3). The hardened Compose orchestrator intentionally has no Docker socket; use a host orchestrator for real verification until a separate verifier service/runner API exists. See [docs/roadmap.md](docs/roadmap.md).
 
 ## Later
 

@@ -36,6 +36,16 @@ class RunMetrics:
     cost_usd: float
     events: int
     per_task: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # step 9: per-call telemetry (model_calls) — evidence independent of settlement; unpriced calls are called out
+    model_calls: int = 0
+    model_call_errors: int = 0
+    unpriced_calls: int = 0
+    call_input_tokens: int = 0
+    call_output_tokens: int = 0
+    call_cache_read_tokens: int = 0
+    call_cost_usd: float = 0.0
+    call_seconds: float = 0.0
+    per_model: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -112,6 +122,8 @@ def compute(conn: Conn, run_id: UUID) -> RunMetrics:
     if run.created_at and run.finished_at:
         total = (run.finished_at - run.created_at).total_seconds()
 
+    calls = model_call_summary(conn, run_id)
+
     return RunMetrics(
         run_id=str(run.id),
         status=run.status.value,
@@ -137,4 +149,60 @@ def compute(conn: Conn, run_id: UUID) -> RunMetrics:
         cost_usd=round(sum(a.cost_usd for a in attempts), 6),
         events=int(n_events),
         per_task=per_task,
+        **calls,
     )
+
+
+def model_call_summary(conn: Conn, run_id: UUID) -> dict[str, Any]:
+    """Totals over model_calls for a run, plus a per-model breakdown (role, calls, tokens, cost, priced?)."""
+    rows = conn.execute(
+        """
+        SELECT provider, model, role,
+               count(*)                                   AS calls,
+               count(*) FILTER (WHERE status = 'error')   AS errors,
+               count(*) FILTER (WHERE NOT priced)         AS unpriced,
+               coalesce(sum(input_tokens), 0)             AS input_tokens,
+               coalesce(sum(output_tokens), 0)            AS output_tokens,
+               coalesce(sum(cache_read_tokens), 0)        AS cache_read_tokens,
+               coalesce(sum(cost_usd), 0)                 AS cost_usd,
+               coalesce(sum(duration_ms), 0)              AS duration_ms
+        FROM model_calls WHERE run_id = %s
+        GROUP BY provider, model, role ORDER BY provider, model, role
+        """,
+        (run_id,),
+    ).fetchall()
+    per_model: dict[str, dict[str, Any]] = {}
+    tot: dict[str, Any] = {
+        "model_calls": 0,
+        "model_call_errors": 0,
+        "unpriced_calls": 0,
+        "call_input_tokens": 0,
+        "call_output_tokens": 0,
+        "call_cache_read_tokens": 0,
+        "call_cost_usd": 0.0,
+        "call_seconds": 0.0,
+    }
+    for r in rows:
+        key = f"{r['provider']}:{r['model']}/{r['role']}"
+        per_model[key] = {
+            "calls": int(r["calls"]),
+            "errors": int(r["errors"]),
+            "unpriced": int(r["unpriced"]),
+            "input_tokens": int(r["input_tokens"]),
+            "output_tokens": int(r["output_tokens"]),
+            "cache_read_tokens": int(r["cache_read_tokens"]),
+            "cost_usd": round(float(r["cost_usd"]), 6),
+            "seconds": round(int(r["duration_ms"]) / 1000.0, 3),
+        }
+        tot["model_calls"] += int(r["calls"])
+        tot["model_call_errors"] += int(r["errors"])
+        tot["unpriced_calls"] += int(r["unpriced"])
+        tot["call_input_tokens"] += int(r["input_tokens"])
+        tot["call_output_tokens"] += int(r["output_tokens"])
+        tot["call_cache_read_tokens"] += int(r["cache_read_tokens"])
+        tot["call_cost_usd"] += float(r["cost_usd"])
+        tot["call_seconds"] += int(r["duration_ms"]) / 1000.0
+    tot["call_cost_usd"] = round(tot["call_cost_usd"], 6)
+    tot["call_seconds"] = round(tot["call_seconds"], 3)
+    tot["per_model"] = per_model
+    return tot

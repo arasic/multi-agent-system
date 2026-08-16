@@ -5,7 +5,8 @@ mas run --dag FILE [--workers N ...]     in-process run: orchestrator + N stub w
 mas submit --dag FILE [--wait]           create a run for the orchestrator/worker services to execute
 mas orchestrate --watch [--verifier external|acceptance|stub] [--parallel N]   orchestrator service (bounded, concurrent)
 mas verify --watch | --once              verifier service: real sandboxed verdicts for runs left in VERIFYING
-mas worker --stub [--capabilities ...]   worker service (compose)
+mas worker --stub [--capabilities ...]   worker service (compose); --model <provider>:<model> attaches a metered model
+mas models [--ping]                      configured model roles, pricing status; --ping makes one metered test call
 mas status RUN_ID                        summary + metrics (+ pending questions when AWAITING_INPUT)
 mas answer RUN_ID "text"                 answer the planner's clarifying questions (ADR-006)
 mas artifacts RUN_ID                     list artifacts (git_commit shas, sha:path documents, decisions, verification)
@@ -104,13 +105,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     stop = threading.Event()
     agent = StubAgent(default_script={"sleep_s": args.stub_sleep})
+    provider = _worker_provider(None)  # $MAS_MODEL_WORKER; stub agents ignore it, LLM agents (step 10) use ctx.model
     ws = _workspace(args.workspace)
     print(
         f"  workspace={ws.name}"
         + (f"  repos={settings().repo_root}  worktrees={settings().worktree_root}" if ws.name == "git" else "")
     )
     workers = [
-        Worker(f"worker-{i + 1}", sorted(caps), agent, poll_s=0.1, run_id=run.id, workspace=ws) for i in range(args.workers)
+        Worker(f"worker-{i + 1}", sorted(caps), agent, poll_s=0.1, run_id=run.id, workspace=ws, provider=provider)
+        for i in range(args.workers)
     ]
     threads = [run_worker_thread(w, stop) for w in workers]
 
@@ -168,6 +171,18 @@ def _print_metrics(m: metrics.RunMetrics) -> None:
     )
     for k, v in m.per_task.items():
         print(f"    {k:14s} {v['status']:10s} attempts={v['attempts']} {v['seconds']:.2f}s workers={v['workers']}")
+    if m.model_calls:
+        unpriced = f"  UNPRICED={m.unpriced_calls} (cost understated; set MAS_MODEL_PRICES)" if m.unpriced_calls else ""
+        print(
+            f"  model calls={m.model_calls} errors={m.model_call_errors} "
+            f"tokens in/out={m.call_input_tokens}/{m.call_output_tokens} cache_read={m.call_cache_read_tokens} "
+            f"cost=${m.call_cost_usd} time={m.call_seconds}s{unpriced}"
+        )
+        for k, v in m.per_model.items():
+            print(
+                f"    {k:36s} calls={v['calls']} err={v['errors']} in/out={v['input_tokens']}/{v['output_tokens']} "
+                f"cost=${v['cost_usd']} {v['seconds']}s" + ("  unpriced" if v["unpriced"] else "")
+            )
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
@@ -377,14 +392,23 @@ def _pools(arg: str | None) -> list[str] | None:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
+def _worker_provider(spec: str | None):
+    """--model <provider>:<model> or $MAS_MODEL_WORKER; None = no model (stub agents). Only mas/providers names vendors."""
+    from mas import providers
+
+    spec = spec if spec is not None else settings().model_worker
+    return providers.from_spec(spec) if spec else None
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     if not args.stub:
-        print("only --stub workers exist until roadmap step 10", file=sys.stderr)
+        print("only --stub workers exist until roadmap step 10 (the model layer is in; the LLM agent is next)", file=sys.stderr)
         return 2
     caps = [c.strip() for c in (args.capabilities or ",".join(settings().worker_capabilities)).split(",") if c.strip()]
     wid = args.id or f"worker-{socket.gethostname()}-{os.getpid()}"
     pools = _pools(args.pool)
     ws = _workspace(args.workspace)
+    provider = _worker_provider(args.model)
     w = Worker(
         wid,
         caps,
@@ -392,14 +416,57 @@ def cmd_worker(args: argparse.Namespace) -> int:
         poll_s=settings().worker_poll_s,
         pools=pools,
         workspace=ws,
+        provider=provider,
     )
-    print(f"{wid}: capabilities={caps} pools={pools} (Ctrl-C to stop)")
+    model = f"{provider.name}:{provider.model}" if provider else "none"
+    print(f"{wid}: capabilities={caps} pools={pools} model={model} (Ctrl-C to stop)")
     stop = threading.Event()
     try:
         w.run_forever(stop)
     except KeyboardInterrupt:
         stop.set()
     return 0
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    """Show the configured model roles and pricing status; --ping makes one small metered call per configured role
+    (or the given --spec) and prints the telemetry record — the smallest end-to-end proof that a provider works."""
+    from mas import providers
+
+    cfg = settings()
+    pricing = providers.pricing_from_settings(cfg)
+    known = f": {pricing.known_models()}" if len(pricing) else ""
+    print(f"pricing: {len(pricing)} model(s) configured via MAS_MODEL_PRICES{known}")
+    specs: list[tuple[str, str]] = []
+    if args.spec:
+        specs.append(("adhoc", args.spec))
+    else:
+        for role in providers.ROLES:
+            spec = providers.role_spec(role, cfg)
+            flag = "" if not spec or pricing.price(providers.parse_spec(spec)[1]) else "  [unpriced]"
+            print(f"  {role:9s} {spec or '(none)'}{flag}")
+            if spec:
+                specs.append((role, spec))
+    print(f"  attempt budget: max_calls={cfg.attempt_max_calls} max_tokens={cfg.attempt_max_tokens}")
+    if not args.ping:
+        return 0
+    if not specs:
+        print("nothing to ping: set MAS_MODEL_WORKER / MAS_MODEL_PLANNER or pass --spec <provider>:<model>", file=sys.stderr)
+        return 2
+    rc = 0
+    for role, spec in specs:
+        sink = providers.MemorySink()
+        try:
+            base = providers.from_spec(spec, cfg=cfg)
+            m = providers.meter(base, role="ping", sink=sink, pricing=pricing, budget=providers.CallBudget(max_calls=1))
+            comp = m.complete([{"role": "user", "content": args.prompt}], max_tokens=args.max_tokens)
+            print(f"[{role}] {spec}: {comp.stop_reason} {comp.text.strip()[:200]!r}")
+        except Exception as e:  # noqa: BLE001 - diagnostic command: surface anything
+            print(f"[{role}] {spec}: FAILED {type(e).__name__}: {e}", file=sys.stderr)
+            rc = 1
+        for rec in sink.records:
+            print("   ", json.dumps(rec.as_dict(), default=str))
+    return rc
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -544,12 +611,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     w = sub.add_parser("worker", help="worker service")
     w.add_argument("--stub", action="store_true")
+    w.add_argument(
+        "--model",
+        default=None,
+        help="<provider>:<model> handed to agents as a metered ctx.model (default: $MAS_MODEL_WORKER; empty = none)",
+    )
     w.add_argument("--capabilities", default=None)
     w.add_argument("--id", default=None)
     w.add_argument("--stub-sleep", type=float, default=0.5)
     w.add_argument("--pool", default=None, help="comma-separated pools to serve; '*' = all (default: $MAS_POOL or 'default')")
     w.add_argument("--workspace", default=None, choices=["git", "none"])
     w.set_defaults(fn=cmd_worker)
+
+    md = sub.add_parser("models", help="configured model roles + pricing status; --ping makes one metered test call")
+    md.add_argument("--ping", action="store_true", help="make one small metered call per configured role (or --spec)")
+    md.add_argument("--spec", default=None, help="ad-hoc <provider>:<model> to ping instead of the configured roles")
+    md.add_argument("--prompt", default="Reply with the single word OK.", help="prompt used by --ping")
+    md.add_argument("--max-tokens", type=int, default=64)
+    md.set_defaults(fn=cmd_models)
 
     s = sub.add_parser("status", help="run summary + metrics")
     s.add_argument("run_id")

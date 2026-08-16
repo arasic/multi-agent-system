@@ -30,13 +30,13 @@ Also landed early (LLM-free): the **structural subset of the DAG validator** (ru
 2. ~~Write ADR-007 (Acceptance Contract Freeze)~~ — done.
 3. ~~Step 6: real worktrees + commits, `context_spec` enforcement, non-root/no-network workers~~ — built, stabilized (heartbeat through settlement, atomic report, one lock order), stress gate passed.
 4. ~~Step 7A~~, ~~7B~~, ~~7C: concurrent ticking + verifier service~~ — done. Next: trusted adapter library, then concurrent run ticking.
-5. Steps 9–10: model provider + LLM worker (tool layer bound to `ctx.tools`; artifacts rendered as data).
+5. ~~Step 9: model provider + per-call telemetry~~ — done. Step 10: LLM worker (tool layer bound to `ctx.tools`; artifacts rendered as data; uses `ctx.model`; runs on the host or behind a model gateway — hardened workers have no egress).
 6. Step 11: planner producing DAG + assumptions + **acceptance-contract proposal** (ADR-007) or questions (ADR-006).
 7. Step 13-lite: one bounded verifier-driven repair cycle.
 8. Demonstrate one simple app; then the parallel adapters benchmark (M3); only afterwards the ticketing-system example.
 
 ## M2 — Intelligence, one piece at a time
-- [ ] 9. `ModelProvider` interface + usage accounting on attempts.
+- [x] 9. `ModelProvider` interface + usage accounting on attempts — **done 2026-08-16:** provider-neutral message/tool shapes, typed errors; concrete `anthropic` (official SDK), `openai`-compatible (stdlib HTTP, any compatible endpoint/gateway) and `fake` providers selected by `MAS_MODEL_<ROLE>="<provider>:<model>"`; prices from `MAS_MODEL_PRICES`; `MeteredProvider` + `model_calls` table (per-call telemetry written immediately, survives worker death), settlement from the meter, per-attempt call/token budget capped by the run's remaining tokens; `ctx.model` for agents; `mas models [--ping]`; metrics/`mas status` show per-model calls and flag unpriced usage. 20 offline/DB tests. Real providers not yet exercised against a live API from this repo (no key in the dev environment) — the `--ping` path is the smoke test to run first.
 - [ ] 10. LLM worker (fast/cheap model). URL-shortener smoke test with hand-written DAG. **Injection boundary** (antipatterns B12): artifact content and tool output are presented to the model as *data*, never as instructions; the tool layer binds `ctx.tools` (already validated by rule 4) to implementations and refuses anything else.
 - [ ] 11. LLM planner (strong model) → typed JSON: a DAG **or a question batch** (`Planner` protocol, `PlanRequest` with Q&A history).
 - [x] 11b. **Clarifying questions** (antipatterns B3 / MAST 2.2, ADR-006): planner may return `questions[]` → run `AWAITING_INPUT` → `mas answer` → planning resumes with the Q&A; `max_questions` budget; wall-clock counts from creation; same driver for the single-agent baseline. **(done 2026-08-16 with `StubPlanner`; tested end-to-end incl. cross-process demo)**

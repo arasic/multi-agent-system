@@ -28,7 +28,7 @@ These restate the invariants as coding constraints. Violating one is a bug even 
 - **Every state change emits an event.** If it isn't in `events`, it didn't happen.
 - **Budgets are enforced in the orchestrator, not requested from agents.** Every run must terminate with a verdict inside its budget.
 - **Workers only write inside their own worktree.** No shared checkout, no writes to `main`, no network side effects other than the model API.
-- **Model names never appear outside `mas/providers/` and config.** Everything else sees `ModelProvider`.
+- **Model names never appear outside `mas/providers/` and config.** Everything else sees `ModelProvider`. Agents and the planner never construct providers: the runtime hands them a **metered** one (`ctx.model`) — telemetry to `model_calls`, prices from `MAS_MODEL_PRICES`, a per-attempt call/token budget (strict call limit; tokens accounted after each response, further calls refused once exhausted — overshoot ≤ one completed call; `AttemptBudgetExceeded` ends the attempt, never a retry loop). Usage is settled from the meter, not self-reported. Unpriced usage is flagged, never hidden.
 - **No new core nouns.** Run, Task, Attempt, Artifact, Worker, Capability, Tool, Verifier, Policy/Budget, ModelProvider — adding another needs an ADR.
 - **The core test suite must run without any API key.** Stub workers (`mas/workers/stub.py`) exist so the whole pipeline is testable LLM-free.
 
@@ -62,7 +62,7 @@ See "Repository layout" in [README.md](README.md). Keep modules where the layout
 Setup (Windows: `.venv/Scripts/…`; POSIX: `.venv/bin/…`):
 
 ```
-python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"
+python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"     # add ",llm" for the Anthropic SDK (real providers)
 docker compose up -d postgres            # Postgres 16 on localhost:5432 (mas/mas/mas)
 .venv/Scripts/mas migrate
 ```
@@ -78,6 +78,8 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 .venv/Scripts/mas run --dag ... --ask "Which DB?;Which Python?"  # ADR-006 demo: planner asks first, run waits (on the clock)
 .venv/Scripts/mas answer <run_id> "sqlite; 3.12"                 # ...answer from another terminal; run continues
 .venv/Scripts/mas artifacts <run_id>                             # git_commit shas, <sha>:path documents, verification
+.venv/Scripts/mas models                                         # configured model roles + pricing status (MAS_MODEL_*, MAS_MODEL_PRICES)
+.venv/Scripts/mas models --ping --spec fake:demo                 # one metered test call (use anthropic:<model> / openai:<model> with a key)
 git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's whole history (one branch per attempt)
 .venv/Scripts/mas run --dag ... --workspace none                 # no filesystem (fastest; opaque stub refs)
 .venv/Scripts/mas contract acceptance/url_shortener_contract/contract.json   # validate an ADR-007 contract; prints suite digest

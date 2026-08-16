@@ -59,6 +59,11 @@ services:
       MAS_WORKER_CAPABILITIES: architecture,implementation,testing,integration,solve
       MAS_POOL: ${MAS_POOL:-default}
       MAS_WORKSPACE: git
+      # Step 9: model + prices are config. The backend network has NO egress, so a real provider is only reachable
+      # through an in-cluster model gateway (point MAS_OPENAI_BASE_URL at it) — never put vendor keys in this file.
+      MAS_MODEL_WORKER: ${MAS_MODEL_WORKER:-}
+      MAS_MODEL_PRICES: ${MAS_MODEL_PRICES:-}
+      MAS_OPENAI_BASE_URL: ${MAS_OPENAI_BASE_URL:-https://api.openai.com/v1}
     command: ["mas", "worker", "--stub", "--stub-sleep", "${MAS_STUB_SLEEP:-0.5}"]
     volumes:
       - ${MAS_DATA_DIR:-./.mas}:/data

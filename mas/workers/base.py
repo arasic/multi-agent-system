@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from mas.models.types import Artifact, Attempt, Run, Task
+from mas.providers.base import ModelProvider
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,9 @@ class TaskContext:
         default_factory=list
     )  # context_spec.paths — the only paths the agent should read (tool layer enforces)
     conflicts: list[str] = field(default_factory=list)  # unresolved merge conflicts left by input assembly (agent must resolve)
+    # The model for this attempt: a MeteredProvider (telemetry, pricing, per-attempt call budget) handed over by the
+    # runtime, or None when the worker has no model (stub agents). Agents never build providers themselves.
+    model: ModelProvider | None = None
 
 
 class Agent(Protocol):

@@ -163,9 +163,26 @@ events
   type                  text        -- run.created, task.ready, attempt.leased, attempt.abandoned, …
   payload               jsonb
   ts                    timestamptz default now()
+
+model_calls                          -- step 9: one row per model call, written as the call finishes (append-only)
+  id                    bigserial   pk
+  run_id, task_id, attempt_id uuid  null (planner calls: no attempt; `mas models --ping`: no run)
+  role                  text        -- planner | worker | reviewer | ping
+  provider, model       text
+  seq                   int         -- call index within the attempt / planning round
+  started_at            timestamptz
+  duration_ms           int
+  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens bigint
+  cost_usd              numeric
+  priced                boolean     -- false = no price configured → cost understated, surfaced by `mas status`
+  status                text        -- ok | max_tokens | refusal | error
+  stop_reason, error, request_id text
+  meta                  jsonb       -- max_tokens, message/tool counts
 ```
 
 Not in MVP: `claims`, `evidence`, `decisions` as tables (ADR-004). Decisions are artifacts of type `decision`.
+`attempts.*_tokens/cost_usd` and `runs.tokens_used/cost_used_usd` are the **settlement summary** budgets are enforced on;
+`model_calls` is the **evidence** (it survives a worker dying mid-attempt; the two must agree for settled attempts).
 
 ---
 
@@ -383,11 +400,17 @@ This is one of the economic claims under test — measure input tokens per attem
 
 ---
 
-## 11. Model providers and roles
+## 11. Model providers, roles and per-call telemetry (step 9)
 
-`ModelProvider.complete(messages, tools=None, max_tokens=…, …) -> (output, usage)`. Usage is recorded on the attempt.
+`ModelProvider.complete(messages, *, max_tokens, tools=None, temperature=None) -> Completion` — `Completion(text, usage: Usage, tool_calls: [ToolCall(id, name, input)], stop_reason ∈ {end_turn, tool_use, max_tokens, refusal, other}, request_id, raw)`; `Usage(model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, priced)`. Messages and tools are **provider-neutral shapes** (`mas/providers/base.py`: `system|user|assistant(+tool_calls)|tool` messages, `{name, description, input_schema}` tools); each concrete provider translates. Errors are typed: `ProviderRateLimited` / `ProviderUnavailable` (retryable) vs `ProviderRequestError` (not).
 
-MVP roles (three, no dynamic routing): **planner** → strong model; **worker** → fast/cheap model; **reviewer/re-planner** → strong (preferably different family). Concrete names and prices live only in [models.md](models.md) and config.
+**Concrete providers** (`mas/providers/`, the *only* package that may name a vendor): `anthropic` (official SDK; adaptive thinking, optional `effort`, streaming for large outputs, `refusal` surfaced as a stop reason, `temperature` deliberately not forwarded), `openai` (OpenAI-compatible Chat Completions over stdlib HTTP — api.openai.com or any compatible endpoint / in-cluster gateway; retries with backoff on 429/5xx), `fake` (deterministic scripted provider for tests and key-less runs). Selection is by **spec string** in config: `MAS_MODEL_PLANNER / MAS_MODEL_WORKER / MAS_MODEL_REVIEWER = "<provider>:<model>"` (empty = the role has no model; stub agents keep working). Prices are config too: `MAS_MODEL_PRICES` JSON per model id (or id prefix), USD per 1M tokens — see [models.md](models.md).
+
+**Metering.** Agents and the planner never build providers; the runtime hands them a `MeteredProvider` (`TaskContext.model` for workers). It (1) times and prices every call, (2) writes a `model_calls` row *immediately, in its own transaction* (`DbSink`), so cost evidence survives a worker that dies mid-attempt, (3) sums usage into the attempt's settlement (`AgentResult.usage` ← the meter; agents do not self-report), and (4) enforces a **per-attempt call budget** (`MAS_ATTEMPT_MAX_CALLS`, `MAS_ATTEMPT_MAX_TOKENS`, further capped by the run's *remaining* token budget): the call-count limit is strict; token usage is accounted after each response (it is only known then), and further calls are refused with `AttemptBudgetExceeded` once the limit is reached — so an agent loop cannot run away (antipatterns E1/C4), overshoot is bounded to one completed call (itself bounded by its `max_tokens`), and settlement then trips the run budget (`ABORTED`) if the run is out of tokens. Unpriced models are never hidden: `priced=false` rows, `unpriced_calls` in metrics and an explicit `UNPRICED` marker in `mas status`; cost claims in the evaluation must rest on priced usage only.
+
+**Roles** (three, no dynamic routing): **planner** → strong model; **worker** → fast/cheap model; **reviewer/re-planner** → strong (preferably a different family). `mas models` shows the configured roles and pricing status; `mas models --ping [--spec …]` makes one small metered call — the smallest end-to-end proof that a provider works.
+
+**Deployment note.** The hardened Compose workers have **no egress** (§13), so a real provider cannot be reached from inside them by design. Options, in order of preference: a narrow **model gateway** on the backend network (allow-listed models, keys held only there — the `openai` provider's `base_url` points at it), or workers on the host for development. Keys are never baked into images or task metadata.
 
 ---
 

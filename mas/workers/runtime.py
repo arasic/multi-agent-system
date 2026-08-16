@@ -23,10 +23,14 @@ from typing import Any
 from uuid import UUID
 
 from mas.artifacts import store
+from mas.config import settings
 from mas.db.connection import Conn, connect
 from mas.models.types import Task
 from mas.orchestrator import leases
 from mas.orchestrator.leases import ArtifactSpec, Claim, StaleAttempt
+from mas.providers.base import ModelProvider
+from mas.providers.pricing import Pricing
+from mas.providers.telemetry import CallBudget, DbSink, MeteredProvider
 from mas.workers.base import Agent, AgentResult, ArtifactOut, TaskContext
 from mas.workers.workspace import NullWorkspace, Workspace, WorkspaceError, WorkspaceHandle, since_for
 
@@ -98,6 +102,10 @@ class Worker:
         run_id: UUID | None = None,
         pools: list[str] | tuple[str, ...] | None = None,
         workspace: Workspace | None = None,
+        provider: ModelProvider | None = None,
+        pricing: Pricing | None = None,
+        attempt_max_calls: int | None = None,
+        attempt_max_tokens: int | None = None,
     ):
         self.worker_id = worker_id
         self.capabilities = list(capabilities)
@@ -108,6 +116,13 @@ class Worker:
         self.run_id = run_id  # pin to one run (in-process `mas run`)
         self.pools = list(pools) if pools is not None else None  # serve only these pools (compose services)
         self.workspace = workspace or NullWorkspace()
+        # step 9: the worker's model (None = stub agents). Per attempt it is wrapped in a MeteredProvider — telemetry
+        # rows in model_calls, pricing from config, a hard per-attempt call/token budget — and handed over as ctx.model.
+        self.provider = provider
+        self.pricing = pricing if pricing is not None else Pricing.from_json(settings().model_prices)
+        self.attempt_max_calls = attempt_max_calls if attempt_max_calls is not None else settings().attempt_max_calls
+        self.attempt_max_tokens = attempt_max_tokens if attempt_max_tokens is not None else settings().attempt_max_tokens
+        self._telemetry_lock = threading.Lock()
         self.stats = WorkerStats()
         self._conn: Conn | None = None
         self.dead = threading.Event()  # set by die(): simulate a crash — stop everything, report nothing
@@ -173,6 +188,25 @@ class Worker:
             self.current = None
         return True
 
+    def _metered(self, claim: Claim) -> MeteredProvider | None:
+        """The model handed to the agent for this attempt: telemetry to model_calls on the worker's own connection
+        (idle while the agent runs; the heartbeat has its own), priced from config, bounded by the per-attempt budget
+        AND by what is left of the run's token budget (a run that is nearly out of tokens gets short attempts)."""
+        if self.provider is None:
+            return None
+        remaining_run = max(0, claim.run.budgets.max_tokens - claim.run.tokens_used)
+        budget = CallBudget(max_calls=self.attempt_max_calls, max_tokens=min(self.attempt_max_tokens, remaining_run))
+        return MeteredProvider(
+            self.provider,
+            sink=DbSink(self.conn, self._telemetry_lock),
+            pricing=self.pricing,
+            role="worker",
+            run_id=claim.run.id,
+            task_id=claim.task.id,
+            attempt_id=claim.attempt.id,
+            budget=budget,
+        )
+
     def _process(self, claim: Claim) -> None:
         """One attempt, end to end. The heartbeat runs until the attempt is SETTLED (report committed) — covering
         workspace creation, agent execution, git commit, artifact publication and settlement — so a slow publish can
@@ -183,8 +217,10 @@ class Worker:
         hb.start()
         handle: WorkspaceHandle | None = None
         died = False
+        metered: MeteredProvider | None = None
         try:
             inputs = _dependency_outputs(self.conn, claim.task)
+            metered = self._metered(claim)
             try:
                 handle = self.workspace.create(claim.run, claim.task, claim.attempt, inputs)
             except WorkspaceError as e:  # cannot even build the workspace → failed attempt, with the reason
@@ -201,12 +237,16 @@ class Worker:
                     tools=list(claim.task.tools),
                     paths=list((claim.task.context_spec or {}).get("paths", []) or []),
                     conflicts=list(handle.conflicts) if handle else [],
+                    model=metered,
                 )
                 try:
                     result = self.agent.execute(ctx)
                 except Exception as e:  # agent bug → FAILED attempt, never a hung task
                     log.exception("agent crashed on %s", claim.task.key)
                     result = AgentResult(success=False, failure_reason=f"agent crashed: {e!r}")
+            if metered is not None and metered.calls:
+                # the meter is the source of truth for what this attempt spent (agents do not self-report usage)
+                result.usage = metered.usage_dict()
 
             if result.simulate_death or self.dead.is_set():
                 # crash simulation: walk away without reporting. Lease expires → reaper → ABANDONED → task READY.

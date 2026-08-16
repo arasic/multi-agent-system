@@ -19,6 +19,10 @@ dev = [
     "pytest-timeout>=2.3",
     "ruff>=0.5",
 ]
+# Real model providers (roadmap step 9). The core, the tests and the fake provider need none of this.
+llm = [
+    "anthropic>=0.60",
+]
 
 [project.scripts]
 mas = "mas.cli:main"

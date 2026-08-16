@@ -87,7 +87,7 @@ Comparisons: **A vs D** — is MAS worth more than one cheap agent? **B vs D** �
 Outcome: verdict · acceptance pass rate · human interventions other than answering questions (must be 0).
 Time: total (creation→finish) · machine time (total − human wait) · wall-clock of the execution phase · human wait · critical-path duration · parallelism efficiency (sum of attempt durations / wall-clock).
 Questions: batches asked · assumptions recorded (planner proceeded without asking).
-Cost: input tokens · output/thinking tokens · total USD · tokens-in per attempt (context-scoping claim).
+Cost: input tokens · output/thinking tokens · cache-read tokens · total USD · tokens-in per attempt (context-scoping claim) · model calls and call latency per attempt. Source of truth: `model_calls` (per-call telemetry, written as each call finishes) reconciled with the settled `attempts.*` columns; a run with any **unpriced** call (`priced=false`, no price in `MAS_MODEL_PRICES`) must be reported as *cost unknown*, never as cheap.
 Structure: tasks created · attempts · retries · re-plans · plan-attempts · agent calls · worker utilisation.
 Failures: acceptance failures · integration failures · planning/validation failures · abandoned attempts.
 

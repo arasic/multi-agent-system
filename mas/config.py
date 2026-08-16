@@ -35,6 +35,25 @@ class Settings:
     verifier_cpus: float = field(default_factory=lambda: float(_env("MAS_VERIFIER_CPUS", "1.0")))
     verifier_memory_mb: int = field(default_factory=lambda: int(_env("MAS_VERIFIER_MEMORY_MB", "256")))
     verifier_pids: int = field(default_factory=lambda: int(_env("MAS_VERIFIER_PIDS", "128")))
+    # Models (step 9). Specs are "<provider>:<model>" — provider ∈ {anthropic, openai, fake}; empty = no model for the role.
+    # Model names and prices live HERE and in mas/providers/, nowhere else (CLAUDE.md, docs/models.md).
+    model_planner: str = field(default_factory=lambda: _env("MAS_MODEL_PLANNER", ""))
+    model_worker: str = field(default_factory=lambda: _env("MAS_MODEL_WORKER", ""))
+    model_reviewer: str = field(default_factory=lambda: _env("MAS_MODEL_REVIEWER", ""))
+    # JSON: {"<model id or prefix>": {"input": $/Mtok, "output": $/Mtok, "cache_read": ..., "cache_write": ...} | [in, out]}
+    model_prices: str = field(default_factory=lambda: _env("MAS_MODEL_PRICES", ""))
+    provider_timeout_s: float = field(default_factory=lambda: float(_env("MAS_PROVIDER_TIMEOUT_S", "600")))
+    provider_max_retries: int = field(default_factory=lambda: int(_env("MAS_PROVIDER_MAX_RETRIES", "2")))
+    anthropic_effort: str = field(default_factory=lambda: _env("MAS_ANTHROPIC_EFFORT", ""))  # low|medium|high|xhigh|max
+    anthropic_thinking: bool = field(default_factory=lambda: _env("MAS_ANTHROPIC_THINKING", "1") not in {"0", "false", "no"})
+    anthropic_fallbacks: str = field(default_factory=lambda: _env("MAS_ANTHROPIC_FALLBACKS", ""))  # "default" = beta opt-in
+    openai_base_url: str = field(default_factory=lambda: _env("MAS_OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    openai_api_key: str = field(default_factory=lambda: _env("MAS_OPENAI_API_KEY", _env("OPENAI_API_KEY", "")))
+    openai_max_tokens_field: str = field(default_factory=lambda: _env("MAS_OPENAI_MAX_TOKENS_FIELD", "max_completion_tokens"))
+    # Per-attempt call budget enforced by the metered provider (bounded loops, antipatterns E1); the run's remaining
+    # token budget caps it further.
+    attempt_max_calls: int = field(default_factory=lambda: int(_env("MAS_ATTEMPT_MAX_CALLS", "40")))
+    attempt_max_tokens: int = field(default_factory=lambda: int(_env("MAS_ATTEMPT_MAX_TOKENS", "300000")))
 
 
 def settings() -> Settings:
