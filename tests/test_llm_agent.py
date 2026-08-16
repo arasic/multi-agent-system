@@ -195,10 +195,9 @@ def test_refusal_provider_error_and_reported_failure(tmp_path: Path):
 def test_max_tokens_continuation_then_bound(tmp_path: Path):
     root = tmp_path / "wt"
     root.mkdir()
-    (root / "docs").mkdir()
-    (root / "docs" / "design.md").write_text("x", encoding="utf-8")
     trunc = {"text": "long text cut", "stop_reason": "max_tokens"}
-    model, _, inner = _meter([trunc, _finish(artifacts=[{"type": "document", "path": "docs/design.md"}])])
+    write = {"tool_calls": [_tc("write_file", path="docs/design.md", content="x")]}
+    model, _, inner = _meter([trunc, write, _finish(artifacts=[{"type": "document", "path": "docs/design.md"}])])
     res = LLMAgent(limits=LoopLimits(max_truncations=2)).execute(_ctx(root, model=model))
     assert res.success
     assert "cut off" in inner.calls[1]["messages"][-1]["content"]  # the continuation prompt after the truncated turn
@@ -210,11 +209,10 @@ def test_max_tokens_continuation_then_bound(tmp_path: Path):
 def test_stops_without_finish_is_nudged_then_bound(tmp_path: Path):
     root = tmp_path / "wt"
     root.mkdir()
-    (root / "docs").mkdir()
-    (root / "docs" / "design.md").write_text("x", encoding="utf-8")
-    model, _, inner = _meter(["I think I am done.", _finish(artifacts=[{"type": "document", "path": "docs/design.md"}])])
+    write = {"tool_calls": [_tc("write_file", path="docs/design.md", content="x")]}
+    model, _, inner = _meter([write, "I think I am done.", _finish(artifacts=[{"type": "document", "path": "docs/design.md"}])])
     assert LLMAgent().execute(_ctx(root, model=model)).success
-    assert "call `finish`" in inner.calls[1]["messages"][-1]["content"]
+    assert "call `finish`" in inner.calls[2]["messages"][-1]["content"]
     model, _, inner = _meter(["done", "really done", "totally done", _finish()])
     res = LLMAgent(limits=LoopLimits(max_nudges=2)).execute(_ctx(root, model=model))
     assert not res.success and "without calling `finish`" in res.failure_reason and len(inner.calls) == 3
@@ -329,3 +327,32 @@ def test_finish_tolerates_garbage_artifact_entries(tmp_path: Path, bad):
     model, _, _ = _meter([_finish(artifacts=[bad])])
     res = LLMAgent().execute(_ctx(root, model=model))
     assert not res.success and "malformed artifact entry" in res.failure_reason
+
+
+def test_finish_rejects_trusted_inputs_and_untouched_files_as_outputs(tmp_path: Path):
+    root = tmp_path / "wt"
+    (root / "acceptance").mkdir(parents=True)
+    (root / "acceptance" / "suite.json").write_text("{}", encoding="utf-8")
+    (root / "docs").mkdir()
+    (root / "docs" / "old.md").write_text("from the base commit", encoding="utf-8")
+    import os
+
+    stale = time.time() - 3600
+    os.utime(root / "docs" / "old.md", (stale, stale))
+    os.utime(root / "acceptance" / "suite.json", (stale, stale))
+    script = [
+        {"tool_calls": [_tc("write_file", path="docs/new.md", content="mine")]},
+        _finish(
+            artifacts=[
+                {"type": "document", "path": "acceptance/suite.json", "name": "suite.json"},  # trusted input, read-only
+                {"type": "document", "path": "docs/old.md", "name": "old.md"},  # untouched upstream file
+                {"type": "document", "path": "docs/new.md", "name": "new.md"},  # written now: fine
+            ]
+        ),
+    ]
+    model, _, _ = _meter(script)
+    res = LLMAgent().execute(_ctx(root, model=model, contract=["document:new.md"]))
+    assert not res.success and "read-only" in res.failure_reason and "not written during this attempt" in res.failure_reason
+    model, _, _ = _meter([script[0], _finish(artifacts=[{"type": "document", "path": "docs/new.md", "name": "new.md"}])])
+    res = LLMAgent().execute(_ctx(root, model=model, contract=["document:new.md"]))
+    assert res.success and [a.ref for a in res.artifacts if a.type == "document"] == ["path:docs/new.md"]

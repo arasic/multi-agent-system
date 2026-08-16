@@ -125,10 +125,9 @@ def test_offline_trivial_app_built_by_the_llm_loop_passes_the_real_verifier(conn
     # the sandbox ran the tests: one container for the build attempt (the integrate attempt ran no commands)
     assert len(made) == 2 and made[0].commands >= 1
     assert all(not b.alive() for b in made)  # closed by the runtime
-    assert (
-        subprocess.run(["docker", "ps", "-a", "-q", "--filter", "name=mas-exec-"], capture_output=True, text=True).stdout.strip()
-        == ""
-    )
+    for b in made:  # only this test's containers: concurrent test runs may legitimately have their own mas-exec-* alive
+        ps = subprocess.run(["docker", "ps", "-a", "-q", "--filter", f"name=^{b.container}$"], capture_output=True, text=True)
+        assert ps.stdout.strip() == "", b.container
     # evidence: traces carry the sandbox identity (image id), and the verification artifact carries the verifier's
     rows = conn.execute("SELECT type, meta FROM artifacts WHERE run_id = %s ORDER BY created_at", (run.id,)).fetchall()
     traces = [r["meta"] for r in rows if r["type"] == "log" and r["meta"].get("kind") == "execution_trace"]

@@ -320,12 +320,18 @@ class LLMAgent:
                 problems.append(f"{path}: no worktree")
                 continue
             try:
-                p = tools.jail.resolve(path)
+                # outputs must be something this attempt could have written: the write-side jail (never .git/, never
+                # the read-only acceptance/ suite — a trusted input can not be re-labelled as the worker's output)
+                p = tools.jail.resolve(path, for_write=True)
             except PathJailError as e:
                 problems.append(f"{path}: {e}")
                 continue
             if not p.is_file():
                 problems.append(f"{path}: not a file in the worktree")
+                continue
+            if p.stat().st_mtime < trace.started_wall - 2.0:
+                # untouched since before the attempt began (input assembly, base commit): not produced by this attempt
+                problems.append(f"{path}: not written during this attempt")
                 continue
             name = str(item.get("name") or p.name)
             outs.append(ArtifactOut(type=atype, ref=f"path:{path}", meta={"name": name, "summary": summary[:500]}))
@@ -346,6 +352,7 @@ class _Trace:
     ctx: TaskContext
     limits: LoopLimits
     started: float = field(default_factory=time.monotonic)
+    started_wall: float = field(default_factory=time.time)  # for "was this file written during the attempt?"
     turns: list[dict[str, Any]] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     outcome: dict[str, Any] = field(default_factory=dict)
