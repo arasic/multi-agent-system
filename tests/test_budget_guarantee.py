@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -19,6 +18,7 @@ from mas.models.enums import AttemptStatus, RunStatus, VerdictReason
 from mas.orchestrator import runs as runs_mod
 from mas.orchestrator import scheduler
 from mas.orchestrator import state_machine as sm
+from mas.planner.dag import DagSpec
 from mas.planner.llm import LLMPlanner
 from mas.planner.planner import StubPlanner
 from mas.planner.validator import Remaining, validate
@@ -82,51 +82,64 @@ def test_planner_usage_is_charged_even_when_the_round_fails(conn):
 
 
 def test_concurrent_attempts_reserve_from_the_unreserved_budget(conn):
-    """T2/T3/T4 run concurrently. With 250 tokens unreserved and a 100-token allocation, the third concurrent attempt
-    gets what is left (50), never a fourth full share: the sum of RUNNING allocations + tokens_used never exceeds
-    max_tokens; settlement frees the reservation for later attempts."""
-    budgets = default_budgets(max_tokens=500, max_attempt_tokens=100, max_concurrency=3)  # rule 8: 5 x 100 fits
-    run = runs_mod.create_run_from_dag(conn, diamond(), budgets=budgets, capabilities=set(CAPS))
+    """Three tasks are READY at once. With 250 tokens unreserved and a 100-token allocation, the third *simultaneous*
+    claim gets what is left (50), never a fourth full share: Σ RUNNING allocations + tokens_used never exceeds
+    max_tokens. Settling one attempt frees its share for the next claim. Deterministic: claims are made directly, no
+    threads, no timing."""
+    from mas.orchestrator import leases
+
+    wide = DagSpec.from_dict(
+        {
+            "tasks": [
+                {
+                    "id": k,
+                    "capability": "implementation",
+                    "goal": k,
+                    "depends_on": [],
+                    "output_contract": {"artifacts": ["git_commit"]},
+                }
+                for k in ("A", "B", "C")
+            ]
+        }
+    )
+    budgets = default_budgets(max_tokens=500, max_attempt_tokens=100, max_concurrency=3)  # rule 8: 4 x 100 fits
+    run = runs_mod.create_run_from_dag(conn, wide, budgets=budgets, capabilities=set(CAPS))
     with conn.transaction():  # half the budget is already spent when execution starts: 250 unreserved
         conn.execute("UPDATE runs SET tokens_used = 250 WHERE id = %s", (run.id,))
-    stop = threading.Event()
-    agent = StubAgent({"sleep_s": 0.6})  # long enough for all three to be RUNNING at once
-    ws = [Worker(f"w{i}", list(CAPS), agent, database_url=DB_URL, poll_s=0.02, run_id=run.id) for i in range(3)]
-    ts = [run_worker_thread(w, stop) for w in ws]
-    seen: list[list[int]] = []
-
-    def watch() -> None:
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not stop.is_set():
-            rows = conn.execute(
-                "SELECT a.token_allocation AS alloc FROM attempts a JOIN tasks t ON t.id = a.task_id "
-                "WHERE t.run_id = %s AND a.status = 'RUNNING' AND t.key IN ('T2','T3','T4')",
-                (run.id,),
-            ).fetchall()
-            allocs = sorted(int(r["alloc"]) for r in rows)
-            if len(allocs) == 3:
-                seen.append(allocs)
-                return
-            time.sleep(0.02)
-
-    try:
-        watcher = threading.Thread(target=watch, daemon=True)
-        watcher.start()
-        final = scheduler.run_until_terminal(conn, run.id, verifier=StubVerifier(True), tick_s=0.05, timeout_s=60)
-        watcher.join(5)
-    finally:
-        stop.set()
-        wait_all(ts, 10)
-    assert final.status is RunStatus.PASSED
-    assert seen and seen[0] == [50, 100, 100], seen  # the three concurrent shares fit in 250 exactly
-    atts = {a.attempt_number: a for a in sm.attempts_for_run(conn, run.id)}
-    assert all(a.token_allocation is not None and a.token_allocation <= 100 for a in atts.values())
-    # T1 (alone) got a full share; T5 (after the others settled with zero usage) got a full share again
-    tasks = {t.id: t.key for t in sm.tasks_for_run(conn, run.id)}
-    by_key = {tasks[a.task_id]: a for a in sm.attempts_for_run(conn, run.id)}
-    assert by_key["T1"].token_allocation == 100 and by_key["T5"].token_allocation == 100
+    scheduler.tick(conn, run.id, verifier=StubVerifier(True))  # A, B, C → READY
+    claims = [leases.claim_task(conn, worker_id=f"w{i}", capabilities=list(CAPS), run_id=run.id) for i in range(3)]
+    assert all(c is not None for c in claims)
+    allocs = [c.attempt.token_allocation for c in claims]
+    assert allocs == [100, 100, 50], allocs  # the three simultaneous shares fit in 250 exactly
+    assert leases.reserved_tokens(conn, run.id) == 250
+    assert (
+        leases.claim_task(conn, worker_id="w9", capabilities=list(CAPS), run_id=run.id) is None
+    )  # nothing READY (and max_concurrency)
+    # a worker-side ceiling lowers the ask, never raises it
     ev = [e for e in for_run(conn, run.id) if e.type == "attempt.leased"]
-    assert all("token_allocation" in e.payload for e in ev)
+    assert [e.payload["token_allocation"] for e in ev] == [100, 100, 50]
+    # settle the first attempt (used 30 of its 100): its reservation is gone, its usage is charged, the next claim
+    # for the integration task gets min(100, 500 - 280 - 150) = 70
+    leases.report(
+        conn,
+        claims[0].attempt.id,
+        success=True,
+        artifacts=[leases.ArtifactSpec(type="git_commit", ref="stub:A", meta={})],
+        usage={"model": "stub", "input_tokens": 20, "output_tokens": 10, "cost_usd": 0.0},
+    )
+    for c in claims[1:]:
+        leases.report(
+            conn,
+            c.attempt.id,
+            success=True,
+            artifacts=[leases.ArtifactSpec(type="git_commit", ref=f"stub:{c.task.key}", meta={})],
+        )
+    assert leases.reserved_tokens(conn, run.id) == 0
+    scheduler.tick(conn, run.id, verifier=StubVerifier(True))  # T_integrate → READY
+    c4 = leases.claim_task(conn, worker_id="w4", capabilities=list(CAPS), run_id=run.id, token_ceiling=60)
+    assert c4 is not None and c4.task.key == "T_integrate" and c4.attempt.token_allocation == 60  # ceiling 60 < 100 < free 220
+    run_now = sm.get_run(conn, run.id)
+    assert run_now.tokens_used == 280 and run_now.tokens_used + leases.reserved_tokens(conn, run.id) <= 500
 
 
 def test_rule8_remaining_is_net_of_reservations(conn):

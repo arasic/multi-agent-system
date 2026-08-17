@@ -46,6 +46,8 @@ Also landed early (LLM-free): the **structural subset of the DAG validator** (ru
 
 **Gate:** A1, A2, A7, A8 pass; smoke test passes end-to-end with LLM planner + LLM workers. Every entry in [antipatterns.md](antipatterns.md) marked 🟡 for M2 flips to ✅ or gets an explicit reason.
 
+**Gate status (2026-08-17):** A2 ✅ (validator rules 1–10 incl. 8/9, unit-tested); A8 ✅ offline (13-lite: FAIL → amendment → PASS, deterministic NO_PROGRESS/BUDGET_EXHAUSTED); A1 and the live smoke **pending a vendor key on the host** — `python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m>` runs ping → LLM workers on the URL-shortener benchmark with sandboxes + real verifier → LLM planner (goal → contract → approve → DAG → workers → verifier), each step gating the next, budgets hard, everything on record; A7 (`decision` artifact demo) still needs the reviewer role. Offline, the whole path is proven with `fake:builder`/`fake:planner` (compose + CLI).
+
 ## M3 — Fair comparison
 - [ ] 14. Single-agent harness inside the same runtime (configs A, B); `max_concurrency` knob (config C = D with 1). Fairness rules from evaluation.md §3.
 - [ ] 15. Width benchmark: N = 1/2/4/8/16 × configs A/B/C/D × ≥ 5 runs. Metrics, plots, write-up.

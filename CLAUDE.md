@@ -51,7 +51,7 @@ If a task seems to need one of these, stop and say so — don't build it quietly
 - **Stability gate:** `scripts/stress_step6.py` (100 git diamonds / 50 chaos kills / 20 parallel service-style runs). Run it after touching leases, the state machine, the worker loop, or workspaces. Zero deadlocks, zero stale reports, exactly one abandonment per deliberate death, zero leaked worktrees.
 - **Runtime:** Docker Compose — `postgres`, `orchestrator` (`--verifier external`, no Docker), `worker` (scaled ×N, `MAS_EXEC_BACKEND=remote`), plus `mas verify --watch` (verifier service) and `mas execute --watch` (execution runner: workers' command requests → per-attempt sandboxes) on the host (Docker). Workers never get docker.sock and never send paths — the runner derives worktrees from ids. `/data` is the host bind mount `./.mas`. The orchestrator loop is a bounded executor with per-run advisory locks; never tick or verify one run from two places.
 - **Workspaces:** one bare repo per run (`$MAS_REPO_ROOT/<run>.git`, default `.mas/repos`, git-ignored) and one worktree per attempt (`$MAS_WORKTREE_ROOT`), branch `run/<run>/<task>/<attempt>`, created from base + **input assembly** (dependency `git_commit` outputs merged in; conflicts handed to the agent via `ctx.conflicts`). The **runtime** commits and mints `git_commit` artifacts; agents name file artifacts `path:<relpath>` → rewritten to `<sha>:<relpath>`. Roots are resolved to absolute paths (git runs with `cwd=<bare repo>`; a relative worktree path would land inside it — this bit us). `--workspace none` for pure in-memory stub tests. **A terminal run keeps no worktrees**: the orchestrator calls `workspace.gc_run(run_id)` when a run ends (a crashed/abandoned worker's worktree is evidence only while the run is live); the bare repo stays.
-- **Tests:** `pytest`. Unit tests for state machine and validator are mandatory. End-to-end tests use stub workers and a real Postgres. **Each pytest process creates its own database `mas_test_<pid>`** (from the server in `MAS_DATABASE_URL`) and drops it at the end — so concurrent test runs, or tests while the compose services are up, never collide. Never point tests at the shared `mas` database.
+- **Tests:** `pytest`, in tiers (`scripts/test.py unit|core|full|area|gate`, see Commands). Unit tests for state machine and validator are mandatory. End-to-end tests use stub workers and a real Postgres. **Each pytest process creates its own database `mas_test_<pid>`** (from the server in `MAS_DATABASE_URL`) and drops it at the end — so concurrent test runs, or tests while the compose services are up, never collide. Never point tests at the shared `mas` database.
 - **Pools:** every run has a `pool`; workers and orchestrators serve only their pool(s). In-process `mas run` uses `local:<pid>` (its own workers are additionally pinned by `run_id`), the compose services serve `$MAS_POOL` (`default`), `mas submit --pool` targets a pool, `--pool '*'` serves everything. So the containers never touch a local demo run, and vice versa, on the same database.
 - **Config:** environment variables + a small typed settings object. Budgets are per-run parameters, never hard-coded.
 - **Logging/telemetry:** structured, and everything meaningful also goes to the `events` table.
@@ -86,6 +86,7 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 .venv/Scripts/mas run --dag ... --agent llm --model fake:demo    # LLM worker loop (fake provider: no key; real: anthropic:<model> / openai:<model>)
 .venv/Scripts/mas models                                         # configured model roles + pricing status (MAS_MODEL_*, MAS_MODEL_PRICES)
 .venv/Scripts/mas models --ping --spec fake:demo                 # one metered test call (use anthropic:<model> / openai:<model> with a key)
+.venv/Scripts/python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m>   # M2 live gate (key in THIS process): ping -> LLM workers on the benchmark -> LLM planner goal->contract->approve->DAG->PASS
 git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's whole history (one branch per attempt)
 .venv/Scripts/mas run --dag ... --workspace none                 # no filesystem (fastest; opaque stub refs)
 .venv/Scripts/mas run --dag ... --verifier-fail-times 1 --planner fake --max-replans 1   # 13-lite demo: FAIL -> amendment -> PASS (replans=1); --verifier-fail -> NO_PROGRESS
@@ -106,12 +107,25 @@ docker kill multi-agent-system-worker-2                          # A5 demo: reap
 .venv/Scripts/mas verify --once                                  # verify whatever is VERIFYING right now, then exit
 ```
 
-Tests and lint (no API key needed; DB tests skip if Postgres is unreachable):
+Tests and lint (no API key needed; DB tests skip if Postgres is unreachable). **Run the tier a change can affect, not
+the whole suite every time** (`scripts/test.py`; every worker process gets its own test DB, so `-n 4` is safe):
 
 ```
-.venv/Scripts/python -m pytest -q
-.venv/Scripts/ruff check mas tests && .venv/Scripts/ruff format mas tests
+.venv/Scripts/python scripts/test.py unit             # no Postgres, no Docker: validator, providers, tools, agent loop   ~15 s
+.venv/Scripts/python scripts/test.py core             # + Postgres, stub workers, no Docker (`-m "not docker"`)          ~80 s
+.venv/Scripts/python scripts/test.py full             # everything incl. Docker sandboxes / verifier image / service     ~2 min (-n 4; 5-7 min serial)
+.venv/Scripts/python scripts/test.py area repair      # the files for an area: validator planner repair budget state-machine
+                                                      #   leases workspace providers tools worker runner verifier contracts cli service
+.venv/Scripts/python scripts/test.py gate             # scripts/stress_step6.py, ~13 min (see Stability gate above)
+.venv/Scripts/python scripts/test.py core -- -k foo -x   # extra pytest args after --
+.venv/Scripts/ruff check mas tests scripts && .venv/Scripts/ruff format mas tests scripts
 ```
+
+Which tier when: `unit` while iterating on pure logic · `core` before committing changes to the orchestrator, planner,
+workers or CLI · `full` before committing changes to sandboxes, the verifier, the runner, the gateway or service mode
+· `gate` after touching leases, the state machine, the worker loop or workspaces. `-m docker` is auto-applied to tests
+that use the `verifier_image` fixture. Don't use `-n auto` here (12 workers): a few tests measure real concurrency
+and sockets and flake under that load; `MAS_TEST_WORKERS` overrides the default 4.
 
 Verifier/sandbox changes additionally require Docker and the five-fixture gate:
 

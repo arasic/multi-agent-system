@@ -17,6 +17,7 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pytest-timeout>=2.3",
+    "pytest-xdist>=3.5",   # `-n auto`: every worker process gets its own mas_test_<pid> database (tests/conftest.py)
     "ruff>=0.5",
 ]
 # Real model providers (roadmap step 9). The core, the tests and the fake provider need none of this.
@@ -41,8 +42,10 @@ timeout = 120
 addopts = "-ra"
 markers = [
     "db: requires a reachable PostgreSQL (MAS_DATABASE_URL)",
-    "docker: executes the hardened acceptance sandbox using Docker",
+    "docker: needs the Docker daemon (sandboxes / the verifier image); auto-applied to tests using `verifier_image`",
 ]
+# Tiers (scripts/test.py): unit = -m "not db and not docker" (seconds) · core = -m "not docker" (~1 min with -n auto)
+# · full = everything (~2 min with -n auto, 5-7 min serial) · gate = scripts/stress_step6.py (~13 min).
 
 [tool.ruff]
 line-length = 130

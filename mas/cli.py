@@ -73,6 +73,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_tokens=args.max_tokens,
         max_attempt_tokens=args.max_attempt_tokens,
         max_replans=args.max_replans,
+        max_cost_usd=args.max_cost_usd,
     )
     caps = set(settings().worker_capabilities)
     conn = connect()
@@ -262,6 +263,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         max_tokens=args.max_tokens,
         max_attempt_tokens=args.max_attempt_tokens,
         max_replans=args.max_replans,
+        max_cost_usd=args.max_cost_usd,
     )
     conn = connect()
     migrate(conn)
@@ -786,6 +788,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-replans", type=int, default=1, help="bounded repair cycles after a verifier FAIL (13-lite; the only repair budget)"
     )
     r.add_argument("--max-tokens", type=int, default=2_000_000, help="run token budget")
+    r.add_argument("--max-cost-usd", type=float, default=20.0, help="run cost budget (USD, priced from MAS_MODEL_PRICES)")
     r.add_argument(
         "--max-attempt-tokens",
         type=int,
@@ -850,6 +853,7 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--max-attempt-runtime-s", type=int, default=120)
     sb.add_argument("--max-replans", type=int, default=1)
     sb.add_argument("--max-tokens", type=int, default=2_000_000)
+    sb.add_argument("--max-cost-usd", type=float, default=20.0)
     sb.add_argument("--max-attempt-tokens", type=int, default=200_000)
     sb.add_argument("--wait", action="store_true", help="block until the run is terminal, then print status")
     sb.add_argument("--timeout", type=float, default=600)

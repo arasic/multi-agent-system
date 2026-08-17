@@ -39,6 +39,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BASE_URL = os.environ.get("MAS_DATABASE_URL", "postgresql://mas:mas@localhost:5432/mas")
 TEST_DB = f"mas_test_{os.getpid()}"
 
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Tiers by capability, so the default loop is fast (see CLAUDE.md "Tests"): any test that uses a Docker-backed
+    fixture is `docker`; a test whose module is `db` is `db`; everything else is pure unit. `scripts/test.py` selects:
+    unit = not db and not docker · core = not docker · full = everything (run with -n auto: per-process test DBs)."""
+    for item in items:
+        if "verifier_image" in getattr(item, "fixturenames", ()):
+            item.add_marker(pytest.mark.docker)
+
+
 # Set once the session DB exists; read by execute() and by the CLI (via MAS_DATABASE_URL) during the session.
 DB_URL = make_conninfo(BASE_URL, dbname=TEST_DB)
 
