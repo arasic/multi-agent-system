@@ -9,7 +9,11 @@ mas execute --watch | --once             execution-runner service: workers' comm
 mas worker [--agent stub|llm] [--model <provider>:<model>] [--exec-backend sandbox|none]   worker service (compose)
 mas models [--ping]                      configured model roles, pricing status; --ping makes one metered test call
 mas gateway [--upstream P:M]             model gateway: the one process holding a vendor key (compose: workers -> gateway)
+mas doctor [--require-live]               preflight Docker, Postgres, images, workspace and model configuration
+mas up [--workers N]                      Compose services + trusted host execution/verifier supervisor
+mas down                                  stop the Compose services (data is retained unless --volumes)
 mas status RUN_ID                        summary + metrics (+ pending questions when AWAITING_INPUT)
+mas result RUN_ID [--output DIR]          show or export the exact verified repository commit
 mas answer RUN_ID "text"                 answer the planner's clarifying questions (ADR-006)
 mas approve RUN_ID [--contract f.json]   approve the planner's acceptance-contract proposal -> frozen definition of done (ADR-007)
 mas artifacts RUN_ID                     list artifacts (git_commit shas, sha:path documents, decisions, verification)
@@ -25,6 +29,7 @@ import logging
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -36,6 +41,14 @@ from mas import metrics
 from mas.config import settings
 from mas.db import connect, migrate
 from mas.db.events import for_run
+from mas.evaluation import (
+    CONFIGS,
+    SingleAgentRepairPlanner,
+    dag_for_config,
+    effective_concurrency,
+    normalize_config,
+    single_agent_dag,
+)
 from mas.models.types import Budgets
 from mas.orchestrator import runs as runs_mod
 from mas.orchestrator import scheduler
@@ -60,12 +73,194 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_ok(argv: list[str], *, timeout: float = 30) -> tuple[bool, str]:
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    detail = (p.stdout or p.stderr or "").strip().splitlines()
+    return p.returncode == 0, (detail[0][:300] if detail else f"exit {p.returncode}")
+
+
+def _dotenv_values(path: Path = Path(".env")) -> dict[str, str]:
+    """Minimal Compose-compatible KEY=VALUE reader for diagnostics; never mutates os.environ."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key and key.replace("_", "").isalnum():
+            out[key] = value.strip().strip('"').strip("'")
+    return out
+
+
+def _doctor_checks(*, require_live: bool = False) -> list[dict[str, Any]]:
+    """Read-only MVP preflight. Each row is stable enough for both the human output and `--json`."""
+    cfg = settings()
+    dot = _dotenv_values()
+    value = lambda name, fallback="": os.environ.get(name) or dot.get(name) or fallback  # noqa: E731
+    rows: list[dict[str, Any]] = []
+
+    def add(name: str, ok: bool, detail: str, *, required: bool = True) -> None:
+        rows.append({"name": name, "ok": bool(ok), "required": required, "detail": detail})
+
+    add("python", sys.version_info >= (3, 12), f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+    add("git", shutil.which("git") is not None, shutil.which("git") or "not found")
+    ok, detail = _command_ok(["docker", "info", "--format", "{{.ServerVersion}}"])
+    add("docker", ok, detail)
+    ok_image, image_detail = _command_ok(["docker", "image", "inspect", cfg.verifier_image, "--format", "{{.Id}}"])
+    add("verifier_image", ok_image, image_detail if ok_image else f"{cfg.verifier_image}: {image_detail}")
+    try:
+        with connect() as conn:
+            version = conn.execute("select current_database() AS db, version() AS version").fetchone()
+        add("postgres", True, f"database={version['db']}")
+    except Exception as exc:  # noqa: BLE001 - diagnostic boundary
+        add("postgres", False, str(exc)[:300])
+    for name, raw in (("repo_root", cfg.repo_root), ("worktree_root", cfg.worktree_root)):
+        path = Path(raw).resolve()
+        parent = next((p for p in (path, *path.parents) if p.exists()), path.parent)
+        add(name, os.access(parent, os.W_OK), str(path))
+
+    upstream = value("MAS_GATEWAY_UPSTREAM", cfg.gateway_upstream).strip()
+    is_fake = upstream.startswith("fake:") or upstream == "fake"
+    add(
+        "gateway_upstream",
+        bool(upstream) and (not require_live or not is_fake),
+        upstream or "not configured",
+        required=require_live,
+    )
+    worker_model = value("MAS_MODEL_WORKER", cfg.model_worker)
+    planner_model = value("MAS_MODEL_PLANNER", cfg.model_planner)
+    add("worker_model", bool(worker_model), worker_model or "not configured", required=require_live)
+    add("planner_model", bool(planner_model), planner_model or "not configured", required=require_live)
+    prices = value("MAS_MODEL_PRICES", cfg.model_prices).strip()
+    add("model_prices", bool(prices), "configured" if prices else "not configured (cost will be unknown)", required=require_live)
+    if require_live:
+        provider = upstream.split(":", 1)[0] if upstream else ""
+        key_names = {
+            "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+            "openai": ("MAS_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        }.get(provider, ())
+        has_key = any(os.environ.get(k) or dot.get(k) for k in key_names)
+        add(
+            "vendor_credentials",
+            bool(key_names) and has_key,
+            f"provider={provider or 'unknown'}",
+        )
+    return rows
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    rows = _doctor_checks(require_live=args.require_live)
+    failed = [r for r in rows if r["required"] and not r["ok"]]
+    if args.json:
+        print(json.dumps({"ok": not failed, "checks": rows}, indent=2))
+    else:
+        for r in rows:
+            mark = "OK" if r["ok"] else ("FAIL" if r["required"] else "WARN")
+            print(f"{mark:4s} {r['name']:20s} {r['detail']}")
+        print("preflight: " + ("PASS" if not failed else f"FAIL ({len(failed)} required check(s))"))
+    return 0 if not failed else 2
+
+
+def _compose(argv: list[str], *, env: dict[str, str] | None = None) -> int:
+    print("+ docker compose " + " ".join(argv), flush=True)
+    return subprocess.call(["docker", "compose", *argv], env=env)
+
+
+def cmd_up(args: argparse.Namespace) -> int:
+    """Start the hardened Compose actors and supervise the two trusted host-side services in this foreground process."""
+    cfg = settings()
+    if not args.offline:
+        failed = [r for r in _doctor_checks(require_live=True) if r["required"] and not r["ok"]]
+        if failed:
+            for r in failed:
+                print(f"preflight failed: {r['name']}: {r['detail']}", file=sys.stderr)
+            print("run `mas doctor --require-live` for the full report (or use `mas up --offline`)", file=sys.stderr)
+            return 2
+    env = dict(os.environ)
+    dot = _dotenv_values()
+    env["MAS_WORKER_AGENT"] = "llm"
+    if args.offline:
+        env["MAS_GATEWAY_UPSTREAM"] = "fake:builder"
+        env["MAS_GATEWAY_MODELS"] = "builder"
+        env["MAS_MODEL_WORKER"] = "openai:builder"
+        env["MAS_ORCH_PLANNER"] = "fake"
+    else:
+        env["MAS_ORCH_PLANNER"] = "llm"
+        if not env.get("MAS_MODEL_WORKER"):
+            env["MAS_MODEL_WORKER"] = dot.get("MAS_MODEL_WORKER") or cfg.model_worker or "openai:builder"
+        if not env.get("MAS_MODEL_PLANNER"):
+            env["MAS_MODEL_PLANNER"] = dot.get("MAS_MODEL_PLANNER") or cfg.model_planner or "openai:builder"
+    if args.build:
+        if subprocess.call(["docker", "build", "-f", "acceptance/Dockerfile.verifier", "-t", cfg.verifier_image, "."], env=env):
+            return 2
+        if _compose(["build", "orchestrator", "gateway", "worker"], env=env):
+            return 2
+    if _compose(["up", "-d", "--scale", f"worker={args.workers}", "postgres", "orchestrator", "gateway", "worker"], env=env):
+        return 2
+    host_env = dict(env)
+    for secret in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "MAS_OPENAI_API_KEY", "MAS_GATEWAY_TOKEN"):
+        host_env.pop(secret, None)  # only the Compose gateway receives vendor/gateway credentials
+    children = [
+        subprocess.Popen([sys.executable, "-m", "mas", "execute", "--watch"], env=host_env),
+        subprocess.Popen([sys.executable, "-m", "mas", "verify", "--watch"], env=host_env),
+    ]
+    print("MVP services are ready; executor and verifier are supervised here. Ctrl-C stops the host services.")
+    try:
+        while True:
+            dead = next((p for p in children if p.poll() is not None), None)
+            if dead is not None:
+                print(f"host service exited unexpectedly with code {dead.returncode}", file=sys.stderr)
+                return 1
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+        for child in children:
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+        if args.down_on_exit:
+            _compose(["down"], env=env)
+
+
+def cmd_down(args: argparse.Namespace) -> int:
+    argv = ["down"]
+    if args.volumes:
+        argv.append("--volumes")
+    return 0 if _compose(argv) == 0 else 2
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not args.dag and not args.goal:
         raise SystemExit("mas run needs --dag FILE, or --goal TEXT with --planner llm|fake")
+    config = normalize_config(args.config)
     dag = DagSpec.from_file(args.dag) if args.dag else None
+    if dag is not None:
+        if args.benchmark:
+            dag.benchmark = args.benchmark
+        dag = dag_for_config(dag, config)
+    elif config in {"A", "B"}:
+        if not args.goal:
+            raise SystemExit("configs A/B need --goal or --dag")
+        try:
+            dag = single_agent_dag(args.goal, args.benchmark)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    max_concurrency = effective_concurrency(config, args.max_concurrency)
     budgets = Budgets(
-        max_concurrency=args.max_concurrency,
+        max_concurrency=max_concurrency,
         lease_s=args.lease_s,
         max_wallclock_s=args.max_wallclock_s,
         max_attempts_per_task=args.max_attempts,
@@ -87,7 +282,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         planner = _planner(args.planner or "llm", spec=args.planner_model)
         if planner is None:
             raise SystemExit("--goal needs a planner: --planner llm|fake")
-        run = runs_mod.create_run(conn, goal=args.goal, budgets=budgets, benchmark=args.benchmark, config=args.config, pool=pool)
+        run = runs_mod.create_run(conn, goal=args.goal, budgets=budgets, benchmark=args.benchmark, config=config, pool=pool)
         run = runs_mod.plan_run(conn, run.id, planner, capabilities=caps)
         print(f"run {run.id}  status={run.status.value}  pool={pool}  planner={planner.name}")
         _print_waiting(conn, run.id)
@@ -99,7 +294,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             goal=args.goal or dag.goal or "(no goal)",
             budgets=budgets,
             benchmark=args.benchmark or dag.benchmark,  # the DAG file's suite; an ad-hoc goal without one needs a contract first
-            config=args.config,
+            config=config,
             pool=pool,
         )
         run = runs_mod.plan_run(conn, run.id, planner, capabilities=caps)
@@ -112,15 +307,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             goal=args.goal,
             budgets=budgets,
             benchmark=args.benchmark,
-            config=args.config,
+            config=config,
             capabilities=caps,
             pool=pool,
         )
         print(
-            f"run {run.id}  ({len(dag.tasks)} tasks, {args.workers} workers, max_concurrency={args.max_concurrency}, pool={pool})"
+            f"run {run.id}  (config={config}, {len(dag.tasks)} tasks, {args.workers} workers, "
+            f"max_concurrency={max_concurrency}, pool={pool})"
         )
         # bounded repair (13-lite) after a verifier FAIL needs a planner for the amendment; --planner fake|llm opts in
-        planner = _planner(args.planner, spec=args.planner_model) if args.planner else None
+        planner = SingleAgentRepairPlanner() if config in {"A", "B"} else (
+            _planner(args.planner, spec=args.planner_model) if args.planner else None
+        )
     if args.chaos_kill_after is not None and dag is None:
         raise SystemExit("--chaos-kill-after needs --dag")
 
@@ -253,9 +451,22 @@ def cmd_submit(args: argparse.Namespace) -> int:
     orchestrator's planner (`mas orchestrate --planner llm|fake`) plans it: contract proposal -> `mas approve` -> DAG."""
     if not args.dag and not args.goal:
         raise SystemExit("mas submit needs --dag FILE or --goal TEXT")
+    config = normalize_config(args.config)
     dag = DagSpec.from_file(args.dag) if args.dag else None
+    if dag is not None:
+        if args.benchmark:
+            dag.benchmark = args.benchmark
+        dag = dag_for_config(dag, config)
+    elif config in {"A", "B"}:
+        if not args.goal:
+            raise SystemExit("configs A/B need --goal or --dag")
+        try:
+            dag = single_agent_dag(args.goal, args.benchmark)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    max_concurrency = effective_concurrency(config, args.max_concurrency)
     budgets = Budgets(
-        max_concurrency=args.max_concurrency,
+        max_concurrency=max_concurrency,
         lease_s=args.lease_s,
         max_wallclock_s=args.max_wallclock_s,
         max_attempts_per_task=args.max_attempts,
@@ -269,7 +480,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     migrate(conn)
     if dag is None:
         run = runs_mod.create_run(
-            conn, goal=args.goal, budgets=budgets, benchmark=args.benchmark, config=args.config, pool=args.pool
+            conn, goal=args.goal, budgets=budgets, benchmark=args.benchmark, config=config, pool=args.pool
         )
         print(f"submitted run {run.id} (goal, to be planned) status={run.status.value} pool={args.pool}")
     else:
@@ -279,7 +490,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             goal=args.goal,
             budgets=budgets,
             benchmark=args.benchmark,
-            config=args.config,
+            config=config,
             capabilities=set(settings().worker_capabilities),
             pool=args.pool,
         )
@@ -427,7 +638,7 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT ar.type, ar.status, ar.ref, t.key, a.attempt_number, ar.created_at
+            SELECT ar.type, ar.status, ar.ref, ar.meta, ar.superseded_by, t.key, a.attempt_number, ar.created_at
             FROM artifacts ar LEFT JOIN tasks t ON t.id = ar.task_id LEFT JOIN attempts a ON a.id = ar.attempt_id
             WHERE ar.run_id = %s ORDER BY ar.created_at, ar.id
             """,
@@ -438,7 +649,12 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
         return 1
     for r in rows:
         who = f"{r['key']}#{r['attempt_number']}" if r["key"] else "(run)"
-        print(f"  {r['type']:14s} {r['status']:10s} {who:12s} {r['ref']}")
+        sup = f"  superseded_by={str(r['superseded_by'])[:8]}" if r["superseded_by"] else ""
+        print(f"  {r['type']:14s} {r['status']:10s} {who:12s} {r['ref']}{sup}")
+        if r["type"] == "decision":
+            m = r["meta"] or {}
+            losers = [str(x)[:8] for x in m.get("losers") or []]
+            print(f"      winner={str(m.get('winner'))[:8]} losers={losers}  {m.get('rationale', '')}")
     return 0
 
 
@@ -693,6 +909,89 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     return 0
 
 
+def _result_record(conn, run_id: UUID) -> dict[str, Any]:
+    run = runs_mod.sm.get_run(conn, run_id)
+    if run.status.value != "PASSED":
+        raise ValueError(f"run is {run.status.value}, not PASSED; only externally verified results can be exported")
+    integration = conn.execute(
+        """
+        SELECT ar.id, ar.ref, ar.meta, t.key
+        FROM artifacts ar JOIN tasks t ON t.id = ar.task_id
+        WHERE ar.run_id = %s AND ar.type = 'git_commit' AND ar.status = 'accepted' AND t.capability = 'integration'
+        ORDER BY ar.created_at DESC LIMIT 1
+        """,
+        (run_id,),
+    ).fetchone()
+    if integration is None:
+        raise ValueError("PASSED run has no accepted integration artifact")
+    verification = conn.execute(
+        "SELECT meta FROM artifacts WHERE run_id = %s AND type = 'verification' ORDER BY created_at DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    return {
+        "run_id": str(run.id),
+        "goal": run.goal,
+        "benchmark": run.benchmark,
+        "config": run.config,
+        "status": run.status.value,
+        "verdict": run.verdict,
+        "integration_sha": integration["ref"],
+        "integration_task": integration["key"],
+        "artifact_id": str(integration["id"]),
+        "verification": (verification or {}).get("meta", {}),
+        "metrics": metrics.compute(conn, run_id).as_dict(),
+    }
+
+
+def cmd_result(args: argparse.Namespace) -> int:
+    run_id = UUID(args.run_id)
+    try:
+        with connect() as conn:
+            record = _result_record(conn, run_id)
+    except (LookupError, ValueError) as exc:
+        print(f"cannot export result: {exc}", file=sys.stderr)
+        return 2
+    cfg = settings()
+    repo = Path(cfg.repo_root).resolve() / f"{run_id}.git"
+    record["repository"] = str(repo)
+    if not repo.joinpath("HEAD").exists():
+        print(f"cannot export result: run repository is missing: {repo}", file=sys.stderr)
+        return 2
+    if not args.output:
+        print(json.dumps(record, indent=2, default=str))
+        print(f"export with: mas result {run_id} --output <directory>", file=sys.stderr)
+        return 0
+    dest = Path(args.output).resolve()
+    sidecar = Path(str(dest) + ".mas-result.json")
+    if dest.exists() or sidecar.exists():
+        print(f"refusing to overwrite existing result path: {dest} or {sidecar}", file=sys.stderr)
+        return 2
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    made = False
+    try:
+        clone = subprocess.run(["git", "clone", "-q", "--no-checkout", str(repo), str(dest)], capture_output=True, text=True)
+        if clone.returncode != 0:
+            raise RuntimeError(clone.stderr.strip() or "git clone failed")
+        made = True
+        checkout = subprocess.run(
+            ["git", "-C", str(dest), "checkout", "-q", "-B", "verified-result", record["integration_sha"]],
+            capture_output=True,
+            text=True,
+        )
+        if checkout.returncode != 0:
+            raise RuntimeError(checkout.stderr.strip() or "git checkout failed")
+        sidecar.write_text(json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8")
+    except (OSError, RuntimeError) as exc:
+        if made:
+            shutil.rmtree(dest, ignore_errors=True)
+        print(f"cannot export result: {exc}", file=sys.stderr)
+        return 2
+    print(f"verified repository: {dest}")
+    print(f"exact commit:        {record['integration_sha']}")
+    print(f"verification record: {sidecar}")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     with connect() as conn:
         m = metrics.compute(conn, UUID(args.run_id))
@@ -773,11 +1072,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("migrate", help="apply schema migrations").set_defaults(fn=cmd_migrate)
 
+    dr = sub.add_parser("doctor", help="preflight Docker, Postgres, verifier image, workspaces and model configuration")
+    dr.add_argument("--require-live", action="store_true", help="also require a non-fake upstream, role models, prices and key")
+    dr.add_argument("--json", action="store_true")
+    dr.set_defaults(fn=cmd_doctor)
+
+    up = sub.add_parser("up", help="start Compose and supervise the trusted host executor + verifier in this terminal")
+    up.add_argument("--workers", type=int, default=3)
+    up.add_argument("--offline", action="store_true", help="use fake:builder/fake planner to prove plumbing without a key")
+    up.add_argument("--build", action="store_true", help="build the app and verifier images first")
+    up.add_argument("--down-on-exit", action="store_true", help="also stop Compose containers on Ctrl-C")
+    up.set_defaults(fn=cmd_up)
+
+    dn = sub.add_parser("down", help="stop Compose services; database and run data are retained by default")
+    dn.add_argument("--volumes", action="store_true", help="also delete the Postgres volume (destructive)")
+    dn.set_defaults(fn=cmd_down)
+
     r = sub.add_parser("run", help="in-process run with stub workers")
     r.add_argument("--dag", default=None, help="hand-written DAG file (or use --goal with --planner)")
     r.add_argument("--goal", default=None)
     r.add_argument("--benchmark", default=None)
-    r.add_argument("--config", default="D", help="A|B|C|D (evaluation.md)")
+    r.add_argument("--config", default="D", type=str.upper, choices=CONFIGS, help="frozen A|B|C|D policy (evaluation.md)")
     r.add_argument("--workers", type=int, default=3)
     r.add_argument("--max-concurrency", type=int, default=4)
     r.add_argument("--max-attempts", type=int, default=3)
@@ -829,6 +1144,11 @@ def build_parser() -> argparse.ArgumentParser:
     ar.add_argument("run_id")
     ar.set_defaults(fn=cmd_artifacts)
 
+    rs = sub.add_parser("result", help="show or export the exact externally verified repository commit")
+    rs.add_argument("run_id")
+    rs.add_argument("--output", default=None, help="new directory for a normal Git checkout; never overwritten")
+    rs.set_defaults(fn=cmd_result)
+
     ap = sub.add_parser("approve", help="approve the planner's acceptance-contract proposal (freezes the definition of done)")
     ap.add_argument("run_id")
     ap.add_argument("--contract", default=None, help="edited contract JSON to freeze instead of the proposal as-is")
@@ -845,7 +1165,7 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--dag", default=None, help="DAG file; omit to submit an ad-hoc --goal for the orchestrator planner")
     sb.add_argument("--goal", default=None)
     sb.add_argument("--benchmark", default=None)
-    sb.add_argument("--config", default="D")
+    sb.add_argument("--config", default="D", type=str.upper, choices=CONFIGS)
     sb.add_argument("--max-concurrency", type=int, default=4)
     sb.add_argument("--max-attempts", type=int, default=3)
     sb.add_argument("--lease-s", type=int, default=15)

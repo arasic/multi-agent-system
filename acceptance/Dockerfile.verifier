@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir --root-user-action=ignore pytest==8.* \
 
 # Trusted adapters (ADR-007 §4a): the only executable checks a contract-based suite can run. Baked into the image so
 # the image digest recorded in every verification artifact pins the adapter code too. Stdlib-only files.
-COPY mas/verifier/adapters/schema.py mas/verifier/adapters/runner.py /opt/mas/adapters/
+COPY mas/verifier/adapters/schema.py mas/verifier/adapters/runner.py mas/verifier/adapters/width_runner.py /opt/mas/adapters/
 RUN chmod -R a=rX /opt/mas
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

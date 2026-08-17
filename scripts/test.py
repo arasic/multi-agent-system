@@ -44,7 +44,9 @@ AREAS: dict[str, list[str]] = {
     "runner": ["test_exec_runner.py", "test_death_recovery.py", "test_execution_sandbox.py"],
     "verifier": ["test_acceptance.py", "test_adapters.py", "test_orchestrate_service.py"],
     "contracts": ["test_planner_llm.py", "test_adapters.py"],
-    "cli": ["test_cli.py", "test_questions.py"],
+    "cli": ["test_cli.py", "test_questions.py", "test_evaluation.py"],
+    "evaluation": ["test_evaluation.py", "test_cli.py"],
+    "conflicts": ["test_conflicts.py", "test_llm_agent.py"],
     "service": ["test_orchestrate_service.py", "test_gateway.py", "test_exec_runner.py"],
 }
 
@@ -54,6 +56,10 @@ def _pytest(args: list[str], *, parallel: bool = True) -> int:
     if parallel and _has_xdist():
         # 4, not `auto`: a few tests measure real concurrency / sockets and flake when 12 workers fight for the CPU
         cmd += ["-n", os.environ.get("MAS_TEST_WORKERS", "4")]
+    # A short, per-process base avoids Git-for-Windows MAX_PATH failures in nested worktree/ref fixtures and keeps
+    # simultaneous test invocations isolated. Callers may still provide their own --basetemp.
+    if not any(a == "--basetemp" or a.startswith("--basetemp=") for a in args):
+        cmd += [f"--basetemp=.t/p{os.getpid()}"]
     cmd += args
     print("+", " ".join(cmd), flush=True)
     return subprocess.call(cmd, cwd=ROOT)

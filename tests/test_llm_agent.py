@@ -356,3 +356,37 @@ def test_finish_rejects_trusted_inputs_and_untouched_files_as_outputs(tmp_path: 
     model, _, _ = _meter([script[0], _finish(artifacts=[{"type": "document", "path": "docs/new.md", "name": "new.md"}])])
     res = LLMAgent().execute(_ctx(root, model=model, contract=["document:new.md"]))
     assert res.success and [a.ref for a in res.artifacts if a.type == "document"] == ["path:docs/new.md"]
+
+
+def test_finish_decisions_on_competing_inputs(tmp_path: Path):
+    """A7 for the LLM worker: competing inputs are announced in the brief (as data) and `finish.decisions` must name a
+    winner among them; a forged winner or an uncontested slot is rejected; a valid decision becomes a decision artifact."""
+    from types import SimpleNamespace as NS
+    from uuid import uuid4 as u
+
+    root = tmp_path / "wt"
+    root.mkdir()
+    (root / "docs").mkdir()
+    a = NS(id=u(), task_id=u(), type="document", ref="aaa111:docs/design.md", meta={"name": "design.md", "producer": "ARCH_A"})
+    b = NS(id=u(), task_id=u(), type="document", ref="bbb222:docs/design.md", meta={"name": "design.md", "producer": "ARCH_B"})
+    ctx = _ctx(root, model=None, contract=["git_commit"], inputs=[a, b])
+    ctx.competing = {"document:design.md": [a, b]}
+    # forged winner → rejected
+    model, _, inner = _meter([_finish(decisions=[{"slot": "document:design.md", "winner": str(u()), "rationale": "x"}])])
+    ctx.model = model
+    res = LLMAgent().execute(ctx)
+    assert not res.success and "not one of the competing artifacts" in res.failure_reason
+    brief = inner.calls[0]["messages"][1]["content"]
+    assert "COMPETING INPUTS" in brief and str(a.id) in brief and "ARCH_B" in brief
+    # uncontested slot → rejected
+    model, _, _ = _meter([_finish(decisions=[{"slot": "document:other.md", "winner": str(a.id), "rationale": "x"}])])
+    ctx.model = model
+    assert "not a competing slot" in LLMAgent().execute(ctx).failure_reason
+    # a valid decision → a decision artifact the runtime will validate again and apply
+    model, _, _ = _meter([_finish(decisions=[{"slot": "document:design.md", "winner": str(b.id), "rationale": "B is simpler"}])])
+    ctx.model = model
+    res = LLMAgent().execute(ctx)
+    assert res.success
+    dec = [x for x in res.artifacts if x.type == "decision"]
+    assert len(dec) == 1 and dec[0].ref == "decision:document:design.md"
+    assert dec[0].meta == {"slot": "document:design.md", "winner": str(b.id), "rationale": "B is simpler"}

@@ -1,0 +1,15 @@
+{
+  "goal": "A7 forced-disagreement demo: two architecture tasks answer the same design question; the consumer must decide.",
+  "tasks": [
+    {"id": "ARCH_A", "capability": "architecture", "goal": "Design the service (candidate A): sqlite storage",
+     "depends_on": [], "output_contract": {"artifacts": ["document:design.md"]}},
+    {"id": "ARCH_B", "capability": "architecture", "goal": "Design the service (candidate B): json-file storage",
+     "depends_on": [], "output_contract": {"artifacts": ["document:design.md"]}},
+    {"id": "IMPL", "capability": "implementation",
+     "goal": "Implement the service on ONE of the two competing designs and say which, and why",
+     "depends_on": ["ARCH_A", "ARCH_B"], "output_contract": {"artifacts": ["git_commit"]},
+     "meta": {"stub": {"decide": "ARCH_B"}}},
+    {"id": "INTEG", "capability": "integration", "goal": "Merge", "depends_on": ["IMPL"],
+     "output_contract": {"artifacts": ["git_commit"]}}
+  ]
+}

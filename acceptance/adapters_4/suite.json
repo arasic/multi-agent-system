@@ -1,0 +1,1 @@
+{"protocol_version":1,"command":["python","/opt/mas/adapters/width_runner.py","/acceptance/spec.json"],"expected_checks":["adapter_files","adapter_behavior","tests_pass"],"timeout_s":30}

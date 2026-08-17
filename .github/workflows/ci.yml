@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mas
+          POSTGRES_PASSWORD: mas
+          POSTGRES_DB: mas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mas -d mas"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      MAS_DATABASE_URL: postgresql://mas:mas@localhost:5432/mas
+      MAS_TEST_WORKERS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m ruff check .
+      - name: Full Postgres and Docker gate
+        run: python scripts/test.py full
+
+  windows-unit:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m ruff check .
+      - name: Windows process-tree and path boundary gate
+        run: python scripts/test.py unit

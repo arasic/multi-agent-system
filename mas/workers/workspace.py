@@ -139,6 +139,9 @@ class GitWorkspace:
             try:
                 _git("init", "--bare", "-q", "--initial-branch=main", str(tmp))
                 _git("config", "gc.auto", "0", cwd=tmp)
+                # Git for Windows otherwise inherits MAX_PATH for ref logs. Attempt branches contain UUIDs and can
+                # exceed that limit under pytest or a deeply nested MAS_DATA_DIR even when the worktree itself fits.
+                _git("config", "core.longpaths", "true", cwd=tmp)
                 if not repo.exists():
                     try:
                         os.rename(tmp, repo)  # atomic on the same filesystem; loser gets an error → fine
@@ -148,6 +151,7 @@ class GitWorkspace:
                 if tmp.exists():
                     shutil.rmtree(tmp, ignore_errors=True)
         # base commit on main (deterministic sha, so racing creators agree)
+        _git("config", "core.longpaths", "true", cwd=repo, check=False)  # also upgrades repositories created earlier
         head = _git("rev-parse", "-q", "--verify", "refs/heads/main", cwd=repo, check=False)
         if head.returncode != 0:
             if base_ref:

@@ -48,6 +48,10 @@ class TaskContext:
         default_factory=list
     )  # context_spec.paths — the only paths the agent should read (tool layer enforces)
     conflicts: list[str] = field(default_factory=list)  # unresolved merge conflicts left by input assembly (agent must resolve)
+    # A7: competing candidate inputs for the same output slot (e.g. two `document:design.md` from two tasks). The agent
+    # MUST publish one `decision` artifact per slot: ArtifactOut(type="decision", ref="decision:<slot>",
+    # meta={"slot", "winner": <artifact id>, "rationale"}); the runtime accepts the winner and supersedes the losers.
+    competing: dict[str, list[Artifact]] = field(default_factory=dict)
     # The model for this attempt: a MeteredProvider (telemetry, pricing, per-attempt call budget, deadline, cancel)
     # handed over by the runtime, or None when the worker has no model (stub agents). Agents never build providers.
     model: ModelProvider | None = None

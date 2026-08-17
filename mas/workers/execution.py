@@ -93,7 +93,9 @@ def kill_tree(proc: subprocess.Popen) -> None:
     """Terminate the process and everything it spawned (process group / session; `taskkill /T` on Windows)."""
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=15, check=False)
+            # `taskkill` is the only stdlib-available process-tree primitive on Windows. Keep its own timeout short:
+            # this function is called *after* the command deadline and must not turn a 1 s tool timeout into a 15 s one.
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=5, check=False)
         else:
             import signal
 
@@ -175,7 +177,8 @@ def run_bounded(
         finally:
             done.set()
 
-    threading.Thread(target=_reader, name="exec-reader", daemon=True).start()
+    reader = threading.Thread(target=_reader, name="exec-reader", daemon=True)
+    reader.start()
     deadline = t0 + max(0.05, timeout_s)
     while True:
         if proc.poll() is not None:
@@ -198,12 +201,18 @@ def run_bounded(
             proc.wait(timeout=kill_grace_s)
         except subprocess.TimeoutExpired:
             log.warning("process %s did not die after kill", proc.pid)
-    done.wait(kill_grace_s)
-    try:
-        if proc.stdout is not None:
-            proc.stdout.close()
-    except Exception:
-        pass
+    reader.join(kill_grace_s)
+    if reader.is_alive():
+        # Never close a buffered pipe from this thread while `_reader` is blocked in `read()`: on Windows `close()`
+        # waits for the reader's internal lock and can hang forever when a stubborn descendant retained the handle.
+        # The daemon reader owns the pipe and will close it when EOF arrives; returning here preserves the hard bound.
+        log.warning("output reader for process %s did not reach EOF after tree termination", proc.pid)
+    else:
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
     out = b"".join(chunks).decode("utf-8", "replace")
     if flags["truncated"]:
         out += "\n[output truncated]"

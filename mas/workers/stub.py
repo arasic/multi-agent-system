@@ -64,13 +64,43 @@ class StubAgent:
         if n <= int(s.get("crash_attempts", 0)):
             raise RuntimeError(f"stub crash on {ctx.task.key}#{n}")
 
+        # A7: competing candidate inputs for the same slot → one decision per slot. Script `decide`: "first" (default) |
+        # "last" | "<producer task key>" | "none" (publish no decision → the runtime fails the attempt: contract unmet)
+        decide = str(s.get("decide", "first"))
+        decisions: list[ArtifactOut] = []
+        winners: dict[str, Any] = {}
+        if ctx.competing and decide != "none":
+            for slot, cands in sorted(ctx.competing.items()):
+                if decide == "last":
+                    winner = cands[-1]
+                elif decide == "first":
+                    winner = cands[0]
+                else:
+                    winner = next((a for a in cands if str(a.meta.get("producer") or "") == decide), None) or cands[0]
+                winners[slot] = winner
+                decisions.append(
+                    ArtifactOut(
+                        type="decision",
+                        ref=f"decision:{slot}",
+                        meta={
+                            "slot": slot,
+                            "winner": str(winner.id),
+                            "losers": [str(a.id) for a in cands if a.id != winner.id],
+                            "rationale": f"stub policy {decide!r}: chose {winner.ref} among {len(cands)} candidates for {slot}",
+                        },
+                    )
+                )
+
         if ctx.conflicts:
-            # input assembly left merge conflicts; a stub cannot resolve them (an LLM integration agent would)
-            return AgentResult(
-                success=False,
-                failure_reason=f"unresolved merge conflicts in {sorted(ctx.conflicts)}",
-                usage=dict(s.get("usage", {})),
-            )
+            # input assembly left merge conflicts. Where a conflicted file IS a decided slot, apply the decision: take the
+            # winner's version (what an integrating agent does after choosing). Anything else a stub cannot resolve.
+            unresolved = _apply_decisions_to_conflicts(ctx, winners) if winners else list(ctx.conflicts)
+            if unresolved:
+                return AgentResult(
+                    success=False,
+                    failure_reason=f"unresolved merge conflicts in {sorted(unresolved)}",
+                    usage=dict(s.get("usage", {})),
+                )
 
         arts = s.get("artifacts")
         if arts is None:
@@ -88,6 +118,8 @@ class StubAgent:
                 )
                 for a in arts
             ]
+
+        outs.extend(decisions)
 
         if n <= int(s.get("fail_attempts", 0)):
             # publish_on_fail: leave candidate artifacts behind on a failed attempt (they must stay hints, never outputs)
@@ -135,6 +167,35 @@ class StubAgent:
         for rel, content in (s.get("files") or {}).items():
             _write(ws / rel, str(content))
         return outs
+
+
+def _apply_decisions_to_conflicts(ctx: TaskContext, winners: dict[str, Any]) -> list[str]:
+    """Resolve each conflicted path that is a decided slot's file with the winner's content (`git show <sha>:<path>` in
+    the worktree; the winner's ref is `<sha>:<relpath>`). Returns the paths that stayed unresolved."""
+    import subprocess
+
+    if ctx.workspace is None:
+        return list(ctx.conflicts)
+    by_path: dict[str, Any] = {}
+    for w in winners.values():
+        if ":" in w.ref:
+            sha, _, rel = w.ref.partition(":")
+            if sha and rel and not sha.startswith(("stub", "path")):
+                by_path[rel] = (sha, rel)
+    unresolved: list[str] = []
+    for rel in ctx.conflicts:
+        pick = by_path.get(rel)
+        if pick is None:
+            unresolved.append(rel)
+            continue
+        sha, path = pick
+        r = subprocess.run(["git", "show", f"{sha}:{path}"], cwd=ctx.workspace, capture_output=True, check=False)
+        if r.returncode != 0:
+            unresolved.append(rel)
+            continue
+        (Path(ctx.workspace) / rel).write_bytes(r.stdout)
+        subprocess.run(["git", "add", rel], cwd=ctx.workspace, capture_output=True, check=False)
+    return unresolved
 
 
 def _write(p: Path, content: str) -> None:

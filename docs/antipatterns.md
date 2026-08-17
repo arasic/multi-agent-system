@@ -34,7 +34,7 @@ Legend: ✅ enforced and tested today · 🟡 designed, not built yet (roadmap s
 | B5 | **Information withholding** (MAST 2.4) | Upstream result never reaches downstream | Downstream context = **outputs of dependencies** (`outputs_of_dependencies`), computed by the runtime, not by the agent's goodwill | ✅ |
 | B6 | **Ignoring another agent's input** (MAST 2.5) | Agent re-derives instead of using upstream artifact | Inputs are explicit in the attempt (`ctx.inputs`, recorded in artifact `meta.inputs`); planner-level: `context_spec.artifacts_from` | ✅ plumbing; 🟡 measured in evaluation (context tokens per attempt) |
 | B7 | **Reasoning–action mismatch** (MAST 2.6) | Says "done", didn't publish; says "tests pass", verifier disagrees | Output contract checked against *published* artifacts; verifier ignores agent claims | ✅ |
-| B8 | **Merging by "ask another LLM to summarise"** (discuss.md) | Averages away contradictions; conflicts vanish | Conflicts stay visible: competing `candidate` artifacts → `decision` artifact with rationale → losers `superseded`/`rejected` (I-10, ADR-002/004) | ✅ representation; 🟡 forced-disagreement demo (evaluation A7, M2) |
+| B8 | **Merging by "ask another LLM to summarise"** (discuss.md) | Averages away contradictions; conflicts vanish | Conflicts stay visible: competing `candidate` artifacts → `decision` artifact with rationale → losers `superseded`/`rejected` (I-10, ADR-002/004) | ✅ representation + resolution (2026-08-17): competing inputs computed by the runtime, one `decision` per slot required of the consumer (silent choice = contract violation), winner accepted / losers superseded in the report transaction, forged decisions rejected; demo `benchmarks/forced_disagreement`, `tests/test_conflicts.py` |
 | B9 | **Agreement = truth** (discuss.md; *More Agents…* caveat) | Three agents can be wrong together | Nothing becomes `accepted` by vote; only integration/decision or verifier PASS accept; only the SUCCESS attempt's outputs flow downstream | ✅ |
 | B10 | **Communication / context explosion** (discuss.md) | Tokens scale with agents²; nobody can afford it | No fan-in of chat; artifacts referenced, not copied; per-task `context_spec`; tokens-in per attempt is a first-class metric | ✅ metrics + artifact scoping; ✅ path scoping in the tool layer (`Jail(read_globs=context_spec.paths)`, step 10 part 1) |
 | B11 | **Hallucination cascade / trust laundering** (discuss.md) | One agent's guess becomes another's premise, then "verified" by a third | Only outputs of *successful* attempts propagate; nothing is accepted without external verification; provenance on every artifact (run/task/attempt/model) | ✅ plumbing; 🟡 real verifier |
@@ -87,9 +87,9 @@ Legend: ✅ enforced and tested today · 🟡 designed, not built yet (roadmap s
 
 ## Open gaps (tracked in roadmap.md)
 
-1. ~~**B3 — clarifying questions**~~ → done (ADR-006, `AWAITING_INPUT`, `mas answer`); remaining: the LLM planner using it (step 11).
-2. **B12 — prompt-injection boundary**: containment done (rule 4 allow-lists, forbidden tools); presentation-as-data and tool-layer enforcement land with the LLM worker (step 10).
+1. ~~**B3 — clarifying questions**~~ → done (ADR-006, `AWAITING_INPUT`, `mas answer`, LLM planner typed outcome).
+2. ~~**B12 — prompt-injection boundary**~~ → done: DATA envelopes + nonce framing; path/tool/sandbox containment is the guarantee.
 3. ~~**A8/A2 — validator rule 4**~~ → done (policy half); tool implementations bound to the allow-list at step 10.
-4. **C2/C3 — real acceptance-suite verifier and read-only mount** (steps 6–7).
-5. **B8 — forced-disagreement demo** (M2, evaluation A7).
-6. **D4–D6 — the fair comparison itself** (M3).
+4. ~~**C2/C3 — real acceptance-suite verifier and read-only mount**~~ → done (7A–C; sandbox + trusted adapters).
+5. ~~**B8 — forced-disagreement demo**~~ → done (A7: `benchmarks/forced_disagreement`, `tests/test_conflicts.py`).
+6. **D4–D6 — fair comparison:** executable A/B/C/D harness and width suites are done; real ≥5-run matrix/write-up remains.

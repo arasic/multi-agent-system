@@ -438,6 +438,13 @@ def get_task(conn: Conn, task_id: UUID) -> Task:
     return Task.from_row(row)
 
 
+def get_artifact(conn: Conn, artifact_id: UUID) -> Artifact:
+    row = conn.execute("SELECT * FROM artifacts WHERE id = %s", (artifact_id,)).fetchone()
+    if row is None:
+        raise LookupError(f"artifact {artifact_id} not found")
+    return Artifact.from_row(row)
+
+
 def get_attempt(conn: Conn, attempt_id: UUID) -> Attempt:
     row = conn.execute("SELECT * FROM attempts WHERE id = %s", (attempt_id,)).fetchone()
     if row is None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import threading
@@ -178,15 +177,18 @@ def test_worker_commit_to_external_verdict_end_to_end(conn, tmp_path, verifier_i
 
 
 @pytest.mark.docker
-def test_output_flood_is_capped_killed_and_never_reaches_host_disk(tmp_path, verifier_image):
+def test_output_flood_is_capped_killed_and_never_reaches_host_disk(tmp_path, verifier_image, monkeypatch):
     """P1 from review: capture is bounded while capturing, not after. A 400 MB flood must produce INVALID quickly,
     leave no container, and never create a capture file on the host (pipes + in-memory cap only)."""
-    import glob
     import tempfile
     import time
 
     repo, sha = _fixture_commit(tmp_path, "known_good")
-    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "mas-verify-*")))
+    # Give this test a process-local capture root. A global `%TEMP%/mas-verify-*` snapshot races verifier tests in
+    # other xdist workers and reports their legitimate temporary directories as leaks.
+    captures = tmp_path / "captures"
+    captures.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(captures))
     t0 = time.monotonic()
     result = AcceptanceVerifier(SPECIAL_SUITES, image=verifier_image, limits=SandboxLimits(timeout_s=20)).verify(
         _request(repo, sha, "floods")
@@ -196,7 +198,7 @@ def test_output_flood_is_capped_killed_and_never_reaches_host_disk(tmp_path, ver
     assert "output exceeded limit" in (result.reason or "")
     assert result.evidence["stdout_bytes"] > result.evidence["output_cap"] == 256 * 1024
     assert elapsed < 15, elapsed  # killed on overflow, well before the 20 s timeout
-    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "mas-verify-*"))) - before == set()
+    assert list(captures.glob("mas-verify-*")) == []
     leftover = subprocess.run(
         ["docker", "ps", "-a", "--filter", "name=mas-verify-", "-q"], capture_output=True, text=True, check=False
     ).stdout.split()

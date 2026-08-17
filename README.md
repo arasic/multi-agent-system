@@ -152,8 +152,10 @@ Design changes go through an ADR. Nothing about the design lives only in chat.
 python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"     # POSIX: .venv/bin/pip
 docker compose up -d postgres
 .venv/Scripts/mas migrate
+.venv/Scripts/mas doctor
 .venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3 --stub-verifier
 .venv/Scripts/mas replay <run_id>
+.venv/Scripts/mas result <run_id> --output ./verified-result
 docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
 .venv/Scripts/python scripts/test.py unit|core|full                 # key-less test tiers (~15 s / ~1.5 min / ~2 min, 4 workers, own temp DBs)
 .venv/Scripts/python scripts/test.py area repair                    # just the files for an area; `list` shows the areas
@@ -161,17 +163,20 @@ docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
 
 Runs are tagged with a **pool**: `mas run` uses a private `local:<pid>` pool, the compose services serve `default`, so they never take each other's work even on the same database. Tests are isolated too — each pytest process creates and drops its own `mas_test_<pid>` database, so concurrent test runs can't collide.
 
-Distributed (orchestrator + 3 worker containers, then kill one mid-run):
+Supported distributed operator path (the command stays in the foreground supervising the trusted host-side executor
+and verifier; use another terminal for `submit`, `approve`, `status` and `result`):
 
 ```
-docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
-docker compose build orchestrator && docker compose up -d --scale worker=3 orchestrator worker
-.venv/Scripts/mas verify --watch             # host-side verifier service (has Docker) — real sandboxed verdicts
-.venv/Scripts/mas execute --watch            # host-side execution runner (has Docker) — command tools for compose LLM workers
-MAS_WORKER_AGENT=llm docker compose up -d --scale worker=3 postgres orchestrator gateway worker   # LLM workers via the gateway (offline: fake:builder)
+.venv/Scripts/mas up --offline --build --workers 3       # key-less plumbing rehearsal
 .venv/Scripts/mas submit --dag benchmarks/url_shortener/dag.json --wait
+.venv/Scripts/mas result <run_id> --output ./verified-result
 docker kill multi-agent-system-worker-2      # the reaper reassigns its task; the run still passes
+.venv/Scripts/mas down
 ```
+
+For a real provider, copy `.env.example` to `.env`, select a real `MAS_GATEWAY_UPSTREAM`, configure current prices,
+inject its vendor key into the launching shell, run `mas doctor --require-live`, then `mas up --build`. The one-command
+live gate remains `python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m>`.
 
 ## Status
 
@@ -186,6 +191,12 @@ docker kill multi-agent-system-worker-2      # the reaper reassigns its task; th
 **Step 7C done:** the orchestrator service ticks runs concurrently (bounded executor, per-run advisory locks, one connection per tick — a slow verification never blocks other runs) and defers verification (`--verifier external`) to a **verifier service** (`mas verify --watch`) that has sandbox access; service-mode runs now get real verdicts. Demonstrated fire-and-forget: submit through the services, kill a worker, kill the verifier mid-verification, restart → `PASS`.
 
 **M1 substrate is complete.** **M2 step 9 done:** concrete `ModelProvider`s (`anthropic`, `openai`-compatible, `fake`) chosen by `MAS_MODEL_<ROLE>="<provider>:<model>"`, prices from `MAS_MODEL_PRICES`, and **per-call telemetry**: every model call is timed, priced and written to `model_calls` as it finishes (evidence that survives a dying worker), attempts settle from the meter, and a per-attempt call/token budget (capped by the run's remaining tokens) makes runaway agent loops impossible. `mas models --ping` is the provider smoke test; `mas status` shows per-model calls and flags unpriced usage. **Step 10 (in progress):** tool layer with an in-process path jail and an **execution boundary** — command tools run only inside a per-attempt hardened container (or not at all); attempt deadlines and cancellation are enforced across model calls including provider retries; and the **bounded LLM worker loop** (`--agent llm`) with typed endings, data envelopes for untrusted content and a per-attempt execution-trace artifact — proven offline with a scripted provider building the diamond DAG through git worktrees. The **execution-runner service** (`mas execute --watch`) lets docker-less compose workers run command tools: ids-only requests through Postgres, a trusted host-side runner validates, derives the worktree, and runs each command in the attempt's sandbox (typed ABANDONED on runner death, never replayed). Model connectivity is a narrow **gateway** service (the only process with a key; workers keep zero egress) — demonstrated offline in compose: 3 LLM workers → gateway (`fake:builder`) → runner-side sandboxes → real verifier, `benchmarks/url_shortener` PASSED with no API key; the death-recovery gate (worker / provider / runner / sandbox deaths) passed. **Step 11 (LLM planner) is in:** the planner returns exactly one typed outcome — questions, an acceptance-contract proposal, or a DAG — a deterministic driver validates and decides, rejections go back as data, the human approves the contract once (`mas approve`) and it freezes as the definition of done the verifier pins; task-shape metadata is recorded but never selects the mode. Demonstrated offline via CLI: `mas run --goal … --planner fake --agent llm --model fake:builder` → contract → approve → DAG → 3 workers → real verifier ran the frozen suite → PASS. **Validator rule 8** is a real budget-allocation check (per-attempt token allocation `max_attempt_tokens` is a run budget; a plan must be fundable for one attempt per open task; wall-clock from observed attempts + estimates that only tighten). **13-lite bounded repair** is in: verifier FAIL → deterministic progress fingerprint (failing ids, normalized failure classes, integration *tree* hash, accepted artifacts) → one amendment on COMPLETED work (rule 9) within `max_replans`, the only repair budget → PASS, or `NO_PROGRESS` / `BUDGET_EXHAUSTED` — every non-passing run carries a `verdict_reason` code (ADR-008); only a verifier `FAIL` is repairable (`TIMEOUT`/`ERROR`/`INVALID` are coded infrastructure verdicts). The token budget is a **hard total**: attempt allocations are reservations claimed from the run's unreserved tokens, planner rounds are charged from telemetry, and a terminal run keeps no worktrees. Offline demo: `mas run --dag … --verifier-fail-times 1 --planner fake --max-replans 1`. Open: the live-provider smokes (worker + planner) once a key is present — one command, `python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m>` (ping → LLM workers + sandboxes + real verifier on the benchmark → LLM planner goal→contract→approve→DAG→PASS); then the fair benchmark (M3). The hardened Compose services intentionally have no Docker socket; run `mas execute --watch` and `mas verify --watch` in the trusted host-side services that own sandbox execution and verification. See [docs/roadmap.md](docs/roadmap.md).
+
+**MVP productization pass (2026-08-17):** `mas doctor`, supervised `mas up`/`mas down`, and `mas result --output`
+provide preflight, one-command local operation, and a normal checkout of the exact verified commit plus a sidecar evidence
+record. Frozen configs A/B/C/D are executable policy rather than labels; the adapter width family (`N=1/2/4/8/16`),
+trusted suites, key-less real-verifier gate, and `scripts/benchmark.py` matrix/report runner are built. The M3 experiment
+itself and the live-provider smoke remain open because this environment has no provider/model/price/key configuration.
 
 ## Post-MVP direction
 

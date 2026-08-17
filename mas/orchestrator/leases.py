@@ -21,10 +21,10 @@ from uuid import UUID
 from mas.artifacts import store
 from mas.db.connection import Conn, Jsonb
 from mas.db.events import emit
-from mas.models.enums import AttemptStatus, RunStatus, TaskStatus
+from mas.models.enums import ArtifactStatus, AttemptStatus, RunStatus, TaskStatus
 from mas.models.types import Attempt, Run, Task
 from mas.orchestrator import state_machine as sm
-from mas.orchestrator.contracts import missing_outputs
+from mas.orchestrator.contracts import DECISION_TYPE, missing_outputs
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +155,52 @@ def reserve_allocation(conn: Conn, run_row: dict[str, Any], token_ceiling: int |
     return max(0, min(want, free))
 
 
+def _validated_decision(meta: dict[str, Any], competing: dict[str, list[UUID]]) -> str | None:
+    """A decision names a competing slot and a winner among that slot's candidates (the runtime knows the set: an agent
+    can not crown an artifact it was never given). Losers default to the rest. Returns an error string or None."""
+    slot = meta.get("slot")
+    if not slot or slot not in competing:
+        return f"decision for unknown/uncontested slot {slot!r}"
+    ids = [str(x) for x in competing[slot]]
+    winner = str(meta.get("winner") or "")
+    if winner not in ids:
+        return f"decision for {slot}: winner {winner!r} is not one of the competing artifacts {ids}"
+    losers = [str(x) for x in (meta.get("losers") or [])] or [x for x in ids if x != winner]
+    bad = [x for x in losers if x not in ids or x == winner]
+    if bad:
+        return f"decision for {slot}: losers {bad} are not competing artifacts"
+    meta["losers"] = losers
+    meta["rationale"] = str(meta.get("rationale") or "")[:2000]
+    return None
+
+
+def _apply_decision(conn: Conn, run_id: UUID, task: Task, attempt_id: UUID, meta: dict[str, Any]) -> None:
+    """Winner → accepted, losers → superseded_by winner (immutable rows; only status/superseded_by change, through the
+    artifact module). Already-decided artifacts (an earlier attempt of a sibling consumer) are left as they are."""
+    winner = UUID(str(meta["winner"]))
+    w = sm.get_artifact(conn, winner)
+    if w.status is ArtifactStatus.CANDIDATE:
+        store.accept(conn, winner)
+    for loser in meta.get("losers") or []:
+        lid = UUID(str(loser))
+        cur = sm.get_artifact(conn, lid)
+        if cur.status is ArtifactStatus.CANDIDATE:
+            store.supersede(conn, lid, winner)
+    emit(
+        conn,
+        run_id,
+        "artifact.decided",
+        task_id=task.id,
+        attempt_id=attempt_id,
+        payload={
+            "slot": meta.get("slot"),
+            "winner": str(winner),
+            "losers": list(meta.get("losers") or []),
+            "rationale": meta.get("rationale"),
+        },
+    )
+
+
 def heartbeat(conn: Conn, attempt_id: UUID, lease_s: int) -> bool:
     with conn.transaction():
         row = conn.execute(
@@ -246,8 +292,11 @@ def report(
     failure_reason: str | None = None,
     usage: dict[str, Any] | None = None,
     new_work_required: str | None = None,
+    competing: dict[str, list[UUID]] | None = None,
 ) -> Task:
-    """Apply a worker's result atomically: lock run → task → attempt; publish artifacts; check contract; settle.
+    """Apply a worker's result atomically: lock run → task → attempt; publish artifacts; apply decisions on competing
+    inputs (A7: winner accepted, losers superseded — only among the competing ids the runtime handed the agent);
+    check the contract (a decision per competing slot is part of it); settle.
 
     Raises StaleAttempt (and publishes nothing) if the attempt is not RUNNING anymore.
     """
@@ -265,7 +314,14 @@ def report(
         assert att is not None
         if att.status is not AttemptStatus.RUNNING:
             raise StaleAttempt(f"attempt {attempt_id} is {att.status.value}, report ignored")
+        decision_errors: list[str] = []
         for a in artifacts or []:
+            meta = dict(a.meta)
+            if a.type == DECISION_TYPE:
+                err = _validated_decision(meta, competing or {})
+                if err:
+                    decision_errors.append(err)
+                    continue  # an invalid decision is not published (nothing was decided)
             store.publish(
                 conn,
                 run_id=ids["run_id"],
@@ -273,8 +329,10 @@ def report(
                 attempt_id=attempt_id,
                 type=a.type,
                 ref=a.ref,
-                meta=a.meta,
+                meta=meta,
             )
+            if a.type == DECISION_TYPE:
+                _apply_decision(conn, ids["run_id"], task, attempt_id, meta)
         if new_work_required:
             # step 13 trigger: the orchestrator's tick turns this into a re-plan (bounded by max_replans) when it can
             conn.execute(
@@ -291,13 +349,15 @@ def report(
                 payload={"detail": new_work_required},
             )
         if success:
-            missing = missing_outputs(conn, task, attempt_id)
+            missing = missing_outputs(conn, task, attempt_id, competing=competing)
+            if decision_errors:
+                missing = missing + [f"invalid decision: {e}" for e in decision_errors]
             if missing:
                 return sm.settle_failed_attempt(
                     conn,
                     attempt_id,
                     AttemptStatus.FAILED,
-                    reason=f"output contract unmet: {', '.join(missing)}",
+                    reason=f"output contract unmet: {', '.join(missing)}"[:1000],
                     usage=usage,
                 )
             return sm.complete_attempt(conn, attempt_id, usage=usage)

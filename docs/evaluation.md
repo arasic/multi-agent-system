@@ -23,7 +23,7 @@ All ten must hold, each demonstrated by a repeatable test or scripted demo:
 | A4 | Workers are isolated | Separate processes/containers, per-attempt worktrees, scoped context (tokens-in per attempt recorded) |
 | A5 | Worker death recovers automatically | Kill a worker mid-attempt → `ABANDONED` → task re-claimed → run completes |
 | A6 | Artifacts stay consistent | Immutability enforced; retries don't inherit partial outputs; supersession chain intact |
-| A7 | Conflicts are representable and resolved visibly | Forced-disagreement demo: two competing candidate artifacts → `decision` artifact → loser `superseded` |
+| A7 | Conflicts are representable and resolved visibly | Forced-disagreement demo: two competing candidate artifacts → `decision` artifact → loser `superseded`. **Status (2026-08-17):** ✅ `benchmarks/forced_disagreement/dag.json` — ARCH_A/ARCH_B both produce `document:design.md`; IMPL must decide; winner accepted, loser `superseded_by` winner, decision artifact with rationale, `artifact.decided` event; silent choice fails the attempt; forged winners rejected (`tests/test_conflicts.py`, stub and git worktrees; LLM `finish.decisions` unit-tested) |
 | A8 | Bounded re-plan works | Induced integration/verifier failure → amendment → validator → completes; `max_replans` respected. **Status (13-lite, offline):** stub verifier FAIL → amendment (rule 9) → PASS with `replans_used = 1`; repeated fingerprint → `NO_PROGRESS`; budget spent → `BUDGET_EXHAUSTED`/`NO_PROGRESS` (`tests/test_repair.py`) |
 | A9 | External verifier alone controls PASS | Agents' own tests irrelevant to verdict; `acceptance/` read-only; verifier is not a task |
 | A10 | Every run terminates inside budget, fully auditable | Budget-starvation tests reach `ABORTED`; `mas replay <run_id>` reconstructs the run from `events` |
@@ -54,7 +54,10 @@ Purpose: prove the whole pipeline end-to-end. **Not** used to claim MAS superior
 
 Run at **N = 1, 2, 4, 8, 16**. This is where the value question is answered: where is the crossover?
 
-Fixtures for stub workers (pre-written commits per task) exist for both benchmarks so the pipeline is testable without an LLM.
+Fixtures for stub workers exist for both benchmarks so the pipeline is testable without an LLM. The width family is
+generated deterministically by `mas.evaluation.width_dag(N)` and verified by immutable `acceptance/adapters_<N>` suites;
+`tests/test_benchmark.py` permanently gates N=4 through real Git worktrees and the Docker verifier. The full experiment
+is `python scripts/benchmark.py` (JSONL + CSV/JSON + SVG); real evidence requires at least five repetitions per cell.
 
 ---
 
@@ -72,6 +75,10 @@ Same task. Same acceptance suite. Same tools. Same budgets. Same runtime code.
 Comparisons: **A vs D** — is MAS worth more than one cheap agent? **B vs D** — can heterogeneous MAS beat fast frontier intelligence? **C vs D** — what does actual parallelism buy?
 
 Through M3, the execution mode is **explicitly configured and frozen**. The planner may record task-shape metadata (estimated width, coupling, shared-output risk and critical path), but that metadata is observational and cannot silently change A/B/C/D. Automatic mode selection is a post-MVP hypothesis evaluated under [ADR-008](adr/008-adaptive-execution-modes.md), not a prerequisite for an honest MAS result.
+
+**Enforcement (2026-08-17):** `mas.evaluation` and the CLI make this table executable. A/B are transformed into one
+`solve` task plus system integration and forced to concurrency 1; their deterministic repair policy preserves that shape.
+C is forced to concurrency 1; D alone honors N. Model specs stay explicit at the experiment boundary.
 
 ### Fairness rules (non-negotiable)
 

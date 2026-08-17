@@ -83,6 +83,22 @@ FINISH_TOOL: dict[str, Any] = {
             },
             "failure_reason": {"type": "string"},
             "new_work_required": {"type": "string", "description": "only if the task revealed missing upstream work"},
+            "decisions": {
+                "type": "array",
+                "description": "REQUIRED when the brief lists competing input artifacts: one entry per competing slot",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "slot": {
+                            "type": "string",
+                            "description": "the competing slot exactly as listed, e.g. document:design.md",
+                        },
+                        "winner": {"type": "string", "description": "the artifact id you chose to build on"},
+                        "rationale": {"type": "string", "description": "why, in one or two sentences"},
+                    },
+                    "required": ["slot", "winner", "rationale"],
+                },
+            },
         },
         "required": ["success", "summary"],
     },
@@ -290,6 +306,17 @@ class LLMAgent:
             lines.append("")
             lines.append(data_envelope("unresolved merge conflicts (paths)", "\n".join(ctx.conflicts), nonce=True))
             lines.append("Resolve these conflict markers first.")
+        if ctx.competing:
+            lines.append("")
+            lines.append(
+                "COMPETING INPUTS: upstream tasks produced rival candidates for the same output slot. You must decide, "
+                "explicitly, which one this task builds on: call `finish` with one `decisions` entry per slot (slot, "
+                "winner artifact id, rationale). The runtime accepts the winner and supersedes the losers; the disagreement "
+                "stays on record. Choosing silently is not allowed."
+            )
+            for slot, arts in sorted(ctx.competing.items()):
+                rows = [{"artifact_id": str(a.id), "ref": a.ref, "producer": a.meta.get("producer")} for a in arts]
+                lines.append(data_envelope(f"competing candidates for {slot}", json.dumps(rows, sort_keys=True), nonce=True))
         if ctx.inputs:
             lines.append("")
             lines.append("Input artifacts from upstream tasks (already merged into the worktree where they are files):")
@@ -340,6 +367,27 @@ class LLMAgent:
                 continue
             name = str(item.get("name") or p.name)
             outs.append(ArtifactOut(type=atype, ref=f"path:{path}", meta={"name": name, "summary": summary[:500]}))
+        # A7: decisions on competing inputs — validated here against what the runtime handed over; validated and applied
+        # again by the runtime at report time (an agent can not crown an artifact it was never given)
+        known = {slot: {str(a.id) for a in arts} for slot, arts in (ctx.competing or {}).items()}
+        for d in args.get("decisions") or []:
+            if not isinstance(d, dict) or not d.get("slot") or not d.get("winner"):
+                problems.append(f"malformed decision entry: {d!r}")
+                continue
+            slot, winner = str(d["slot"]), str(d["winner"])
+            if slot not in known:
+                problems.append(f"decision for {slot!r}: not a competing slot")
+                continue
+            if winner not in known[slot]:
+                problems.append(f"decision for {slot!r}: winner {winner!r} is not one of the competing artifacts")
+                continue
+            outs.append(
+                ArtifactOut(
+                    type="decision",
+                    ref=f"decision:{slot}",
+                    meta={"slot": slot, "winner": winner, "rationale": str(d.get("rationale") or "")[:2000]},
+                )
+            )
         if problems:
             return AgentResult(success=False, failure_reason="finish listed invalid artifacts: " + "; ".join(problems)[:900])
         return AgentResult(

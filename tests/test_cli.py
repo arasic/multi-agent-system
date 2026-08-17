@@ -1,5 +1,7 @@
 """CLI smoke tests: the commands a human runs must work end-to-end (in-process, stub workers, no API key)."""
 
+import json
+
 import pytest
 
 from mas.cli import main
@@ -9,7 +11,7 @@ pytestmark = pytest.mark.db
 DAG = "benchmarks/url_shortener/dag.json"
 
 
-def test_migrate_and_run_and_status_and_replay(conn, capsys):
+def test_migrate_and_run_and_status_and_replay_and_export(conn, capsys, tmp_path):
     assert main(["migrate"]) == 0
     rc = main(["run", "--dag", DAG, "--workers", "3", "--stub-sleep", "0.05", "--lease-s", "2", "--stub-verifier"])
     out = capsys.readouterr().out
@@ -24,6 +26,13 @@ def test_migrate_and_run_and_status_and_replay(conn, capsys):
     assert "run.created" in replay and "run.passed" in replay and "attempt.leased" in replay
     assert main(["status", run_id, "--json"]) == 0
     assert '"status": "PASSED"' in capsys.readouterr().out
+    assert main(["result", run_id]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["status"] == "PASSED" and len(record["integration_sha"]) == 40
+    output = tmp_path / "verified"
+    assert main(["result", run_id, "--output", str(output)]) == 0
+    assert (output / ".git").is_dir() and (tmp_path / "verified.mas-result.json").is_file()
+    assert main(["result", run_id, "--output", str(output)]) == 2  # never overwrites
 
 
 def test_run_with_chaos_kill_recovers(conn, capsys):
@@ -115,3 +124,36 @@ def test_submit_creates_run_and_exits(conn, capsys):
     assert rc == 0 and "submitted run" in out and "status=RUNNING" in out
     row = conn.execute("SELECT status FROM runs").fetchone()
     assert row["status"] == "RUNNING"  # waits for the orchestrator/worker services
+
+
+def test_configs_a_and_c_change_the_runtime_shape_not_only_the_label(conn, capsys):
+    assert main(["run", "--dag", DAG, "--config", "A", "--stub-verifier", "--stub-sleep", "0.01"]) == 0
+    out = capsys.readouterr().out
+    assert "config=A, 2 tasks" in out and "max_concurrency=1" in out
+    row = conn.execute("SELECT config, max_concurrency FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert row == {"config": "A", "max_concurrency": 1}
+
+    assert main(["submit", "--dag", DAG, "--config", "C", "--max-concurrency", "9"]) == 0
+    row = conn.execute("SELECT config, max_concurrency FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert row == {"config": "C", "max_concurrency": 1}
+
+
+def test_single_agent_verifier_repair_remains_single_agent(conn, capsys):
+    rc = main(
+        [
+            "run",
+            "--dag",
+            DAG,
+            "--config",
+            "A",
+            "--verifier-fail-times",
+            "1",
+            "--max-replans",
+            "1",
+            "--stub-sleep",
+            "0.01",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "SOLVE_R1" in out and "INTEGRATE_R1" in out and "replans=1" in out

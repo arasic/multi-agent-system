@@ -29,6 +29,7 @@ from mas.config import settings
 from mas.db.connection import Conn, connect
 from mas.models.types import Task
 from mas.orchestrator import leases
+from mas.orchestrator.contracts import competing_inputs
 from mas.orchestrator.leases import ArtifactSpec, Claim, StaleAttempt
 from mas.providers.base import ModelProvider
 from mas.providers.pricing import Pricing
@@ -242,6 +243,7 @@ class Worker:
         backend: Any = None
         try:
             inputs = _dependency_outputs(self.conn, claim.task)
+            competing = competing_inputs(inputs)  # A7: same slot from different tasks → the agent must decide
             metered = self._metered(claim, cancel=cancel, deadline=deadline)
             try:
                 handle = self.workspace.create(claim.run, claim.task, claim.attempt, inputs)
@@ -265,6 +267,7 @@ class Worker:
                     tools=list(claim.task.tools),
                     paths=list((claim.task.context_spec or {}).get("paths", []) or []),
                     conflicts=list(handle.conflicts) if handle else [],
+                    competing=competing,
                     model=metered,
                     deadline=deadline,
                     exec_backend=backend,
@@ -308,8 +311,10 @@ class Worker:
                             meta={"branch": handle.branch, "base": handle.base_sha, "merged": handle.merged},
                         )
                     )
+            for a in outs:  # who produced it (a decision policy may name the producer; also plain provenance)
+                a.meta.setdefault("producer", claim.task.key)
             result.artifacts = outs
-            self._report(claim, result)  # one transaction: artifacts + contract + settlement
+            self._report(claim, result, competing)  # one transaction: artifacts + decisions + contract + settlement
             hb.settled.set()
         finally:
             hb.stop()  # only now — after settlement — does the lease stop being renewed
@@ -324,7 +329,7 @@ class Worker:
                 except Exception:
                     log.warning("workspace cleanup failed for %s", claim.task.key, exc_info=True)
 
-    def _report(self, claim: Claim, result: AgentResult) -> None:
+    def _report(self, claim: Claim, result: AgentResult, competing: dict[str, list[Any]] | None = None) -> None:
         try:
             task = leases.report(
                 self.conn,
@@ -334,6 +339,7 @@ class Worker:
                 failure_reason=result.failure_reason,
                 usage=result.usage or None,
                 new_work_required=result.new_work_required,
+                competing={slot: [a.id for a in arts] for slot, arts in (competing or {}).items()},
             )
         except StaleAttempt as e:
             self.stats.stale += 1

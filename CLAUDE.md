@@ -27,6 +27,7 @@ These restate the invariants as coding constraints. Violating one is a bug even 
 - **The verifier is not a task and not callable by agents.** `acceptance/` is mounted read-only into every worker. The verdict comes only from `mas/verifier/`.
 - **The planner proposes; the driver decides.** `Planner.plan()` returns exactly one typed outcome (DAG | questions | contract proposal); `runs.plan_run` validates and records it, returns rejections as data within `max_plan_attempts`, and fails the run with a verdict after that. The planner never writes acceptance suites, freezes contracts (`mas approve` + `mas/planner/contracts.py` do), changes budgets, sets run state, or selects the execution mode (task-shape metadata is advisory).
 - **Repair is bounded and progress is measured, never declared.** Only a verifier `FAIL` (checks ran, some failed) can be repaired; `TIMEOUT`/`ERROR` get one bounded re-verification, then (like `INVALID`, at once) a coded terminal verdict — never an amendment. After a verifier FAIL the orchestrator records a deterministic progress fingerprint (`mas/orchestrator/progress.py`) and decides: repeat → `NO_PROGRESS`; `max_replans` spent → `BUDGET_EXHAUSTED`/`NO_PROGRESS`; else one more amendment. `max_replans` is the only repair budget (never add another). Amendments add new tasks on COMPLETED work only and may cancel PENDING/READY work (validator rule 9); recorded tasks are never altered. Triggers: verifier FAIL, task FAILED, `new_work_required` — each fires once, and the planner is asked only after work in flight has settled. Every non-passing run carries one `verdict_reason` code (ADR-008 §6), set only by `state_machine.fail_run/abort_run`.
+- **Disagreement is decided, never averaged.** Competing candidate inputs for one slot (`ctx.competing`) require one `decision` artifact per slot from the consuming task; the runtime validates it against the competing ids and applies it (winner accepted, losers superseded) in the report transaction; a missing decision fails the attempt. Agents never accept/supersede artifacts themselves.
 - **Every state change emits an event.** If it isn't in `events`, it didn't happen.
 - **Budgets are enforced in the orchestrator, not requested from agents.** Every run must terminate with a verdict inside its budget.
 - **Workers only write inside their own worktree.** No shared checkout, no writes to `main`, no network side effects other than the model API.
@@ -90,6 +91,7 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's whole history (one branch per attempt)
 .venv/Scripts/mas run --dag ... --workspace none                 # no filesystem (fastest; opaque stub refs)
 .venv/Scripts/mas run --dag ... --verifier-fail-times 1 --planner fake --max-replans 1   # 13-lite demo: FAIL -> amendment -> PASS (replans=1); --verifier-fail -> NO_PROGRESS
+.venv/Scripts/mas run --dag benchmarks/forced_disagreement/dag.json --stub-verifier --workspace none   # A7 demo: two designs -> IMPL decides -> winner accepted, loser superseded (mas artifacts <run>)
 .venv/Scripts/mas contract acceptance/url_shortener_contract/contract.json   # validate an ADR-007 contract; prints suite digest
 ```
 
@@ -125,7 +127,7 @@ Which tier when: `unit` while iterating on pure logic · `core` before committin
 workers or CLI · `full` before committing changes to sandboxes, the verifier, the runner, the gateway or service mode
 · `gate` after touching leases, the state machine, the worker loop or workspaces. `-m docker` is auto-applied to tests
 that use the `verifier_image` fixture. Don't use `-n auto` here (12 workers): a few tests measure real concurrency
-and sockets and flake under that load; `MAS_TEST_WORKERS` overrides the default 4.
+and sockets and flake under that load; `MAS_TEST_WORKERS` overrides the default 4. Known parallel-load flake: `test_acceptance.py::test_output_flood_is_capped_killed_and_never_reaches_host_disk` (Docker output flood; passes alone) — rerun it serially before blaming a change.
 
 Verifier/sandbox changes additionally require Docker and the five-fixture gate:
 

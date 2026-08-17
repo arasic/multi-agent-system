@@ -415,6 +415,14 @@ def _tick(
     verifier = verifier or MissingVerifier()
     reap_expired(conn, run_id)
 
+    cur = sm.get_run(conn, run_id)
+    if cur.status is RunStatus.REPLANNING and cur.config in {"A", "B"}:
+        # Frozen evaluation configs never delegate repair decomposition to the general planner: the next cycle remains
+        # one solve task plus system integration, with the verifier failure report handed to that solve task.
+        from mas.evaluation import SingleAgentRepairPlanner
+
+        planner = SingleAgentRepairPlanner()
+
     # planning happens outside the run-row lock: the planner may take a while (LLM at step 11); REPLANNING = amendment.
     # A REPLANNING run is planned only once no attempt is RUNNING (quiesce): work in flight settles first, so the
     # amendment builds on everything that completed and never races a live worker. Attempt runtime caps bound the wait.
