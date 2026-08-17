@@ -60,12 +60,21 @@ Also landed early (LLM-free): the **structural subset of the DAG validator** (ru
 
 **Gate:** adaptive selection is evidence-backed, auditable and always overrideable; fixed modes remain available.
 
-## M5 — Broader software coverage, one profile at a time
-- [ ] 20. Application/toolchain profile schema: supported runtime/build image, capability/tool mapping, planner constraints, trusted acceptance criteria and explicit exclusions.
-- [ ] 21. Add and independently gate profiles in order: Python API → CLI → web UI (browser/accessibility/visual evidence + human quality gate) → API+database → full-stack → multi-service platform. Each profile needs known-good/bad fixtures and fixed single-vs-MAS evaluation; no claim of “any app.”
-- [ ] 22. Add richer synchronization or plan-staleness detection only for profiles with changing external state. Static software construction continues to use dependencies, immutable artifacts, integration and repair checkpoints.
+## M5 — Project continuity and iterative change runs
+- [ ] 20. **Persistent project identity and repository binding:** introduce a project record that owns one repository and an ordered history of accepted baseline commits. A run targets an exact project baseline; run-local worktrees remain disposable. No run may mutate the project's accepted baseline directly.
+- [ ] 21. **Change-request runs:** support bounded goals such as add/remove/refactor/migrate against an accepted baseline. Assemble scoped prior context from versioned requirements, architecture decisions, interfaces and relevant artifacts—not an unbounded conversation transcript. Record the requested change, assumptions, impact analysis and resulting commit lineage.
+- [ ] 22. **Versioned acceptance and regression policy:** every change gets a newly approved acceptance-contract version that combines retained regression checks with new requirements. Removing or weakening an existing requirement requires an explicit contract amendment and human approval; agents can never delete a failing check to make a run pass.
+- [ ] 23. **Atomic promotion, concurrency and rollback:** on PASS, compare-and-swap the project baseline from the run's starting commit to its verified integration commit. If another change has advanced the project, rebase/re-plan/re-verify rather than overwrite it. Preserve immutable release history and support rollback to any previously accepted commit and contract version.
+- [ ] 24. **Longitudinal project gate:** demonstrate at least five consecutive changes to one application—add, modify, remove, migrate and repair—including one pair of concurrent changes and one rollback. Every accepted version must pass the applicable regression contract, and a failed change must leave the project baseline untouched.
 
-## M6 — Domain experiment #2: Autonomous SOC
-- [ ] 23. Reuse the runtime with security tools and an incident goal. Add richer claim/evidence/conflict logic (ADR-004), telemetry-backed verification and deterministic action/approval policy only when the domain requires them.
+**Gate:** a project can evolve across many independent, auditable runs without relying on chat history, weakening verification, losing accepted history or allowing concurrent changes to overwrite one another.
+
+## M6 — Broader software coverage, one profile at a time
+- [ ] 25. Application/toolchain profile schema: supported runtime/build image, capability/tool mapping, planner constraints, trusted acceptance criteria and explicit exclusions.
+- [ ] 26. Add and independently gate profiles in order: Python API → CLI → web UI (browser/accessibility/visual evidence + human quality gate) → API+database → full-stack → multi-service platform. Each profile needs known-good/bad fixtures and fixed single-vs-MAS evaluation; no claim of “any app.”
+- [ ] 27. Add richer synchronization or plan-staleness detection only for profiles with changing external state. Static software construction continues to use dependencies, immutable artifacts, integration and repair checkpoints.
+
+## M7 — Domain experiment #2: Autonomous SOC
+- [ ] 28. Reuse the runtime with security tools and an incident goal. Add richer claim/evidence/conflict logic (ADR-004), telemetry-backed verification and deterministic action/approval policy only when the domain requires them.
 
 **Gate:** the core runtime changes little; domain capability, evidence and policy modules carry the SOC specialization.

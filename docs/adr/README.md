@@ -11,6 +11,7 @@ Design changes go through an ADR. Nothing about the design lives only in chat.
 | [005](005-postgres-coordination.md) | Postgres as blackboard and coordination mechanism; no queue | Accepted |
 | [006](006-clarifying-questions.md) | Clarifying questions: planner may ask before it plans (`AWAITING_INPUT`) | Accepted |
 | [007](007-acceptance-contract-freeze.md) | Acceptance Contract Freeze: approved, frozen definition of done for ad-hoc goals; checks never planner-authored | Accepted |
+| [008](008-adaptive-execution-modes.md) | Controlled adaptive execution after the fixed-mode MVP; templates + dynamic DAGs, evidence-based mode selection | Accepted (post-MVP) |
 
 ## Adding one
 

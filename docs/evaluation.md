@@ -71,6 +71,8 @@ Same task. Same acceptance suite. Same tools. Same budgets. Same runtime code.
 
 Comparisons: **A vs D** — is MAS worth more than one cheap agent? **B vs D** — can heterogeneous MAS beat fast frontier intelligence? **C vs D** — what does actual parallelism buy?
 
+Through M3, the execution mode is **explicitly configured and frozen**. The planner may record task-shape metadata (estimated width, coupling, shared-output risk and critical path), but that metadata is observational and cannot silently change A/B/C/D. Automatic mode selection is a post-MVP hypothesis evaluated under [ADR-008](adr/008-adaptive-execution-modes.md), not a prerequisite for an honest MAS result.
+
 ### Fairness rules (non-negotiable)
 
 - A/B run **inside the same runtime**: one `solve` task + system integration task, same worktree/tool layer, same read-only acceptance, same verifier stage, failure report fed back on the next cycle.
@@ -89,6 +91,7 @@ Time: total (creation→finish) · machine time (total − human wait) · wall-c
 Questions: batches asked · assumptions recorded (planner proceeded without asking).
 Cost: input tokens · output/thinking tokens · cache-read tokens · total USD · tokens-in per attempt (context-scoping claim) · model calls and call latency per attempt. Source of truth: `model_calls` (per-call telemetry, written as each call finishes) reconciled with the settled `attempts.*` columns; a run with any **unpriced** call (`priced=false`, no price in `MAS_MODEL_PRICES`) must be reported as *cost unknown*, never as cheap.
 Structure: tasks created · attempts · retries · re-plans · plan-attempts · agent calls · worker utilisation.
+Task shape: estimated independent width · dependency density · estimated critical-path ratio · overlapping-output risk · coupling/risk flags · planner-suggested mode versus configured mode. These fields are descriptive through M3 and become selector inputs only after the fixed-mode evidence exists.
 Failures: acceptance failures · integration failures · planning/validation failures · abandoned attempts.
 
 Report: for each config, plot **N vs wall-clock**, **N vs cost**, **N vs success rate**; table of A/B/C/D at each N.
@@ -115,3 +118,16 @@ The MAS lab is where the "generic framework" trap can re-enter. Guard: **one tas
 - Architecture passes; MAS loses at N ≤ 2, ties at N ≈ 4, wins at N ≥ 8 → **excellent result**; proceed to the SOC application.
 - Architecture passes; MAS never wins on any axis at any N → still a valid result; the runtime is a durable execution engine and the value question needs a different task shape. Do **not** move to the SOC on the strength of architecture alone without understanding this.
 - Architecture fails → fix or stop. Do not add models to compensate for substrate failures (MAST).
+
+---
+
+## 8. Post-MVP adaptive-mode evaluation
+
+This section does **not** change the frozen MVP experiment. After M3 has produced fixed-mode A/B/C/D traces, M4 may evaluate the deterministic selector described by ADR-008.
+
+1. Replay the M3 corpus without executing work and ask the selector to choose `single_agent`, `sequential_workflow`, or `parallel_centralized_mas` from goal, acceptance contract, budgets and validated task-shape metadata.
+2. Compare its choice with the best observed fixed mode for the declared objective (success first, then machine time and cost). Report selection accuracy, regret, abstention rate and unsupported-task rate — never only aggregate success.
+3. Compare against simple policies such as “always strong single agent” and “parallel only when validated width ≥ 4.” A learned or LLM-written selector must beat these before it can control execution.
+4. Roll out behind a configuration flag with the chosen mode and reason recorded before work begins. The validator, budgets, tool policy, verifier and human approval gates remain authoritative in every mode.
+
+If the selector cannot demonstrate lower regret than the simple policies, keep mode selection explicit. Adaptive routing is an optimisation, not part of correctness.
