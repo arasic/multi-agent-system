@@ -19,7 +19,7 @@ from typing import Any
 from uuid import UUID
 
 from mas.artifacts import store
-from mas.db.connection import Conn
+from mas.db.connection import Conn, Jsonb
 from mas.db.events import emit
 from mas.models.enums import AttemptStatus, RunStatus, TaskStatus
 from mas.models.types import Attempt, Run, Task
@@ -276,6 +276,11 @@ def report(
                 meta=a.meta,
             )
         if new_work_required:
+            # step 13 trigger: the orchestrator's tick turns this into a re-plan (bounded by max_replans) when it can
+            conn.execute(
+                "UPDATE tasks SET meta = meta || %s WHERE id = %s",
+                (Jsonb({"new_work_required": str(new_work_required)[:1000]}), task.id),
+            )
             emit(
                 conn,
                 ids["run_id"],

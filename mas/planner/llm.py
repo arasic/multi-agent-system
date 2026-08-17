@@ -31,7 +31,7 @@ from mas.providers.telemetry import CallBudget, MeteredProvider, Sink
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "llm-planner/v3"
+PROMPT_VERSION = "llm-planner/v4"
 
 
 @dataclass(frozen=True)
@@ -87,12 +87,15 @@ that rejected your previous output. Reply with ONE JSON object and nothing else.
    "low|medium|high", "integration_risk": "low|medium|high", "suggested_mode": "single_agent|sequential_workflow|
    parallel_centralized_mas", "rationale": "..."}. Prefer independent tasks that do not touch the same files.
 
-4. Repair (only when the brief has a "# Repair (amendment)" section): the integrated result FAILED the frozen
-   acceptance checks and the run has repair budget left. Reply with kind=dag containing ONLY NEW tasks — an amendment.
-   New tasks may depend on existing COMPLETED task ids (typically the last integration task, so the fix builds on the
-   integrated code); never reuse or alter an existing task id; end in a NEW task with capability "integration". Address
-   the failing checks named in the failure report; do not repeat an earlier amendment (their hashes are listed) — an
-   amendment that repeats, or a repair that changes nothing observable, ends the run as NO_PROGRESS.
+4. Repair (only when the brief has a "# Repair (amendment)" section) — the run has repair budget left and one of:
+   the integrated result FAILED the frozen acceptance checks; a task FAILED (its retries are exhausted; its dependents
+   are BLOCKED); a worker reported that new work is required. Reply with kind=dag containing ONLY NEW tasks — an
+   amendment. New tasks may depend on existing COMPLETED task ids (after a verification failure typically the last
+   integration task, so the fix builds on the integrated code; after a task failure, the failed task's own inputs);
+   never reuse or alter an existing task id; end in a NEW task with capability "integration". Optionally
+   "cancel": [existing PENDING/READY task ids] that this amendment makes obsolete (never RUNNING or COMPLETED work).
+   Address exactly the failure report; do not repeat an earlier amendment (their hashes are listed) — an amendment
+   that repeats, or a repair that changes nothing observable, ends the run as NO_PROGRESS.
 
 Be concrete and honest. Never claim capabilities or tools that are not listed. If you proceed without asking, record
 what you assumed in "assumptions"."""
@@ -229,12 +232,18 @@ class LLMPlanner:
                 "",
             ]
         if req.amendment:
+            kind = (req.failure_report or {}).get("trigger", "verification_failed")
+            why = {
+                "verification_failed": "the integrated result FAILED verification",
+                "task_failed": f"task {(req.failure_report or {}).get('task')!r} FAILED (retries exhausted; dependents BLOCKED)",
+                "new_work_required": f"task {(req.failure_report or {}).get('task')!r} reported that new work is required",
+            }.get(kind, kind)
             lines += [
                 "# Repair (amendment)",
                 "",
-                f"Repair cycle {req.replan}/{req.remaining.get('replans', 0) + req.replan}: the integrated result FAILED "
-                "verification. Reply with kind=dag holding ONLY new tasks (an amendment) that fix it, building on existing "
-                "COMPLETED tasks, ending in a new integration task.",
+                f"Repair cycle {req.replan}/{req.remaining.get('replans', 0) + req.replan}: {why}. Reply with kind=dag "
+                "holding ONLY new tasks (an amendment), building on existing COMPLETED tasks, ending in a new integration "
+                "task; optionally cancel obsolete PENDING/READY tasks.",
                 "",
                 "## Existing tasks (key, capability, status, depends_on, outputs)",
                 "",

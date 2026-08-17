@@ -12,7 +12,7 @@ from uuid import UUID
 from mas.artifacts import store
 from mas.db.connection import Conn, Jsonb
 from mas.db.events import emit
-from mas.models.enums import RunStatus, VerdictReason
+from mas.models.enums import RunStatus, TaskStatus, VerdictReason
 from mas.models.types import Budgets, Run
 from mas.orchestrator import budgets as budget_rules
 from mas.orchestrator import leases, progress
@@ -184,7 +184,7 @@ def install_dag(
             remaining=remaining_budget(conn, run),
             existing=prior if amendment else None,
         )
-        a_hash = progress.amendment_hash([t.to_dict() for t in result.dag.tasks]) if amendment else None
+        a_hash = progress.amendment_hash([t.to_dict() for t in result.dag.tasks], result.dag.cancel) if amendment else None
         if amendment and result.ok and a_hash in previous_amendments(conn, run_id):
             result.errors.append(ValidationError("9", "amendment repeats an earlier amendment (no progress)"))
         emit(
@@ -225,6 +225,20 @@ def install_dag(
                 )
                 emit(conn, run_id, "plan.assumptions", payload={"assumptions": list(result.dag.assumptions)})
             _insert_tasks(conn, run_id, run, result, created_by, existing_keys={e.key for e in prior})
+            if amendment:  # every FAILED task on record was shown to the planner: this amendment is its answer
+                conn.execute(
+                    "UPDATE tasks SET meta = meta || %s "
+                    "WHERE run_id = %s AND status = 'FAILED' AND NOT (meta ? 'repair_handled')",
+                    (Jsonb({"repair_handled": run.replans_used}), run_id),
+                )
+            for key in result.dag.cancel:  # obsolete pending work named by the amendment (validated: PENDING/READY only)
+                row = conn.execute(
+                    "SELECT id FROM tasks WHERE run_id = %s AND key = %s FOR NO KEY UPDATE", (run_id, key)
+                ).fetchone()
+                if row is not None:
+                    sm.transition_task(
+                        conn, row["id"], TaskStatus.CANCELLED, payload={"reason": "amendment", "replan": run.replans_used}
+                    )
             # the plan itself is evidence: the validated DAG + advisory task-shape metadata (ADR-008), on record;
             # an amendment is recorded with its hash (repeating one is no progress)
             ref = f"plan:{run_id}:r{run.replans_used}" if amendment else f"plan:{run_id}:{plan_attempt}"
@@ -448,24 +462,63 @@ def _amendment_context(conn: Conn, run: Run) -> dict[str, Any]:
                 "outputs": outs,
             }
         )
+    trig = conn.execute(
+        "SELECT payload FROM events WHERE run_id = %s AND type = 'run.replanning' ORDER BY id DESC LIMIT 1", (run.id,)
+    ).fetchone()
+    trigger = dict(trig["payload"]) if trig is not None else {}
+    kind = trigger.get("trigger", "verification_failed")
+    report: dict[str, Any] | None = {"trigger": kind}
+    if kind == "task_failed":
+        key = trigger.get("task")
+        failed = conn.execute(  # every FAILED task no amendment has addressed yet, the triggering one first
+            "SELECT id, key FROM tasks WHERE run_id = %s AND status = 'FAILED' AND NOT (meta ? 'repair_handled') "
+            "ORDER BY (key = %s) DESC, updated_at",
+            (run.id, key),
+        ).fetchall()
+        failed_tasks = []
+        for f in failed:
+            atts = conn.execute(
+                "SELECT attempt_number, status, failure_reason FROM attempts WHERE task_id = %s ORDER BY attempt_number",
+                (f["id"],),
+            ).fetchall()
+            failed_tasks.append(
+                {
+                    "key": f["key"],
+                    "attempts": [
+                        {"n": a["attempt_number"], "status": a["status"], "failure_reason": str(a["failure_reason"] or "")[:500]}
+                        for a in atts
+                    ],
+                }
+            )
+        report.update(
+            {
+                "task": key,
+                "attempts": failed_tasks[0]["attempts"] if failed_tasks else [],
+                "failed_tasks": failed_tasks,
+                "blocked": list(trigger.get("blocked", [])),
+            }
+        )
+    elif kind == "new_work_required":
+        report.update({"task": trigger.get("task"), "detail": str(trigger.get("detail") or "")[:1000]})
     last = conn.execute(
         "SELECT meta FROM artifacts WHERE run_id = %s AND type = 'verification' ORDER BY created_at DESC, id DESC LIMIT 1",
         (run.id,),
     ).fetchone()
-    report = None
-    if last is not None:
+    if last is not None and kind == "verification_failed":
         rep = dict(last["meta"].get("report") or {})
         checks = [
             {"id": c.get("id"), "status": c.get("status"), "detail": str(c.get("detail") or "")[:500]}
             for c in (rep.get("checks") or [])
             if isinstance(c, dict)
         ]
-        report = {
-            "status": rep.get("status"),
-            "reason": str(rep.get("reason") or "")[:500],
-            "checks": checks,
-            "failing": [c["id"] for c in checks if c["status"] != "PASS"],
-        }
+        report.update(
+            {
+                "status": rep.get("status"),
+                "reason": str(rep.get("reason") or "")[:500],
+                "checks": checks,
+                "failing": [c["id"] for c in checks if c["status"] != "PASS"],
+            }
+        )
         for k in ("stdout", "stderr"):
             if isinstance(rep.get(k), str) and rep[k]:
                 report[k] = rep[k][-2000:]
@@ -591,7 +644,11 @@ def plan_run(conn: Conn, run_id: UUID, planner: Planner, *, capabilities: set[st
             remaining=remaining,
             existing=prior,
         )
-        if amendment and result.ok and progress.amendment_hash([t.to_dict() for t in result.dag.tasks]) in tried:
+        if (
+            amendment
+            and result.ok
+            and progress.amendment_hash([t.to_dict() for t in result.dag.tasks], result.dag.cancel) in tried
+        ):
             result.errors.append(
                 ValidationError("9", "amendment repeats an earlier amendment (no progress): propose a different repair")
             )

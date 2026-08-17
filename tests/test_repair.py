@@ -371,3 +371,150 @@ def test_verdict_reason_codes_on_other_endings(conn):
         conn.execute("UPDATE runs SET created_at = now() - interval '5 seconds' WHERE id = %s", (run.id,))
     r = scheduler.tick(conn, run.id, verifier=StubVerifier(True))
     assert r.status is RunStatus.ABORTED and r.verdict_reason == "BUDGET_EXHAUSTED"
+
+
+# ----------------------------------------------------------------------------- step 13: the other two triggers + cancel
+
+
+def _run_dag(conn, dag, *, verifier, planner, budgets=None, workspace=None, workers=3, sleep=0.03, timeout=90):
+    run = runs_mod.create_run_from_dag(conn, dag, budgets=budgets or default_budgets(), capabilities=set(CAPS))
+    stop = threading.Event()
+    agent = StubAgent({"sleep_s": sleep})
+    ws = [
+        Worker(f"w{i}", list(CAPS), agent, database_url=DB_URL, poll_s=0.05, run_id=run.id, workspace=workspace)
+        for i in range(workers)
+    ]
+    ts = [run_worker_thread(w, stop) for w in ws]
+    try:
+        final = scheduler.run_until_terminal(
+            conn,
+            run.id,
+            verifier=verifier,
+            planner=planner,
+            capabilities=set(CAPS),
+            workspace=workspace,
+            tick_s=0.1,
+            timeout_s=timeout,
+        )
+    finally:
+        stop.set()
+        wait_all(ts, 10)
+    return final
+
+
+def test_task_failed_triggers_a_bounded_repair_that_reopens_the_work(conn):
+    """T2 exhausts its retries → run REPLANNING (trigger task_failed; T5 BLOCKED); the amendment re-opens the work as a
+    new task on T2's own inputs plus a new integration sink → PASS. The FAILED task and its BLOCKED dependent stay on
+    record; replans_used == 1; the planner saw the trigger, the attempts' failure reasons and the blocked keys."""
+    dag = diamond({"T2": {"fail_attempts": 99}})
+    fix = _amend(
+        _t("T2b", "implementation", ["T1"], goal="redo T2 differently"), _t("INTEG2", "integration", ["T2b", "T3", "T4"])
+    )
+    planner = StubPlanner(diamond(), amendments=[fix])
+    final = _run_dag(
+        conn, dag, verifier=StubVerifier(True), planner=planner, budgets=default_budgets(max_attempts_per_task=2, max_replans=1)
+    )
+    assert final.status is RunStatus.PASSED and final.replans_used == 1, final.verdict
+    st = {t.key: t.status for t in sm.tasks_for_run(conn, final.id)}
+    assert st["T2"] is TaskStatus.FAILED and st["T5"] is TaskStatus.BLOCKED
+    assert st["T2b"] is TaskStatus.COMPLETED and st["INTEG2"] is TaskStatus.COMPLETED
+    ev = [e for e in _events(conn, final.id) if e.type == "run.replanning"]
+    assert len(ev) == 1 and ev[0].payload["trigger"] == "task_failed" and ev[0].payload["task"] == "T2"
+    assert "T5" in ev[0].payload["blocked"]
+    req = planner.requests[-1]
+    assert req.amendment and req.failure_report["trigger"] == "task_failed" and req.failure_report["task"] == "T2"
+    assert [a["status"] for a in req.failure_report["attempts"]] == ["FAILED", "FAILED"]
+    assert "scripted failure" in req.failure_report["attempts"][0]["failure_reason"]
+    assert {t["key"]: t["status"] for t in req.existing_tasks}["T5"] == "BLOCKED"
+    # no verification happened before the repair; the amendment plan artifact carries the hash
+    plans = conn.execute(
+        "SELECT ref FROM artifacts WHERE run_id = %s AND type = 'plan' ORDER BY created_at", (final.id,)
+    ).fetchall()
+    assert [p["ref"] for p in plans] == [f"plan:{final.id}:1", f"plan:{final.id}:r1"]
+
+
+def test_task_failed_without_planner_or_budget_is_still_unrecoverable(conn):
+    dag = diamond({"T2": {"fail_attempts": 99}})
+    fix = _amend(_t("T2b", "implementation", ["T1"]), _t("INTEG2", "integration", ["T2b", "T3", "T4"]))
+    final = _run_dag(
+        conn,
+        dag,
+        verifier=StubVerifier(True),
+        planner=StubPlanner(diamond(), amendments=[fix]),
+        budgets=default_budgets(max_attempts_per_task=1, max_replans=0),
+    )
+    assert final.status is RunStatus.FAILED and final.verdict_reason == VerdictReason.UNRECOVERABLE_FAILURE.value
+    assert "task T2 failed" in final.verdict and final.replans_used == 0
+
+
+def test_new_work_required_triggers_a_repair_that_adds_work_and_cancels_the_obsolete_sink(conn):
+    """T2 completes and reports new work; T3/T4 are still running (slow) → REPLANNING (claims stop), planning waits
+    until they settle (quiesce), the old sink T5 is still PENDING → the amendment adds MIG on T2 and a new sink, and
+    cancels T5 as obsolete → PASS. Without a planner the report stays a recorded fact (existing behaviour)."""
+    dag = diamond(
+        {
+            "T2": {"new_work_required": "a migration task is needed", "sleep_s": 0.02},
+            "T3": {"sleep_s": 1.2},
+            "T4": {"sleep_s": 1.2},
+        }
+    )
+    amend = DagSpec.from_dict(
+        {
+            "tasks": [
+                _t("MIG", "implementation", ["T2"], goal="write the migration"),
+                _t("INTEG2", "integration", ["MIG", "T3", "T4"]),
+            ],
+            "cancel": ["T5"],
+        }
+    )
+    planner = StubPlanner(diamond(), amendments=[amend])
+    final = _run_dag(conn, dag, verifier=StubVerifier(True), planner=planner, budgets=default_budgets(max_replans=1))
+    assert final.status is RunStatus.PASSED and final.replans_used == 1, final.verdict
+    st = {t.key: t.status for t in sm.tasks_for_run(conn, final.id)}
+    assert st["T5"] is TaskStatus.CANCELLED and st["MIG"] is TaskStatus.COMPLETED and st["INTEG2"] is TaskStatus.COMPLETED
+    assert st["T3"] is TaskStatus.COMPLETED and st["T4"] is TaskStatus.COMPLETED  # work in flight settled before planning
+    ev = [e for e in _events(conn, final.id) if e.type == "run.replanning"]
+    assert len(ev) == 1 and ev[0].payload["trigger"] == "new_work_required" and "migration" in ev[0].payload["detail"]
+    req = planner.requests[-1]
+    assert req.failure_report["trigger"] == "new_work_required" and req.failure_report["task"] == "T2"
+    assert all(t["status"] != "RUNNING" for t in req.existing_tasks)  # quiesced: no work in flight when the planner ran
+    cancelled = [e for e in _events(conn, final.id) if e.type == "task.cancelled"]
+    assert any(e.payload.get("key") == "T5" and e.payload.get("reason") == "amendment" for e in cancelled)
+    # the same trigger is never re-fired: one replan for one report
+    assert (
+        conn.execute("SELECT meta FROM tasks WHERE run_id = %s AND key = 'T2'", (final.id,)).fetchone()["meta"][
+            "new_work_handled"
+        ]
+        == 1
+    )
+
+
+def test_new_work_required_without_planner_is_deferred_and_the_run_still_passes(conn):
+    final = _run_dag(conn, diamond({"T2": {"new_work_required": "later"}}), verifier=StubVerifier(True), planner=None)
+    assert final.status is RunStatus.PASSED and final.replans_used == 0
+    types = [e.type for e in _events(conn, final.id)]
+    assert "task.new_work_required" in types and "task.new_work_deferred" in types and "run.replanning" not in types
+
+
+def test_cancel_is_validated_under_rule_9_and_hashed():
+    prior = [
+        ExistingTask("A", "COMPLETED"),
+        ExistingTask("B", "PENDING", ("A",)),
+        ExistingTask("C", "RUNNING", ("A",)),
+        ExistingTask("D", "READY", ("A",)),
+    ]
+    ok = DagSpec.from_dict({"tasks": [_t("N", "implementation", ["A"])], "cancel": ["B", "D"]})
+    r = validate(ok, existing=prior)
+    assert r.ok, r.errors
+    assert r.dag.cancel == ["B", "D"]
+    bad = DagSpec.from_dict({"tasks": [_t("N", "implementation", ["A"])], "cancel": ["C", "A", "ZZ", "B", "B"]})
+    msgs = [e.message for e in validate(bad, existing=prior).errors if e.rule == "9"]
+    assert any("'C' is RUNNING" in m for m in msgs) and any("'A' is COMPLETED" in m for m in msgs)
+    assert any("unknown task 'ZZ'" in m for m in msgs) and any("twice" in m for m in msgs)
+    # an initial plan may not cancel anything; a new task may not build on what it cancels
+    assert any("only an amendment may cancel" in e.message for e in validate(ok).errors)
+    dep = DagSpec.from_dict({"tasks": [_t("N", "implementation", ["B"])], "cancel": ["B"]})
+    assert any("may only build on COMPLETED" in e.message for e in validate(dep, existing=prior).errors)
+    tasks = [t.to_dict() for t in ok.tasks]
+    assert progress.amendment_hash(tasks, ["B", "D"]) != progress.amendment_hash(tasks, [])
+    assert progress.amendment_hash(tasks, ["D", "B"]) == progress.amendment_hash(tasks, ["B", "D"])

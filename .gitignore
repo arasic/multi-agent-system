@@ -22,3 +22,6 @@ Thumbs.db
 .idea/
 .vscode/
 acceptance/adhoc-*/
+
+# local pytest --basetemp trees
+.t/

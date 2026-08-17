@@ -104,9 +104,9 @@ def failure_fingerprint(
     )
 
 
-def amendment_hash(tasks: list[dict[str, Any]]) -> str:
+def amendment_hash(tasks: list[dict[str, Any]], cancel: list[str] | None = None) -> str:
     """Structure + goals of an amendment with the new task ids normalized (a planner that re-proposes the same repair
-    under new ids still repeats itself). Dependencies on existing tasks keep their keys (they are stable)."""
+    under new ids still repeats itself), plus what it cancels. Dependencies on existing tasks keep their keys."""
     rows = []
     for t in tasks:
         rows.append(
@@ -123,7 +123,7 @@ def amendment_hash(tasks: list[dict[str, Any]]) -> str:
     for r in rows:
         r["id"] = alias[r["id"]]
         r["depends_on"] = sorted(alias.get(d, d) for d in r["depends_on"])
-    return digest(rows)
+    return digest({"tasks": rows, "cancel": sorted(str(c) for c in (cancel or []))})
 
 
 @dataclass(frozen=True)

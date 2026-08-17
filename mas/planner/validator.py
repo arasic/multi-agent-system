@@ -295,8 +295,24 @@ def validate(
     errors: list[ValidationError] = []
     tasks = [TaskSpec.from_dict(t.to_dict()) for t in dag.tasks]  # defensive copy
     prior = {e.key: e for e in (existing or ())}
+    # 9 — cancellation of obsolete pending work: only in an amendment, only PENDING/READY tasks, never RUNNING/COMPLETED
+    cancel = [str(k) for k in dag.cancel]
+    if cancel and existing is None:
+        errors.append(ValidationError("9", f"only an amendment may cancel tasks (cancel={cancel})"))
+    for k in cancel:
+        if k not in prior:
+            errors.append(ValidationError("9", f"cancel names unknown task {k!r}"))
+        elif prior[k].status not in ("PENDING", "READY"):
+            errors.append(ValidationError("9", f"amendment may only cancel PENDING/READY tasks; {k!r} is {prior[k].status}"))
+    if len(set(cancel)) != len(cancel):
+        errors.append(ValidationError("9", "cancel lists a task twice"))
     result = DagSpec(
-        tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions), shape=dict(dag.shape)
+        tasks=tasks,
+        goal=dag.goal,
+        benchmark=dag.benchmark,
+        assumptions=list(dag.assumptions),
+        shape=dict(dag.shape),
+        cancel=list(dag.cancel),
     )
 
     if not tasks:
@@ -463,7 +479,14 @@ def validate(
             errors.extend(validate_estimate(t, budgets))
 
     return ValidationResult(
-        DagSpec(tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions), shape=dict(dag.shape)),
+        DagSpec(
+            tasks=tasks,
+            goal=dag.goal,
+            benchmark=dag.benchmark,
+            assumptions=list(dag.assumptions),
+            shape=dict(dag.shape),
+            cancel=list(dag.cancel),
+        ),
         errors,
         auto_added,
         warnings,

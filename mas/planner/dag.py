@@ -165,6 +165,9 @@ class DagSpec:
     # ADR-008: task-shape metadata — ADVISORY. Recorded with the plan, validated for shape, never selects the mode:
     # A/B/C/D configuration controls execution through M3.
     shape: dict[str, Any] = field(default_factory=dict)
+    # step 13 amendments only: keys of existing PENDING/READY tasks made obsolete by this amendment → CANCELLED at install
+    # (validator rule 9: never RUNNING/COMPLETED work; an initial plan may not cancel anything)
+    cancel: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DagSpec:
@@ -174,6 +177,7 @@ class DagSpec:
             benchmark=d.get("benchmark"),
             assumptions=[str(a) for a in d.get("assumptions", []) or []],
             shape=dict(d.get("shape", {}) or {}),
+            cancel=[str(k) for k in d.get("cancel", []) or []],
         )
 
     @classmethod
@@ -194,6 +198,8 @@ class DagSpec:
             d["assumptions"] = list(self.assumptions)
         if self.shape:
             d["shape"] = dict(self.shape)
+        if self.cancel:
+            d["cancel"] = list(self.cancel)
         return d
 
     def by_id(self) -> dict[str, TaskSpec]:

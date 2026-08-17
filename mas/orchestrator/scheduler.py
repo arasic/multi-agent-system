@@ -21,7 +21,7 @@ from typing import Any
 from uuid import UUID
 
 from mas.artifacts import store
-from mas.db.connection import Conn, connect
+from mas.db.connection import Conn, Jsonb, connect
 from mas.db.events import emit
 from mas.models.enums import (
     INTEGRATION_CAPABILITY,
@@ -83,6 +83,14 @@ def _block_unreachable(conn: Conn, run_id: UUID) -> list[str]:
     for r in rows:
         sm.transition_task(conn, r["id"], TaskStatus.BLOCKED, payload={"reason": "upstream task failed/blocked/cancelled"})
     return [r["key"] for r in rows]
+
+
+def _live_attempts(conn: Conn, run_id: UUID) -> int:
+    row = conn.execute(
+        "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.id = a.task_id WHERE t.run_id = %s AND a.status = 'RUNNING'",
+        (run_id,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
 
 
 def _integration_task(conn: Conn, run_id: UUID) -> dict[str, Any] | None:
@@ -407,9 +415,13 @@ def _tick(
     verifier = verifier or MissingVerifier()
     reap_expired(conn, run_id)
 
-    # planning happens outside the run-row lock: the planner may take a while (LLM at step 11); REPLANNING = amendment
+    # planning happens outside the run-row lock: the planner may take a while (LLM at step 11); REPLANNING = amendment.
+    # A REPLANNING run is planned only once no attempt is RUNNING (quiesce): work in flight settles first, so the
+    # amendment builds on everything that completed and never races a live worker. Attempt runtime caps bound the wait.
     if planner is not None:
         cur = sm.get_run(conn, run_id)
+        if cur.status is RunStatus.REPLANNING and _live_attempts(conn, run_id):
+            return cur
         if cur.status in {RunStatus.CREATED, RunStatus.PLANNING, RunStatus.REPLANNING}:
             from mas.orchestrator import runs as runs_mod  # local import: runs imports this module's siblings
 
@@ -439,16 +451,66 @@ def _tick(
             _block_unreachable(conn, run_id)
             _promote_ready(conn, run_id)
 
-            failed = conn.execute(
-                "SELECT key FROM tasks WHERE run_id = %s AND status = 'FAILED' ORDER BY updated_at LIMIT 1", (run_id,)
+            failed = conn.execute(  # a FAILED task an amendment has not addressed yet (install marks repair_handled)
+                "SELECT key FROM tasks WHERE run_id = %s AND status = 'FAILED' AND NOT (meta ? 'repair_handled') "
+                "ORDER BY updated_at LIMIT 1",
+                (run_id,),
             ).fetchone()
             if failed is not None:
-                # step 13 (full): task-FAILED is a re-plan trigger; 13-lite repairs verifier failures only
+                # step 13 trigger 2: a task reached FAILED (retries exhausted). With a planner and repair budget left the
+                # run goes REPLANNING (claims stop; RUNNING attempts settle first — see the REPLANNING branch); the
+                # amendment re-opens the work as new tasks on COMPLETED work and may cancel obsolete pending tasks.
+                if planner is not None and run.replans_used < run.budgets.max_replans:
+                    blocked = [
+                        r["key"]
+                        for r in conn.execute(
+                            "SELECT key FROM tasks WHERE run_id = %s AND status = 'BLOCKED' ORDER BY key", (run_id,)
+                        ).fetchall()
+                    ]
+                    return sm.start_replan(
+                        conn,
+                        run_id,
+                        payload={
+                            "trigger": "task_failed",
+                            "task": failed["key"],
+                            "blocked": blocked,
+                            "cycle": run.replans_used + 1,
+                        },
+                    )
                 return sm.fail_run(
                     conn,
                     run_id,
                     f"task {failed['key']} failed (retries exhausted)",
                     code=VerdictReason.UNRECOVERABLE_FAILURE,
+                )
+            # step 13 trigger 3: a worker reported new_work_required (kept on the task). Same bound; without a planner
+            # or budget it stays a recorded fact and the run continues (the reported work was optional to it).
+            nw = conn.execute(
+                """
+                SELECT key, meta->>'new_work_required' AS detail FROM tasks
+                WHERE run_id = %s AND meta ? 'new_work_required' AND NOT (meta ? 'new_work_handled')
+                ORDER BY updated_at LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if nw is not None:
+                conn.execute(
+                    "UPDATE tasks SET meta = meta || %s WHERE run_id = %s AND key = %s",
+                    (Jsonb({"new_work_handled": run.replans_used + 1}), run_id, nw["key"]),
+                )
+                if planner is not None and run.replans_used < run.budgets.max_replans:
+                    return sm.start_replan(
+                        conn,
+                        run_id,
+                        payload={
+                            "trigger": "new_work_required",
+                            "task": nw["key"],
+                            "detail": nw["detail"],
+                            "cycle": run.replans_used + 1,
+                        },
+                    )
+                emit(
+                    conn, run_id, "task.new_work_deferred", payload={"key": nw["key"], "reason": "no planner or no replans left"}
                 )
 
             integ = _integration_task(conn, run_id)
