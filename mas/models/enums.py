@@ -26,7 +26,10 @@ class RunStatus(StrEnum):
 
 class VerdictReason(StrEnum):
     """Why a run did not pass (ADR-008 §6): reason codes on the verdict, deliberately not run states.
-    NO_PROGRESS is deterministic (progress fingerprint / repeated amendment / no reduction within max_replans)."""
+    NO_PROGRESS is deterministic (progress fingerprint / repeated amendment / no reduction within max_replans).
+    CANCELLED (ADR-009) is the one code that is not a statement about the system under test: an operator ended the
+    run deliberately — today only `mas plan`, whose run exists to produce and export a validated plan, never to
+    execute it. Evidence tooling must treat a CANCELLED run as no evidence at all."""
 
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
     NO_PROGRESS = "NO_PROGRESS"
@@ -34,6 +37,7 @@ class VerdictReason(StrEnum):
     POLICY_DENIED = "POLICY_DENIED"
     INVALID_PLAN = "INVALID_PLAN"
     UNRECOVERABLE_FAILURE = "UNRECOVERABLE_FAILURE"
+    CANCELLED = "CANCELLED"
 
 
 class TaskStatus(StrEnum):

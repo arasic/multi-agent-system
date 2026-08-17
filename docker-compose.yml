@@ -68,8 +68,14 @@ services:
       MAS_GATEWAY_MODELS: ${MAS_GATEWAY_MODELS:-builder}
       MAS_GATEWAY_TOKEN: ${MAS_GATEWAY_TOKEN:-mas-gateway}
       MAS_GATEWAY_LISTEN: 0.0.0.0:8080
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Vendor credentials, valueless on purpose: Compose resolves each from the shell or ./.env and OMITS it when it
+      # is not set anywhere (`${VAR:-}` would instead define an empty one, which an SDK may read as a blank credential).
+      # Every name `mas doctor --require-live` accepts must appear here (mas/cli.py VENDOR_KEY_NAMES): otherwise
+      # preflight passes on a credential the gateway — the only process that talks to the vendor — never receives.
+      ANTHROPIC_API_KEY:
+      ANTHROPIC_AUTH_TOKEN:
+      OPENAI_API_KEY:
+      MAS_OPENAI_API_KEY:
       MAS_OPENAI_BASE_URL: ${MAS_UPSTREAM_OPENAI_BASE_URL:-https://api.openai.com/v1}
       # Request shape of the real upstream = the same settings the direct (in-process) path reads, so live and
       # distributed evidence are produced under one configuration (defaults mirror mas/config.py).

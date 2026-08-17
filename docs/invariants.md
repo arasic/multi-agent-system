@@ -19,7 +19,7 @@ Completion is determined by the fixed acceptance suite run by the deterministic 
 *Enforced:* verifier is a stage, not a task; `acceptance/` is read-only to workers; only `mas/verifier/` may set the run verdict.
 
 ### I-4 · Every run terminates with a verdict inside its budget
-Tokens, cost, wall-clock, tasks, attempts, re-plans, plan attempts — all hard limits. Exceeding any → `ABORTED:<reason>`. There is no "still running" forever.
+Tokens, cost, wall-clock, tasks, attempts, re-plans, plan attempts — all hard limits. Exceeding any → `ABORTED:<reason>`. There is no "still running" forever. This binds runs the operator ends too: `mas plan` produces a validated plan and then aborts its run with the reason code `CANCELLED` (ADR-009) rather than leaving it open — and a `CANCELLED` run is never evidence about the system.
 *Enforced:* budget checks on every transition and on a timer in the orchestrator; a test that starves each budget and asserts a terminal state.
 
 ### I-5 · Artifacts are immutable

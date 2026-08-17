@@ -2,6 +2,7 @@
 
 mas migrate                              apply schema migrations
 mas run --dag FILE | --goal TEXT --planner llm|fake [--workers N ...]   in-process run (dev/demo)
+mas plan --goal TEXT [--output f.json]   plan once with the live planner and export the validated DAG (never executed)
 mas submit --dag FILE [--wait]           create a run for the orchestrator/worker services to execute
 mas orchestrate --watch [--verifier external|acceptance|stub] [--parallel N]   orchestrator service (bounded, concurrent)
 mas verify --watch | --once              verifier service: real sandboxed verdicts for runs left in VERIFYING
@@ -49,10 +50,11 @@ from mas.evaluation import (
     normalize_config,
     single_agent_dag,
 )
+from mas.models.enums import VerdictReason
 from mas.models.types import Budgets
 from mas.orchestrator import runs as runs_mod
 from mas.orchestrator import scheduler
-from mas.planner.dag import DagSpec
+from mas.planner.dag import DagSpec, plan_digest
 from mas.planner.planner import StubPlanner
 from mas.verifier.acceptance import AcceptanceVerifier, SandboxLimits
 from mas.verifier.stub import StubVerifier
@@ -71,6 +73,17 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         applied = migrate(conn)
     print(f"migrations applied: {applied or 'none (up to date)'}")
     return 0
+
+
+# Credential variable names each provider accepts, in precedence order. One source of truth for three consumers:
+# `mas doctor --require-live` (does a live run have a credential?), `mas up` (which variables must NOT leak into the
+# trusted host services), and the Compose `gateway` service, which must forward every name doctor accepts — otherwise
+# preflight passes on a credential the one process that needs it never receives (tests/test_gateway.py pins this).
+VENDOR_KEY_NAMES: dict[str, tuple[str, ...]] = {
+    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+    "openai": ("MAS_OPENAI_API_KEY", "OPENAI_API_KEY"),
+}
+VENDOR_KEY_VARIABLES: tuple[str, ...] = tuple(dict.fromkeys(n for names in VENDOR_KEY_NAMES.values() for n in names))
 
 
 def _command_ok(argv: list[str], *, timeout: float = 30) -> tuple[bool, str]:
@@ -143,15 +156,14 @@ def _doctor_checks(*, require_live: bool = False) -> list[dict[str, Any]]:
     add("model_prices", bool(prices), "configured" if prices else "not configured (cost will be unknown)", required=require_live)
     if require_live:
         provider = upstream.split(":", 1)[0] if upstream else ""
-        key_names = {
-            "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
-            "openai": ("MAS_OPENAI_API_KEY", "OPENAI_API_KEY"),
-        }.get(provider, ())
-        has_key = any(os.environ.get(k) or dot.get(k) for k in key_names)
+        key_names = VENDOR_KEY_NAMES.get(provider, ())
+        present = [k for k in key_names if os.environ.get(k) or dot.get(k)]
+        # Compose forwards these to the gateway only when they are set (valueless `environment:` keys), so a name
+        # doctor accepts here is a name the gateway will receive — see VENDOR_KEY_NAMES.
         add(
             "vendor_credentials",
-            bool(key_names) and has_key,
-            f"provider={provider or 'unknown'}",
+            bool(key_names) and bool(present),
+            f"provider={provider or 'unknown'}" + (f" via {', '.join(present)}" if present else ""),
         )
     return rows
 
@@ -206,7 +218,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     if _compose(["up", "-d", "--scale", f"worker={args.workers}", "postgres", "orchestrator", "gateway", "worker"], env=env):
         return 2
     host_env = dict(env)
-    for secret in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "MAS_OPENAI_API_KEY", "MAS_GATEWAY_TOKEN"):
+    for secret in (*VENDOR_KEY_VARIABLES, "MAS_GATEWAY_TOKEN"):
         host_env.pop(secret, None)  # only the Compose gateway receives vendor/gateway credentials
     children = [
         subprocess.Popen([sys.executable, "-m", "mas", "execute", "--watch"], env=host_env),
@@ -446,6 +458,86 @@ def _print_metrics(m: metrics.RunMetrics) -> None:
                 f"    {k:36s} calls={v['calls']} err={v['errors']} in/out={v['input_tokens']}/{v['output_tokens']} "
                 f"cost=${v['cost_usd']} {v['seconds']}s" + ("  unpriced" if v["unpriced"] else "")
             )
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Produce ONE validated DAG for a goal and export it, without executing it (ADR-009).
+
+    A real run: the planner is metered and charged like any other planning round, the validator is the same gate, and
+    the DAG written out is exactly what `install_dag` recorded as the run's `plan` artifact. The run is then ended —
+    `ABORTED` / `CANCELLED`, because execution was never requested — so it never sits half-open and is never mistaken
+    for evidence. Used by the M3 harness so configs C and D replay one identical plan per (N, repetition).
+
+    Exit: 0 exported · 2 the planner asked questions or proposed a contract (nothing to execute unattended) · 1 failed.
+    """
+    if not args.goal:
+        raise SystemExit("mas plan needs --goal TEXT")
+    planner = _planner(args.planner or "llm", spec=args.planner_model)
+    if planner is None:
+        raise SystemExit("mas plan needs --planner llm|fake")
+    budgets = Budgets(
+        max_concurrency=max(1, args.max_concurrency),
+        max_wallclock_s=args.max_wallclock_s,
+        max_attempts_per_task=args.max_attempts,
+        max_attempt_runtime_s=args.max_attempt_runtime_s,
+        max_tokens=args.max_tokens,
+        max_attempt_tokens=args.max_attempt_tokens,
+        max_replans=args.max_replans,
+        max_cost_usd=args.max_cost_usd,
+    )
+    caps = set(settings().worker_capabilities)
+    conn = connect()
+    migrate(conn)
+    run = runs_mod.create_run(conn, goal=args.goal, budgets=budgets, benchmark=args.benchmark, pool=f"local:{os.getpid()}")
+    t0 = time.monotonic()
+    run = runs_mod.plan_run(conn, run.id, planner, capabilities=caps)
+    elapsed = round(time.monotonic() - t0, 3)
+    dag = runs_mod.planned_dag(conn, run.id)
+    if dag is not None and args.output:
+        Path(args.output).write_text(json.dumps(dag, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    parked = dag is None and not run.status.terminal  # AWAITING_INPUT: questions or a contract proposal
+    if parked:
+        _print_waiting(conn, run.id)
+    if not run.status.terminal:  # planned, or parked: either way a plan was asked for, not a run
+        with conn.transaction():
+            run = runs_mod.sm.abort_run(conn, run.id, "plan-only run: execution was not requested", code=VerdictReason.CANCELLED)
+    m = metrics.compute(conn, run.id)
+    record = {
+        "run_id": str(run.id),
+        "status": run.status.value,
+        "verdict": run.verdict,
+        "verdict_reason": run.verdict_reason,
+        "planned": dag is not None,
+        "parked": parked,
+        "plan_sha256": plan_digest(dag) if dag is not None else None,
+        "tasks": len(dag.get("tasks", [])) if dag is not None else 0,
+        "output": str(args.output) if (dag is not None and args.output) else None,
+        "planner": planner.name,
+        "plan_attempts": m.plan_artifacts + m.plan_rejections,
+        "plan_rejections": m.plan_rejections,
+        "questions": m.questions,
+        "assumptions": m.assumptions,
+        "plan_s": elapsed,
+        "model_calls": m.model_calls,
+        "call_input_tokens": m.call_input_tokens,
+        "call_output_tokens": m.call_output_tokens,
+        "call_cost_usd": None if m.unpriced_calls else m.call_cost_usd,
+        "cost_known": m.unpriced_calls == 0,
+    }
+    if args.json:
+        print(json.dumps(record, indent=2, default=str))
+    else:
+        print(f"run {run.id}  {run.status.value}  planner={planner.name}  in {elapsed}s")
+        if dag is not None:
+            print(f"  plan {record['plan_sha256'][:16]}  tasks={record['tasks']}  -> {record['output'] or '(not written)'}")
+        else:
+            print(f"  no DAG: {run.verdict}")
+        cost = "unpriced" if m.unpriced_calls else f"${m.call_cost_usd}"
+        print(f"  planner calls={m.model_calls} tokens in/out={m.call_input_tokens}/{m.call_output_tokens} cost={cost}")
+    conn.close()
+    if dag is None:
+        return 2 if parked else 1
+    return 0
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
@@ -1160,6 +1252,23 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("text")
     an.add_argument("--by", default="human")
     an.set_defaults(fn=cmd_answer)
+
+    pl = sub.add_parser("plan", help="plan a goal once and export the validated DAG, without executing it (ADR-009)")
+    pl.add_argument("--goal", required=True)
+    pl.add_argument("--benchmark", default=None, help="frozen acceptance suite; without one the planner must propose a contract")
+    pl.add_argument("--output", default=None, help="write the validated DAG here (a `mas run --dag` file)")
+    pl.add_argument("--planner", default=None, help="llm (default) | fake")
+    pl.add_argument("--planner-model", default=None, help="<provider>:<model> (default: $MAS_MODEL_PLANNER)")
+    pl.add_argument("--max-concurrency", type=int, default=4, help="the concurrency the planner is told it may use")
+    pl.add_argument("--max-attempts", type=int, default=3)
+    pl.add_argument("--max-wallclock-s", type=int, default=1800)
+    pl.add_argument("--max-attempt-runtime-s", type=int, default=120)
+    pl.add_argument("--max-replans", type=int, default=1)
+    pl.add_argument("--max-tokens", type=int, default=2_000_000)
+    pl.add_argument("--max-cost-usd", type=float, default=20.0)
+    pl.add_argument("--max-attempt-tokens", type=int, default=200_000)
+    pl.add_argument("--json", action="store_true")
+    pl.set_defaults(fn=cmd_plan)
 
     sb = sub.add_parser("submit", help="create a run from a DAG file and exit (services pick it up)")
     sb.add_argument("--dag", default=None, help="DAG file; omit to submit an ad-hoc --goal for the orchestrator planner")

@@ -11,9 +11,14 @@ GitWorkspace
                (the integration agent's, in particular). Nothing from earlier attempts of the *same* task is inherited.
     publish()  commit whatever the agent left in the worktree; return HEAD if it moved (relative to `start` for
                ordinary tasks, to `base` for integration — its output *is* the assembled merge).
-    cleanup()  remove the worktree (branch and commits stay in the bare repo); prune stale worktrees of dead workers.
+    cleanup()  remove the worktree (branch and commits stay in the bare repo).
+    gc_run()   remove every worktree of a terminal run and prune the admin entries a dead worker left behind. Pruning
+               happens ONLY here: it is global, so running it while sibling attempts create worktrees races them.
     promote()  move a run-level ref (e.g. run/<run>/integration) to a sha — used by the verifier stage on PASS.
     show()     read `sha:path` from the object store (how downstream agents read document artifacts).
+
+    Every *administrative* git command (branch creation, worktree add/remove/prune) runs under `repo_admin_lock`,
+    an exclusive per-bare-repo lock held across processes and threads — see its docstring for the race it closes.
 
 NullWorkspace: no filesystem; agents get workspace=None (fast unit tests, LLM-free stubs).
 
@@ -23,12 +28,16 @@ cross-host would push/fetch to a remote instead (out of scope, documented).
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -43,9 +52,142 @@ EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 GIT_IDENTITY = ["-c", "user.name=mas", "-c", "user.email=mas@localhost", "-c", "commit.gpgsign=false"]
 _FIXED_DATE = "2000-01-01T00:00:00Z"  # deterministic base commit sha across racing workers
 
+ADMIN_LOCK_FILE = "mas-admin.lock"  # inside the bare repo: travels and dies with it
+ADMIN_LOCK_TIMEOUT_S = 120.0  # git administration takes milliseconds; waiting this long means something is wrong
+
 
 class WorkspaceError(Exception):
     pass
+
+
+# --------------------------------------------------------------------------- git administration lock
+# Advisory whole-file lock, released by the OS when the holder dies (chaos kills must never strand a run).
+
+# "held by someone else" vs "this filesystem cannot lock at all": a volume that refuses advisory locks (some bind
+# mounts) must degrade to in-process serialization, never fail every attempt with a lock timeout
+_BUSY = {getattr(errno, n) for n in ("EACCES", "EAGAIN", "EWOULDBLOCK", "EDEADLK", "EDEADLOCK") if hasattr(errno, n)}
+
+try:  # POSIX
+    import fcntl
+
+    FILE_LOCKING = "flock"
+
+    def _try_lock(fd: int) -> bool | None:
+        """True = acquired · False = held elsewhere · None = this filesystem does not support locking."""
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as ex:
+            return False if ex.errno in _BUSY else None
+        return True
+
+    def _unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+except ImportError:  # Windows
+    try:
+        import msvcrt
+
+        FILE_LOCKING = "msvcrt"
+
+        def _try_lock(fd: int) -> bool | None:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as ex:
+                return False if ex.errno in _BUSY else None
+            return True
+
+        def _unlock(fd: int) -> None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+    except ImportError:  # pragma: no cover - neither fcntl nor msvcrt
+        FILE_LOCKING = "none"
+
+        def _try_lock(fd: int) -> bool | None:
+            return None
+
+        def _unlock(fd: int) -> None:
+            return None
+
+
+_unsupported_warned = False
+
+
+_thread_locks: dict[str, threading.Lock] = {}
+_thread_locks_guard = threading.Lock()
+
+
+def _thread_lock_for(repo: Path) -> threading.Lock:
+    with _thread_locks_guard:
+        return _thread_locks.setdefault(str(repo), threading.Lock())
+
+
+@contextmanager
+def repo_admin_lock(repo: Path, *, timeout_s: float | None = None, required: bool = True) -> Iterator[bool]:
+    """Serialize *administrative* git commands on one bare repo. Yields whether they may run.
+
+    `git worktree add|remove|prune` and `git branch -f` all enumerate `<repo>/worktrees/` and read each entry's
+    `gitdir`/`commondir` — while `git worktree add` creates that directory *before* writing those files. Two attempts
+    of the same run administering worktrees at the same time therefore made git die on a half-born sibling
+    ("fatal: failed to read worktrees/<id>/commondir", "could not open 'worktrees/<id>/gitdir' for writing"),
+    observed at width 16 and in a short stress rehearsal. Dropping the per-attempt global `prune` (see `ensure_repo`)
+    narrowed the window; only mutual exclusion closes it.
+
+    Per bare repo, so attempts of different runs never contend, and held only around the administrative commands —
+    never around input assembly, a commit, or an agent's work. Cross-process via an advisory file lock the OS releases
+    if the holder is killed, cross-thread via an in-process mutex (so correctness does not depend on the platform's
+    per-descriptor lock semantics). Where the filesystem cannot lock at all — some bind mounts — the in-process mutex
+    stands alone and the caller proceeds: degrading is strictly better than failing every attempt, and it is logged.
+    `required=False` callers (cleanup, GC) skip the git command instead of failing: what they would have removed is
+    registration garbage that `gc_run` prunes when the run ends.
+    """
+    global _unsupported_warned
+    deadline = time.monotonic() + (ADMIN_LOCK_TIMEOUT_S if timeout_s is None else timeout_s)
+    thread_lock = _thread_lock_for(repo)
+    if not thread_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        if required:
+            raise WorkspaceError(f"workspace: timed out waiting for the git administration lock of {repo}")
+        log.warning("workspace: skipping git administration on %s (in-process lock busy)", repo)
+        yield False
+        return
+    fd: int | None = None
+    held = False
+    try:
+        try:
+            fd = os.open(str(repo / ADMIN_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as ex:
+            # exotic/read-only filesystem: keep the in-process guarantee rather than failing every attempt
+            log.warning("workspace: cannot open %s (%s); serializing in-process only", repo / ADMIN_LOCK_FILE, ex)
+            yield True
+            return
+        delay, supported = 0.005, True
+        while True:
+            state = _try_lock(fd)
+            if state is None:  # the volume does not implement advisory locks
+                supported = False
+                if not _unsupported_warned:
+                    _unsupported_warned = True
+                    log.warning("workspace: %s does not support file locking; serializing in-process only", repo)
+                break
+            if state:
+                held = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(delay)
+            delay = min(0.05, delay * 1.6)
+        if supported and not held:
+            if required:
+                raise WorkspaceError(f"workspace: timed out waiting for the git administration lock of {repo}")
+            log.warning("workspace: skipping git administration on %s (lock held elsewhere)", repo)
+        yield held or not supported
+    finally:
+        if held and fd is not None:
+            _unlock(fd)
+        if fd is not None:
+            os.close(fd)
+        thread_lock.release()
 
 
 @dataclass
@@ -173,9 +315,22 @@ class GitWorkspace:
         if not (repo.is_dir() and (repo / "HEAD").is_file()):
             raise WorkspaceError(f"bare repository initialization did not complete: {repo}")
 
-        # Base commit on main (deterministic sha, so racing creators agree). --git-dir lets this also upgrade
-        # repositories created by older releases without depending on the repository itself being a valid cwd.
-        _git("--git-dir", str(repo), "config", "core.longpaths", "true", cwd=repo.parent, check=False)
+        # `git init` above already set core.longpaths, so this only upgrades repositories created by older releases.
+        # It must not run on every attempt: git rewrites `config` through a lockfile + rename, and a sibling attempt
+        # reading it in that instant dies on Windows with "unable to access '<repo>/config': Permission denied"
+        # (seen in `git rev-parse HEAD` from a worktree while another attempt started). Read first, write once, and
+        # only under the administration lock. --git-dir keeps this independent of the repo being a valid cwd.
+        longpaths = _git("--git-dir", str(repo), "config", "--get", "core.longpaths", cwd=repo.parent, check=False)
+        if longpaths.stdout.strip() != "true":
+            with repo_admin_lock(repo, required=False) as may_administer:
+                if may_administer:
+                    _git("--git-dir", str(repo), "config", "core.longpaths", "true", cwd=repo.parent, check=False)
+        # NOTE: no `git worktree prune` here. Pruning is global — it walks every admin entry under
+        # <repo>/worktrees/ and deletes the ones whose directory is missing. A sibling attempt's `git worktree add`
+        # creates that admin directory and only *then* writes its `gitdir` file, so a prune running in between
+        # deletes a worktree that is being born ("fatal: could not open 'worktrees/<id>-<n>/gitdir' for writing").
+        # Observed once at config D / N=16 in the offline matrix. Stale entries are harmless (`add -f` overrides a
+        # missing-but-registered path, and the bare repo is per-run); they are pruned by gc_run when the run ends.
         head = _git("rev-parse", "-q", "--verify", "refs/heads/main", cwd=repo, check=False)
         if head.returncode != 0:
             if base_ref:
@@ -192,7 +347,6 @@ class GitWorkspace:
                 ).stdout.strip()
             # create only if still absent (old value = zeros); a racing loser is harmless
             _git("update-ref", "refs/heads/main", sha, "0" * 40, cwd=repo, check=False)
-        _git("worktree", "prune", cwd=repo, check=False)  # entries left by dead workers
         return repo
 
     def base_sha(self, run_id: UUID) -> str:
@@ -214,15 +368,21 @@ class GitWorkspace:
             base = self.base_sha(run.id)
             path = self.worktree_path(run.id, task.id, attempt.attempt_number)
             branch = self.branch_name(run.id, task.id, attempt.attempt_number)
-            if path.exists():  # a previous incarnation of this attempt (dead worker); start clean
-                _git("worktree", "remove", "--force", str(path), cwd=repo, check=False)
-                shutil.rmtree(path, ignore_errors=True)
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as ex:
             raise WorkspaceError(f"cannot prepare workspace: {ex}") from ex
-        # branch may exist if a dead worker created it before dying; reset it to base
-        _git("branch", "-f", branch, base, cwd=repo, check=False)
-        _git("worktree", "add", "-q", "-f", str(path), branch, cwd=repo)
+        # One attempt at a time may administer this repo's worktrees (see repo_admin_lock): `branch -f`, `worktree add`
+        # and the pre-clean below all enumerate <repo>/worktrees/ and would otherwise read a sibling being created.
+        with repo_admin_lock(repo):
+            if path.exists():  # a previous incarnation of this attempt (dead worker); start clean
+                _git("worktree", "remove", "--force", str(path), cwd=repo, check=False)
+                shutil.rmtree(path, ignore_errors=True)
+            # branch may exist if a dead worker created it before dying; reset it to base
+            _git("branch", "-f", branch, base, cwd=repo, check=False)
+            # -f also covers a *missing but still registered* path (a dead worker's directory vanished without a prune):
+            # git would otherwise refuse with "is a missing but already registered worktree". Registrations are cleaned
+            # up by gc_run at run end, never by a global prune here (see ensure_repo).
+            _git("worktree", "add", "-q", "-f", str(path), branch, cwd=repo)
         handle = WorkspaceHandle(path=path, repo=repo, branch=branch, base_sha=base, start_sha=base, meta={"task_key": task.key})
         # input assembly: merge dependency git_commit outputs, in order; leave conflicts for the agent
         shas: list[str] = []
@@ -266,7 +426,9 @@ class GitWorkspace:
         if handle is None or self.keep_worktrees:
             return
         try:
-            _git("worktree", "remove", "--force", str(handle.path), cwd=handle.repo, check=False)
+            with repo_admin_lock(handle.repo, required=False) as may_administer:
+                if may_administer:
+                    _git("worktree", "remove", "--force", str(handle.path), cwd=handle.repo, check=False)
         except WorkspaceError:
             log.debug("worktree remove failed; falling back to rmtree", exc_info=True)
         shutil.rmtree(handle.path, ignore_errors=True)
@@ -285,21 +447,24 @@ class GitWorkspace:
         repo = self.repo_path(run_id)
         has_repo = (repo / "HEAD").exists()
         removed = 0
-        for child in sorted(run_dir.iterdir()):
-            if not child.is_dir():
-                continue
-            if has_repo:
+        # one administration window for the whole run: the run is terminal, so nothing of it is being created
+        with ExitStack() as stack:
+            may_administer = has_repo and stack.enter_context(repo_admin_lock(repo, required=False))
+            for child in sorted(run_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                if has_repo and may_administer:
+                    try:
+                        _git("worktree", "remove", "--force", str(child), cwd=repo, check=False)
+                    except WorkspaceError:
+                        log.debug("worktree remove failed during gc; falling back to rmtree", exc_info=True)
+                shutil.rmtree(child, ignore_errors=True)
+                removed += 1
+            if has_repo and may_administer:
                 try:
-                    _git("worktree", "remove", "--force", str(child), cwd=repo, check=False)
+                    _git("worktree", "prune", cwd=repo, check=False)
                 except WorkspaceError:
-                    log.debug("worktree remove failed during gc; falling back to rmtree", exc_info=True)
-            shutil.rmtree(child, ignore_errors=True)
-            removed += 1
-        if has_repo:
-            try:
-                _git("worktree", "prune", cwd=repo, check=False)
-            except WorkspaceError:
-                log.debug("worktree prune failed during gc", exc_info=True)
+                    log.debug("worktree prune failed during gc", exc_info=True)
         shutil.rmtree(run_dir, ignore_errors=True)
         return removed
 

@@ -5,6 +5,7 @@ import json
 import pytest
 
 from mas.cli import main
+from mas.planner.dag import plan_digest
 
 pytestmark = pytest.mark.db
 
@@ -136,6 +137,48 @@ def test_configs_a_and_c_change_the_runtime_shape_not_only_the_label(conn, capsy
     assert main(["submit", "--dag", DAG, "--config", "C", "--max-concurrency", "9"]) == 0
     row = conn.execute("SELECT config, max_concurrency FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
     assert row == {"config": "C", "max_concurrency": 1}
+
+
+def test_plan_exports_one_validated_dag_and_never_executes_it(conn, capsys, tmp_path):
+    """ADR-009: `mas plan` is a real, metered planning round whose run is ended as CANCELLED — the exported DAG is
+    exactly what the validator installed, and configs C and D can then replay that same plan."""
+    out_file = tmp_path / "plan.json"
+    rc = main(
+        [
+            "plan",
+            "--goal",
+            "Implement two independent adapters with a passing pytest suite.",
+            "--benchmark",
+            "adapters_2",
+            "--planner",
+            "fake",
+            "--output",
+            str(out_file),
+            "--max-concurrency",
+            "2",
+            "--json",
+        ]
+    )
+    record = json.loads(capsys.readouterr().out)
+    assert rc == 0 and record["planned"] and not record["parked"]
+    assert record["status"] == "ABORTED" and record["verdict_reason"] == "CANCELLED"
+    assert record["model_calls"] >= 1  # the planner really ran and was metered
+
+    row = conn.execute("SELECT status, verdict_reason FROM runs WHERE id = %s", (record["run_id"],)).fetchone()
+    assert row == {"status": "ABORTED", "verdict_reason": "CANCELLED"}  # never left open, never counted as evidence
+    attempts = conn.execute(
+        "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.id = a.task_id WHERE t.run_id = %s", (record["run_id"],)
+    ).fetchone()
+    assert attempts["n"] == 0  # planned, not executed
+
+    exported = json.loads(out_file.read_text(encoding="utf-8"))
+    assert plan_digest(exported) == record["plan_sha256"] and len(exported["tasks"]) == record["tasks"]
+    stored = conn.execute("SELECT meta FROM artifacts WHERE run_id = %s AND type = 'plan'", (record["run_id"],)).fetchone()
+    assert stored["meta"]["dag"] == exported  # the file is the validated plan on record, not the raw proposal
+
+    # ...and that exported plan is executable as-is: the same decomposition, run sequentially (config C)
+    assert main(["run", "--dag", str(out_file), "--config", "C", "--stub-verifier", "--stub-sleep", "0.01"]) == 0
+    assert "max_concurrency=1" in capsys.readouterr().out
 
 
 def test_single_agent_verifier_repair_remains_single_agent(conn, capsys):

@@ -16,9 +16,12 @@ Exit 0 means the direct live-model gate, distributed operator gate, and frozen M
 same clean commit — which must be the commit currently checked out, with a clean tree — with priced calls and a
 manually approved acceptance contract. It does not require MAS to win.
 
-The auditor trusts raw evidence, not summaries: it reloads `runs.jsonl`, checks every row's experiment id, commit and
-suite identity, recomputes completion (missing / duplicate / infrastructure-invalid / unpriced cells) and regenerates
-`analysis.md` from the rows, and requires `completion.json` and the report on disk to agree with what it recomputed.
+The auditor trusts raw evidence, not summaries: it reloads `runs.jsonl` and `plans.jsonl`, checks every row's
+experiment id, commit and suite identity, recomputes completion (missing / duplicate / infrastructure-invalid /
+unpriced cells) and regenerates `analysis.md` from the rows, and requires `completion.json` and the report on disk to
+agree with what it recomputed. It also audits the experiment's *design* (ADR-009): a frozen randomized block schedule
+covering every cell, a frozen environment fingerprint, and one recorded plan per block that configs C and D both
+executed — without that, a C-versus-D difference does not isolate concurrency.
 """
 
 from __future__ import annotations
@@ -34,7 +37,15 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.benchmark import aggregate, completion, load_rows, render_analysis  # noqa: E402
+from scripts.benchmark import (  # noqa: E402
+    REPLAY_CONFIGS,
+    aggregate,
+    completion,
+    load_plans,
+    load_rows,
+    render_analysis,
+    schedule_cells,
+)
 
 CONFIGS = {"A", "B", "C", "D"}
 WIDTHS = {1, 2, 4, 8, 16}
@@ -79,6 +90,78 @@ def current_git_state() -> tuple[str, bool]:
     return (rev.stdout.strip() if rev.returncode == 0 else "unknown", bool(dirty.stdout.strip()) or dirty.returncode != 0)
 
 
+def _design_checks(
+    spec: dict[str, Any],
+    manifest: dict[str, Any],
+    rows: list[dict[str, Any]],
+    plans: dict[tuple[int, int], dict[str, Any]],
+    plans_error: str | None,
+    *,
+    configs: list[str],
+    widths: list[int],
+    repeats: int,
+) -> list[Check]:
+    """ADR-009: the experiment's *design* is part of the evidence — a frozen randomized schedule, a frozen environment,
+    and one shared plan per block that C and D both executed."""
+    schedule = manifest.get("schedule") if isinstance(manifest.get("schedule"), list) else []
+    expected_cells = sorted((c, n, r) for c in configs for n in widths for r in range(1, repeats + 1))
+    scheduled = sorted(schedule_cells(schedule)) if schedule else []
+    env = spec.get("environment") if isinstance(spec.get("environment"), dict) else {}
+    env_missing = [k for k in ("python", "platform", "provider", "attempt", "exec", "verifier") if not env.get(k)]
+    blocks = [(n, r) for n in widths for r in range(1, repeats + 1)]
+    # a block must have a *recorded* planning outcome. Not that planning succeeded: a planner that could not produce a
+    # valid plan for one block is an experimental result, and demanding success here would push the operator to re-roll
+    # the planner until it did — the exact bias this gate exists to prevent.
+    unrecorded = [b for b in blocks if not plans.get(b)]
+    failed_blocks = [b for b in blocks if plans.get(b) and not plans[b].get("planned")]
+    by_key = {(row.get("config"), row.get("n"), row.get("repetition")): row for row in rows}
+    unpaired: list[str] = []
+    for block in blocks:
+        record = plans.get(block) or {}
+        rows_by_config = {c: (by_key.get((c, *block)) or {}) for c in REPLAY_CONFIGS}
+        if record.get("planned"):
+            digest = record.get("plan_sha256")
+            seen = {c: r.get("plan_sha256") for c, r in rows_by_config.items()}
+            if not digest or any(v != digest for v in seen.values()):
+                unpaired.append(f"N={block[0]} r={block[1]} {seen} != {str(digest)[:12]}")
+        elif not all(r.get("plan_failed") for r in rows_by_config.values()):
+            # no plan for this block: C and D must both record exactly that, and neither may have run anyway
+            unpaired.append(f"N={block[0]} r={block[1]} ran without the block's plan")
+    return [
+        Check(
+            "matrix.schedule",
+            bool(schedule) and scheduled == expected_cells and spec.get("seed") is not None,
+            f"seed={spec.get('seed')} blocks={len(schedule)} cells={len(scheduled)}/{len(expected_cells)}"
+            if schedule
+            else "no randomized block schedule recorded in experiment.json",
+        ),
+        Check(
+            "matrix.environment",
+            not env_missing,
+            "python/platform, provider settings, attempt budget and image identity are frozen"
+            if not env_missing
+            else f"experiment.json records no {env_missing}",
+        ),
+        Check(
+            "matrix.plans",
+            plans_error is None and not unrecorded,
+            plans_error
+            or (
+                f"a recorded planning outcome for every block ({len(plans)}; {len(failed_blocks)} without a usable plan)"
+                if not unrecorded
+                else f"blocks with no recorded planning outcome: {unrecorded}"
+            ),
+        ),
+        Check(
+            "matrix.paired_plans",
+            not unpaired,
+            "C and D executed the same recorded plan in every block"
+            if not unpaired
+            else f"{len(unpaired)} block(s) where C and D did not share one plan: {unpaired[:3]}",
+        ),
+    ]
+
+
 def _matrix_checks(benchmark_dir: Path) -> tuple[list[Check], dict[str, Any]]:
     """Recompute the M3 evidence from `experiment.json` + `runs.jsonl`; the summaries on disk must agree."""
     manifest = _read(benchmark_dir / "experiment.json")
@@ -115,6 +198,12 @@ def _matrix_checks(benchmark_dir: Path) -> tuple[list[Check], dict[str, Any]]:
     configs, widths, repeats = list(spec.get("configs") or []), list(spec.get("widths") or []), int(spec.get("repeats") or 0)
     recomputed = completion(rows, configs=configs, widths=widths, repeats=repeats, require_priced=spec.get("mode") == "live")
     disagreements = [k for k in _RECOMPUTED_COMPLETION_FIELDS if done.get(k) != recomputed.get(k)]
+    try:
+        plans = load_plans(benchmark_dir / "plans.jsonl", experiment_id)
+        plans_error = None
+    except ValueError as exc:
+        plans, plans_error = {}, str(exc)
+    checks += _design_checks(spec, manifest, rows, plans, plans_error, configs=configs, widths=widths, repeats=repeats)
     checks += [
         Check("matrix.live", spec.get("mode") == "live", f"mode={spec.get('mode')}"),
         Check("matrix.configs", set(configs) == CONFIGS, f"configs={configs}"),
@@ -151,7 +240,7 @@ def _matrix_checks(benchmark_dir: Path) -> tuple[list[Check], dict[str, Any]]:
     if rows and spec.get("widths") and spec.get("configs"):
         stamped = dict(recomputed)
         stamped.update({k: done.get(k) for k in ("schema", "experiment_id", "updated_at") if k in done})
-        expected_report = render_analysis(aggregate(rows), manifest, stamped)
+        expected_report = render_analysis(aggregate(rows), manifest, stamped, plans)
     on_disk = analysis_path.read_text(encoding="utf-8") if analysis_path.is_file() else None
     if on_disk is None:
         detail = "analysis.md missing"

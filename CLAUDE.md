@@ -26,7 +26,7 @@ These restate the invariants as coding constraints. Violating one is a bug even 
 - **Artifacts are immutable.** No `UPDATE` on artifact content/ref. Only `status` and `superseded_by` change, via the artifact module.
 - **The verifier is not a task and not callable by agents.** `acceptance/` is mounted read-only into every worker. The verdict comes only from `mas/verifier/`.
 - **The planner proposes; the driver decides.** `Planner.plan()` returns exactly one typed outcome (DAG | questions | contract proposal); `runs.plan_run` validates and records it, returns rejections as data within `max_plan_attempts`, and fails the run with a verdict after that. The planner never writes acceptance suites, freezes contracts (`mas approve` + `mas/planner/contracts.py` do), changes budgets, sets run state, or selects the execution mode (task-shape metadata is advisory).
-- **Repair is bounded and progress is measured, never declared.** Only a verifier `FAIL` (checks ran, some failed) can be repaired; `TIMEOUT`/`ERROR` get one bounded re-verification, then (like `INVALID`, at once) a coded terminal verdict — never an amendment. After a verifier FAIL the orchestrator records a deterministic progress fingerprint (`mas/orchestrator/progress.py`) and decides: repeat → `NO_PROGRESS`; `max_replans` spent → `BUDGET_EXHAUSTED`/`NO_PROGRESS`; else one more amendment. `max_replans` is the only repair budget (never add another). Amendments add new tasks on COMPLETED work only and may cancel PENDING/READY work (validator rule 9); recorded tasks are never altered. Triggers: verifier FAIL, task FAILED, `new_work_required` — each fires once, and the planner is asked only after work in flight has settled. Every non-passing run carries one `verdict_reason` code (ADR-008 §6), set only by `state_machine.fail_run/abort_run`.
+- **Repair is bounded and progress is measured, never declared.** Only a verifier `FAIL` (checks ran, some failed) can be repaired; `TIMEOUT`/`ERROR` get one bounded re-verification, then (like `INVALID`, at once) a coded terminal verdict — never an amendment. After a verifier FAIL the orchestrator records a deterministic progress fingerprint (`mas/orchestrator/progress.py`) and decides: repeat → `NO_PROGRESS`; `max_replans` spent → `BUDGET_EXHAUSTED`/`NO_PROGRESS`; else one more amendment. `max_replans` is the only repair budget (never add another). Amendments add new tasks on COMPLETED work only and may cancel PENDING/READY work (validator rule 9); recorded tasks are never altered. Triggers: verifier FAIL, task FAILED, `new_work_required` — each fires once, and the planner is asked only after work in flight has settled. Every non-passing run carries one `verdict_reason` code (ADR-008 §6, plus `CANCELLED` from ADR-009 for an operator-ended run — today only `mas plan`), set only by `state_machine.fail_run/abort_run`.
 - **Disagreement is decided, never averaged.** Competing candidate inputs for one slot (`ctx.competing`) require one `decision` artifact per slot from the consuming task; the runtime validates it against the competing ids and applies it (winner accepted, losers superseded) in the report transaction; a missing decision fails the attempt. Agents never accept/supersede artifacts themselves.
 - **Every state change emits an event.** If it isn't in `events`, it didn't happen.
 - **Budgets are enforced in the orchestrator, not requested from agents.** Every run must terminate with a verdict inside its budget.
@@ -84,6 +84,7 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 .venv/Scripts/mas answer <run_id> "sqlite; 3.12"                 # ...answer from another terminal; run continues
 .venv/Scripts/mas run --goal "Build a URL shortener..." --planner fake --agent llm --model fake:builder   # step 11 gate offline: contract → approve → DAG → workers → verifier
 .venv/Scripts/mas approve <run_id> [--contract edited.json]     # freeze the proposed acceptance contract (ADR-007); the planner then produces the DAG
+.venv/Scripts/mas plan --goal "..." --benchmark adapters_4 --planner llm --output plan.json   # ADR-009: plan once, export the validated DAG, run nothing (run ends ABORTED/CANCELLED)
 .venv/Scripts/mas artifacts <run_id>                             # git_commit shas, <sha>:path documents, verification
 .venv/Scripts/mas result <run_id> --output ./verified-result     # export the exact accepted commit plus evidence sidecar
 .venv/Scripts/mas run --dag ... --agent llm --model fake:demo    # LLM worker loop (fake provider: no key; real: anthropic:<model> / openai:<model>)
@@ -125,6 +126,13 @@ re-invoked with the same arguments resumes: recorded cells are skipped, cells wh
 (verifier crash/timeout, unusable suite, provider outage, sandbox/workspace failure, worker death, lost client) are
 rerun; `experimental` failures (the model, the plan — an unmappable contract included — or the budgets) are kept as
 evidence.
+
+The matrix runs a **frozen randomized block schedule** and gives each (N, repetition) block **one** validated plan
+(`mas plan`) that configs C and D both execute — so C vs D isolates concurrency (ADR-009). Plans, their SHA-256 and
+their planner cost live in `benchmark-results/plans.jsonl` + `plans/`; `analysis.md` reports them separately, since that
+cost is inside neither C nor D. The manifest also freezes the environment (Python/platform, provider timeout/retries and
+Anthropic request shape, attempt call budget, sandbox/verifier image ids and limits): change any of it, or the `--seed`,
+and the experiment refuses to resume into the same directory.
 
 Tests and lint (no API key needed; DB tests skip if Postgres is unreachable). **Run the tier a change can affect, not
 the whole suite every time** (`scripts/test.py`; every worker process gets its own test DB, so `-n 4` is safe):

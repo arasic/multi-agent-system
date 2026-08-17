@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -204,3 +205,10 @@ class DagSpec:
 
     def by_id(self) -> dict[str, TaskSpec]:
         return {t.id: t for t in self.tasks}
+
+
+def plan_digest(dag: DagSpec | dict[str, Any]) -> str:
+    """Identity of a plan: SHA-256 over its canonical JSON. Two runs executing the same decomposition (ADR-009's
+    paired C/D evidence) must show the same digest; the evidence gate checks exactly that."""
+    d = dag.to_dict() if isinstance(dag, DagSpec) else dag
+    return hashlib.sha256(json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

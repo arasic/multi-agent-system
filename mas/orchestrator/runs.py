@@ -280,6 +280,20 @@ def existing_tasks(conn: Conn, run_id: UUID) -> list[ExistingTask]:
     return [ExistingTask(key=r["key"], status=r["status"], depends_on=tuple(r["deps"] or ())) for r in rows]
 
 
+def planned_dag(conn: Conn, run_id: UUID) -> dict[str, Any] | None:
+    """The run's initial validated DAG as recorded by `install_dag` (the `plan` artifact), or None if it never planned.
+
+    This is the plan *after* validation — auto-added tasks included — which is what `mas plan` exports so another run
+    can execute exactly what was validated here (ADR-009)."""
+    row = conn.execute(
+        "SELECT meta FROM artifacts WHERE run_id = %s AND type = 'plan' AND NOT COALESCE((meta->>'amendment')::boolean, false) "
+        "ORDER BY created_at, id LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    dag = (row["meta"] or {}).get("dag") if row is not None else None
+    return dag if isinstance(dag, dict) else None
+
+
 def previous_amendments(conn: Conn, run_id: UUID) -> list[str]:
     rows = conn.execute(
         "SELECT meta->>'amendment_hash' AS h FROM artifacts WHERE run_id = %s AND type = 'plan' "

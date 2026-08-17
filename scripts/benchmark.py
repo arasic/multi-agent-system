@@ -8,8 +8,22 @@ Key-less substrate rehearsal (hand-written width DAG, stub agents, real verifier
   python scripts/benchmark.py --offline --repeats 1
 
 Every cell uses the same goal, acceptance suite and total budgets. A/B are produced by the runtime's single-agent
-policy; C/D use the same planner/worker models and differ only in concurrency. JSONL is appended after each run so an
-interrupted experiment remains auditable. Unpriced calls make cost null in the summary rather than falsely cheap.
+policy. JSONL is appended after each run so an interrupted experiment remains auditable. Unpriced calls make cost
+null in the summary rather than falsely cheap.
+
+Experimental design (ADR-009):
+  * **Paired C/D.** Each (N, repetition) block gets exactly ONE validated plan — `mas plan` with the live planner,
+    under the parallel budget (`max_concurrency = N`) — recorded with its SHA-256 and replayed by both C and D
+    (`mas run --dag`). C and D therefore differ in concurrency alone; planning cost is measured once per block and
+    reported separately, not counted inside either configuration. (Offline, the block's "plan" is the hand-written
+    width fixture, so the same plumbing is rehearsed without a model.)
+  * **Randomized block schedule.** Provider load, rate limits, cache warmth and time of day drift over a matrix that
+    runs for hours. The order of blocks, and of A/B/C/D inside each block, is drawn from a seeded PRNG; the seed and
+    the resulting schedule are frozen in `experiment.json` and replayed verbatim on resume.
+  * **Environment identity.** The manifest freezes not only models, prices, budgets and suite hashes but everything
+    else that changes behavior: Python/platform, provider timeout/retries, the Anthropic request-shape settings, the
+    per-attempt call budget, and the sandbox/verifier image ids and limits. A different environment is a different
+    experiment and will not resume into the same directory.
 
 Failure classification (`classify_run`): a run that ends PASSED, or FAILED/ABORTED because the model, the plan or the
 experiment's budgets did (`experimental`), is evidence and stays. A run that ends because the machinery did — verifier
@@ -26,11 +40,12 @@ import argparse
 import csv
 import hashlib
 import json
+import platform
+import random
 import re
 import statistics
 import subprocess
 import sys
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -43,10 +58,14 @@ from mas.config import settings  # noqa: E402
 from mas.db import connect  # noqa: E402
 from mas.evaluation import CONFIGS, WIDTHS, width_dag, width_goal  # noqa: E402
 from mas.metrics import compute  # noqa: E402
+from mas.planner.dag import plan_digest  # noqa: E402
 
 RUN_ID = re.compile(r"\brun ([0-9a-f-]{36})\b", re.I)
 TERMINAL = {"PASSED", "FAILED", "ABORTED"}
 FAILURE_CLASSES = ("pass", "experimental", "infrastructure")
+REPLAY_CONFIGS = ("C", "D")  # the configurations that execute the block's shared plan (ADR-009)
+# a plan-only run that ended without a DAG: which of those outcomes is the system under test, and which is machinery
+_EXPERIMENTAL_PLAN_REASONS = ("INVALID_PLAN", "UNSUPPORTED", "NO_PROGRESS", "POLICY_DENIED", "BUDGET_EXHAUSTED")
 # verdict texts (state_machine.fail_run) that name the machinery rather than the code under test
 _INFRASTRUCTURE_VERDICT_MARKERS = (
     "verification not completed",  # verifier ERROR/TIMEOUT twice, or INVALID
@@ -91,8 +110,15 @@ def classify_run(row: dict) -> str:
 
     `UNSUPPORTED` is not infrastructure by itself: the planner earns it too (a contract that maps to no trusted adapter,
     ADR-008 §6), which is the model's outcome. Only the verifier's INVALID — "verification not completed" — is.
+    `CANCELLED` (ADR-009) always is: an operator ended that run, so it says nothing about MAS.
     """
     status = row.get("status")
+    if row.get("plan_failed"):
+        # C/D never started: the block's shared plan could not be produced (ADR-009). The planner is part of the
+        # system under test, so its refusals/invalid plans/budget are evidence; a crash or a lost client is not.
+        if row.get("plan_outcome") == "questions":
+            return "experimental"  # it chose to ask; an unattended experiment has no answer key for this benchmark
+        return "experimental" if row.get("verdict_reason") in _EXPERIMENTAL_PLAN_REASONS else "infrastructure"
     if status == "PASSED":
         return "pass"
     if status not in TERMINAL:
@@ -161,6 +187,77 @@ def _suite_sha(n: int) -> str:
     return h.hexdigest()
 
 
+def _image_id(image: str) -> str | None:
+    """The exact local image the sandboxes/verifier would use, not just its tag (a rebuilt `:latest` is a new one)."""
+    p = subprocess.run(
+        [settings().exec_docker, "image", "inspect", "--format", "{{.Id}}", image],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return p.stdout.strip() or None
+
+
+def environment_spec() -> dict:
+    """Everything outside models/prices/budgets that changes how a run behaves (reviewer finding, 2026-08-17).
+
+    Frozen with the experiment: resuming in a different environment — another Python, a rebuilt sandbox image, a
+    different provider timeout or Anthropic request shape — is a different experiment, not a continuation."""
+    s = settings()
+    return {
+        "python": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "platform": platform.platform(),
+        "provider": {
+            "timeout_s": s.provider_timeout_s,
+            "max_retries": s.provider_max_retries,
+            "anthropic_thinking": s.anthropic_thinking,
+            "anthropic_effort": s.anthropic_effort,
+            "anthropic_fallbacks": s.anthropic_fallbacks,
+            "openai_base_url": s.openai_base_url,
+            "openai_max_tokens_field": s.openai_max_tokens_field,
+        },
+        "attempt": {"max_calls": s.attempt_max_calls, "max_tokens": s.attempt_max_tokens},
+        "exec": {
+            "backend": s.exec_backend,
+            "image": s.exec_image,
+            "image_id": _image_id(s.exec_image),
+            "cpus": s.exec_cpus,
+            "memory_mb": s.exec_memory_mb,
+            "pids": s.exec_pids,
+            "tmpfs_mb": s.exec_tmpfs_mb,
+            "max_life_s": s.exec_max_life_s,
+        },
+        "verifier": {
+            "image": s.verifier_image,
+            "image_id": _image_id(s.verifier_image),
+            "timeout_s": s.verifier_timeout_s,
+            "cpus": s.verifier_cpus,
+            "memory_mb": s.verifier_memory_mb,
+            "pids": s.verifier_pids,
+        },
+        "worker_capabilities": list(s.worker_capabilities),
+    }
+
+
+def build_schedule(configs: list[str], widths: list[int], repeats: int, seed: int) -> list[dict]:
+    """Deterministic randomized block schedule (ADR-009): the (N, repetition) blocks in drawn order, and A/B/C/D in a
+    drawn order inside each block, so provider/time drift cannot line up with a configuration."""
+    rng = random.Random(seed)
+    blocks = [{"n": n, "repetition": r} for n in widths for r in range(1, repeats + 1)]
+    rng.shuffle(blocks)
+    schedule = []
+    for index, block in enumerate(blocks, 1):
+        order = list(configs)
+        rng.shuffle(order)
+        schedule.append({"index": index, "n": block["n"], "repetition": block["repetition"], "configs": order})
+    return schedule
+
+
+def schedule_cells(schedule: list[dict]) -> list[tuple]:
+    return [(c, int(b["n"]), int(b["repetition"])) for b in schedule for c in b["configs"]]
+
+
 def experiment_spec(args) -> dict:
     """Everything that must remain frozen across a resumable experiment."""
     prices = settings().model_prices.strip()
@@ -169,11 +266,12 @@ def experiment_spec(args) -> dict:
     except json.JSONDecodeError:
         price_snapshot = prices
     return {
-        "schema": 1,
+        "schema": 2,
         "mode": "offline" if args.offline else "live",
         "configs": list(args.configs),
         "widths": list(args.widths),
         "repeats": args.repeats,
+        "seed": args.seed,
         "models": {
             "cheap": args.cheap_model,
             "strong": args.strong_model,
@@ -189,6 +287,7 @@ def experiment_spec(args) -> dict:
         },
         "model_prices": price_snapshot,
         "suite_sha256": {str(n): _suite_sha(n) for n in args.widths},
+        "environment": environment_spec(),
     }
 
 
@@ -196,6 +295,7 @@ def open_experiment(output: Path, spec: dict) -> dict:
     """Create or resume one immutable experiment. Refuse to mix configurations in the same evidence directory."""
     path = output / "experiment.json"
     revision, dirty = _git_state()
+    schedule = build_schedule(list(spec["configs"]), list(spec["widths"]), int(spec["repeats"]), int(spec["seed"]))
     if path.exists():
         manifest = json.loads(path.read_text(encoding="utf-8"))
         if manifest.get("spec") != spec:
@@ -204,14 +304,18 @@ def open_experiment(output: Path, spec: dict) -> dict:
             raise ValueError(f"{path} was started at commit {manifest.get('git_commit')}; current commit is {revision}")
         if manifest.get("git_dirty") is False and dirty:
             raise ValueError("the experiment started from a clean tree but the current tree has uncommitted changes")
-        return manifest
+        recorded = manifest.get("schedule")
+        if not isinstance(recorded, list) or sorted(schedule_cells(recorded)) != sorted(schedule_cells(schedule)):
+            raise ValueError(f"{path} records a schedule that no longer covers this matrix; choose a new --output directory")
+        return manifest  # the recorded order is the experiment's design: replay it, never redraw it
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "experiment_id": str(uuid4()),
         "created_at": datetime.now(UTC).isoformat(),
         "git_commit": revision,
         "git_dirty": dirty,
         "spec": spec,
+        "schedule": schedule,
     }
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
@@ -232,6 +336,137 @@ def load_rows(path: Path, experiment_id: str) -> list[dict]:
             raise ValueError(f"foreign experiment row at {path}:{number}")
         rows.append(row)
     return rows
+
+
+def load_plans(path: Path, experiment_id: str) -> dict[tuple[int, int], dict]:
+    """The block plans recorded so far, keyed by (N, repetition). Last record for a block wins (a failed plan may be
+    retried by a later invocation); every record stays in the append-only file."""
+    plans: dict[tuple[int, int], dict] = {}
+    for record in load_rows(path, experiment_id):
+        plans[(int(record["n"]), int(record["repetition"]))] = record
+    return plans
+
+
+def plan_command(args, n: int) -> list[str]:
+    """`mas plan`: one planning round with the live planner, under the *parallel* budget (ADR-009 §2)."""
+    return [
+        sys.executable,
+        "-m",
+        "mas",
+        "plan",
+        "--goal",
+        width_goal(n),
+        "--benchmark",
+        f"adapters_{n}",
+        "--planner",
+        "llm",
+        "--planner-model",
+        args.planner_model,
+        "--max-concurrency",
+        str(n),
+        "--max-tokens",
+        str(args.max_tokens),
+        "--max-attempt-tokens",
+        str(args.max_attempt_tokens),
+        "--max-cost-usd",
+        str(args.max_cost_usd),
+        "--max-wallclock-s",
+        str(args.max_wallclock_s),
+        "--max-replans",
+        str(args.max_replans),
+        "--json",
+    ]
+
+
+def make_plan(args, n: int, repetition: int, path: Path) -> dict:
+    """Produce the one plan configs C and D of this block will both execute, and record what it cost.
+
+    Offline the block's plan is the hand-written width fixture (no model, same plumbing); live it is a real metered
+    planning round through `mas plan`. Never raises: a plan that could not be produced is recorded as such and the
+    block's C/D rows say so."""
+    record: dict[str, Any] = {"n": n, "repetition": repetition, "path": path.name}
+    if args.offline:
+        dag = width_dag(n).to_dict()
+        path.write_text(json.dumps(dag, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        record.update(
+            {
+                "source": "fixture",
+                "planned": True,
+                "outcome": "planned",
+                "plan_sha256": plan_digest(dag),
+                "tasks": len(dag["tasks"]),
+                "dag": dag,
+                "cost_known": True,
+                "call_cost_usd": 0.0,
+                "model_calls": 0,
+                "plan_s": 0.0,
+            }
+        )
+        return record
+    argv = plan_command(args, n) + ["--output", str(path)]
+    print(f"\n[plan N={n} repeat={repetition}] " + " ".join(argv[3:]), flush=True)
+    proc = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True, check=False)
+    print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr, end="")
+    record["source"] = "planner"
+    try:
+        start = proc.stdout.index("{")
+        reported = json.loads(proc.stdout[start:])
+    except (ValueError, json.JSONDecodeError):
+        record.update({"planned": False, "outcome": "client_error", "error": "no JSON record from `mas plan`"})
+        return record
+    record.update({k: v for k, v in reported.items() if k != "output"})
+    if not reported.get("planned"):
+        record.update({"planned": False, "outcome": "questions" if reported.get("parked") else "failed"})
+        return record
+    try:
+        dag = json.loads(path.read_text(encoding="utf-8"))
+        digest = plan_digest(dag)
+    except (OSError, json.JSONDecodeError) as exc:
+        record.update({"planned": False, "outcome": "client_error", "error": f"cannot read the exported plan: {exc}"})
+        return record
+    if digest != reported.get("plan_sha256"):  # the file must be the plan the run recorded
+        record.update({"planned": False, "outcome": "client_error", "error": f"exported plan digest {digest} != reported"})
+        return record
+    record.update({"planned": True, "outcome": "planned", "dag": dag, "tasks": len(dag.get("tasks", []))})
+    return record
+
+
+def block_plan(args, plans: dict[tuple[int, int], dict], n: int, repetition: int, plans_dir: Path) -> dict:
+    """The block's plan, produced once and reused: a recorded plan is evidence and is never redrawn, only restored to
+    disk if the file went missing. A recorded *failure* is retried on the next invocation, like an invalid cell."""
+    path = plans_dir / f"n{n:02d}-r{repetition}.json"
+    previous = plans.get((n, repetition))
+    if previous is not None and previous.get("planned"):
+        dag = previous.get("dag")
+        try:  # the file is a convenience; plans.jsonl is the evidence, so a lost or damaged file is just rewritten
+            on_disk = plan_digest(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else None
+        except (OSError, json.JSONDecodeError):
+            on_disk = None
+        if isinstance(dag, dict) and on_disk != previous.get("plan_sha256"):
+            path.write_text(json.dumps(dag, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"[resume] plan N={n} repeat={repetition} already recorded ({str(previous.get('plan_sha256'))[:12]})", flush=True)
+        return previous
+    return make_plan(args, n, repetition, path)
+
+
+def plan_failure_row(config: str, n: int, repetition: int, plan: dict) -> dict:
+    """C or D could not run: there is no shared plan for this block. Recorded as a row so the cell is not silently
+    missing — `classify_run` decides from the planning run's own reason whether that is evidence or machinery."""
+    return {
+        "config": config,
+        "n": n,
+        "repetition": repetition,
+        "status": plan.get("status") or "PLAN_FAILED",
+        "verdict": plan.get("verdict") or plan.get("error") or "the block's shared plan could not be produced",
+        "verdict_reason": plan.get("verdict_reason"),
+        "plan_failed": True,
+        "plan_outcome": plan.get("outcome"),
+        "plan_run_id": plan.get("run_id"),
+        "cost_known": bool(plan.get("cost_known", False)),
+        "call_cost_usd": plan.get("call_cost_usd"),
+    }
 
 
 def completion(rows: list[dict], *, configs: list[str], widths: list[int], repeats: int, require_priced: bool) -> dict:
@@ -271,7 +506,7 @@ def completion(rows: list[dict], *, configs: list[str], widths: list[int], repea
     }
 
 
-def command(args, config: str, n: int, dag_file: Path) -> list[str]:
+def command(args, config: str, n: int, dag_file: Path, plan_file: Path | None = None) -> list[str]:
     common = [
         sys.executable,
         "-m",
@@ -295,7 +530,7 @@ def command(args, config: str, n: int, dag_file: Path) -> list[str]:
     if args.offline:
         return common + [
             "--dag",
-            str(dag_file),
+            str(plan_file if config in REPLAY_CONFIGS and plan_file is not None else dag_file),
             "--agent",
             "stub",
             "--workers",
@@ -319,10 +554,13 @@ def command(args, config: str, n: int, dag_file: Path) -> list[str]:
             "--max-concurrency",
             "1",
         ]
+    # C and D replay the block's ONE validated plan (ADR-009); `--planner llm` stays for bounded repair amendments
+    if plan_file is None:
+        raise ValueError(f"config {config} needs the block's shared plan")
     concurrency = 1 if config == "C" else n
     return common + [
-        "--goal",
-        width_goal(n),
+        "--dag",
+        str(plan_file),
         "--planner",
         "llm",
         "--planner-model",
@@ -540,12 +778,13 @@ def _dist_cell(dist: dict | None) -> str:
     return f"{_fmt(dist['median'])} {spread} (n={dist['n']})"
 
 
-def render_analysis(summary: list[dict], manifest: dict, done: dict) -> str:
-    """The M3 report (evaluation.md §4/§7) as Markdown. Deterministic in (summary, manifest, done): the MVP gate
+def render_analysis(summary: list[dict], manifest: dict, done: dict, plans: dict[tuple[int, int], dict] | None = None) -> str:
+    """The M3 report (evaluation.md §4/§7) as Markdown. Deterministic in (summary, manifest, done, plans): the MVP gate
     regenerates it from the raw rows and requires the file on disk to match byte for byte."""
     by = {(r["config"], r["n"]): r for r in summary}
     spec = manifest["spec"]
     widths, configs = list(spec["widths"]), list(spec["configs"])
+    env = spec.get("environment") or {}
     lines = [
         "# Frozen M3 result",
         "",
@@ -553,6 +792,10 @@ def render_analysis(summary: list[dict], manifest: dict, done: dict) -> str:
         f"Git commit: `{manifest['git_commit']}`  ",
         f"Mode: `{spec.get('mode')}`; models: `{json.dumps(spec.get('models'), sort_keys=True)}`  ",
         f"Budgets per run: `{json.dumps(spec.get('budgets'), sort_keys=True)}`  ",
+        f"Schedule: randomized blocks, seed `{spec.get('seed')}` (order frozen in `experiment.json`)  ",
+        f"Environment: python `{env.get('python')}` on `{env.get('platform')}`; "
+        f"exec image `{str((env.get('exec') or {}).get('image_id'))[:19]}`, "
+        f"verifier image `{str((env.get('verifier') or {}).get('image_id'))[:19]}`  ",
         f"Evidence complete: **{done['evidence_complete']}** "
         f"({done.get('effective_runs', done['recorded_runs'])}/{done['expected_runs']} effective runs; "
         f"{done['recorded_runs']} rows recorded, {done.get('superseded_rows', 0)} infrastructure-invalid rows superseded by "
@@ -579,6 +822,30 @@ def render_analysis(summary: list[dict], manifest: dict, done: dict) -> str:
                 f"| {n} | {config} | {row.get('evidence_runs', 0)} | {row.get('infrastructure_invalid', 0)} | {success} | "
                 f"{_fmt(row.get('median_machine_s'))} | {_fmt(row.get('median_wall_clock_s'))} | "
                 f"{_fmt(row.get('median_critical_path_s'))} | {_fmt(row.get('median_cost_usd'), 6)} |"
+            )
+    lines += [
+        "",
+        "## Shared plans (paired C/D evidence, ADR-009)",
+        "",
+        "One validated plan per (N, repetition) block, produced under the parallel budget and executed by **both** C "
+        "and D — so C versus D differs in concurrency alone. Planning cost is charged to the plan-only run below, "
+        "once per block, and is therefore *not* inside any C or D run: a system-level comparison against A/B must add "
+        "it back.",
+        "",
+        "| N | Rep | Plan | Tasks | Outcome | Planner cost USD | Planner s | Calls | Rejections |",
+        "|---:|---:|:---|---:|:---|---:|---:|---:|---:|",
+    ]
+    for n in widths:
+        for repetition in range(1, int(spec.get("repeats") or 0) + 1):
+            plan = (plans or {}).get((n, repetition))
+            if plan is None:
+                lines.append(f"| {n} | {repetition} | - | - | not planned | - | - | - | - |")
+                continue
+            digest = str(plan.get("plan_sha256") or "-")
+            lines.append(
+                f"| {n} | {repetition} | `{digest[:12]}` | {_fmt(plan.get('tasks'))} | {plan.get('outcome') or '-'} | "
+                f"{_fmt(plan.get('call_cost_usd'), 6)} | {_fmt(plan.get('plan_s'))} | {_fmt(plan.get('model_calls'))} | "
+                f"{_fmt(plan.get('plan_rejections'))} |"
             )
     lines += ["", "## Parallel MAS crossover", ""]
     for baseline in ("A", "B", "C"):
@@ -645,8 +912,8 @@ def render_analysis(summary: list[dict], manifest: dict, done: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_analysis(summary: list[dict], manifest: dict, done: dict, path: Path) -> None:
-    path.write_text(render_analysis(summary, manifest, done), encoding="utf-8")
+def write_analysis(summary: list[dict], manifest: dict, done: dict, plans: dict[tuple[int, int], dict], path: Path) -> None:
+    path.write_text(render_analysis(summary, manifest, done, plans), encoding="utf-8")
 
 
 def main(argv=None) -> int:
@@ -668,6 +935,7 @@ def main(argv=None) -> int:
     ap.add_argument("--max-cost-usd", type=float, default=20.0)
     ap.add_argument("--max-wallclock-s", type=int, default=1800)
     ap.add_argument("--max-replans", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=20260817, help="draws the block/config execution order (frozen in the manifest)")
     args = ap.parse_args(argv)
     if args.repeats < 1:
         ap.error("--repeats must be positive")
@@ -683,51 +951,85 @@ def main(argv=None) -> int:
         if not settings().model_prices.strip() and not args.allow_unpriced:
             ap.error("real matrix requires MAS_MODEL_PRICES so cost is measurable (or explicitly use --allow-unpriced)")
     if args.dry_run:
-        manifest = {"experiment_id": "dry-run"}
+        manifest = {
+            "experiment_id": "dry-run",
+            "schedule": build_schedule(list(args.configs), list(args.widths), args.repeats, args.seed),
+        }
         rows: list[dict] = []
+        plans: dict[tuple[int, int], dict] = {}
     else:
         args.output.mkdir(parents=True, exist_ok=True)
         try:
             manifest = open_experiment(args.output, experiment_spec(args))
             rows = load_rows(args.output / "runs.jsonl", manifest["experiment_id"])
+            plans = load_plans(args.output / "plans.jsonl", manifest["experiment_id"])
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             ap.error(str(exc))
     jsonl = args.output / "runs.jsonl"
+    plans_jsonl = args.output / "plans.jsonl"
+    plans_dir = args.output / "plans"
     effective, _audit = effective_rows(rows)
-    with tempfile.TemporaryDirectory(prefix="mas-benchmark-") as tmp:
-        tmp = Path(tmp)
-        for n in args.widths:
-            dag_file = tmp / f"adapters_{n}.json"
-            dag_file.write_text(json.dumps(width_dag(n).to_dict(), indent=2), encoding="utf-8")
-            for config in args.configs:
-                argv2 = command(args, config, n, dag_file)
-                for repetition in range(1, args.repeats + 1):
-                    if args.dry_run:
-                        print(" ".join(argv2))
-                        continue
-                    key = (config, n, repetition)
-                    previous = effective.get(key)
-                    if previous is not None:
-                        if classify_run(previous) != "infrastructure":
-                            print(f"[resume] {config} N={n} repeat={repetition} already recorded", flush=True)
-                            continue
-                        why = previous.get("verdict") or previous.get("error") or previous.get("status")
-                        print(
-                            f"[rerun] {config} N={n} repeat={repetition}: previous run {previous.get('run_id') or '?'} "
-                            f"was infrastructure-invalid ({why})",
-                            flush=True,
-                        )
-                    row = run_one(argv2, config=config, n=n, repetition=repetition)
-                    row["experiment_id"] = manifest["experiment_id"]
-                    row["git_commit"] = manifest["git_commit"]
-                    row["suite_sha256"] = manifest["spec"]["suite_sha256"][str(n)]
-                    if previous is not None:
-                        row["rerun_of"] = previous.get("run_id")
-                        row["rerun_index"] = int(previous.get("rerun_index") or 0) + 1
-                    rows.append(row)
-                    effective[key] = row
-                    with jsonl.open("a", encoding="utf-8") as f:
-                        f.write(json.dumps(row, default=str) + "\n")
+    if not args.dry_run:
+        plans_dir.mkdir(parents=True, exist_ok=True)
+    # the frozen randomized schedule (ADR-009): one (N, repetition) block at a time, its configs in the drawn order
+    for block in manifest["schedule"]:
+        n, repetition, order = int(block["n"]), int(block["repetition"]), list(block["configs"])
+        needs_plan = any(c in REPLAY_CONFIGS for c in order)
+        plan_file = plans_dir / f"n{n:02d}-r{repetition}.json"
+        fixture = plans_dir / f"adapters_{n}.json"  # A/B: the hand-written width DAG, collapsed to one solve task
+        if args.dry_run:
+            if needs_plan:
+                made = plan_command(args, n) + ["--output", str(plan_file)]
+                print(f"[fixture] {plan_file}" if args.offline else " ".join(made))
+            for config in order:
+                print(" ".join(command(args, config, n, fixture, plan_file)))
+            continue
+        fixture.write_text(json.dumps(width_dag(n).to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        pending = [
+            c
+            for c in order
+            if effective.get((c, n, repetition)) is None or classify_run(effective[(c, n, repetition)]) == "infrastructure"
+        ]
+        if needs_plan and any(c in REPLAY_CONFIGS for c in pending):
+            produced = block_plan(args, plans, n, repetition, plans_dir)
+            if produced is not plans.get((n, repetition)):  # newly produced (or retried): append it to the evidence
+                record = dict(produced, experiment_id=manifest["experiment_id"], git_commit=manifest["git_commit"])
+                plans[(n, repetition)] = record
+                with plans_jsonl.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, default=str) + "\n")
+        plan = plans.get((n, repetition))
+        for config in order:
+            key = (config, n, repetition)
+            previous = effective.get(key)
+            if previous is not None:
+                if classify_run(previous) != "infrastructure":
+                    print(f"[resume] {config} N={n} repeat={repetition} already recorded", flush=True)
+                    continue
+                why = previous.get("verdict") or previous.get("error") or previous.get("status")
+                print(
+                    f"[rerun] {config} N={n} repeat={repetition}: previous run {previous.get('run_id') or '?'} "
+                    f"was infrastructure-invalid ({why})",
+                    flush=True,
+                )
+            if config in REPLAY_CONFIGS and not (plan or {}).get("planned"):
+                row = plan_failure_row(config, n, repetition, plan or {})
+                print(f"[skip] {config} N={n} repeat={repetition}: no shared plan ({row['verdict']})", flush=True)
+            else:
+                row = run_one(command(args, config, n, fixture, plan_file), config=config, n=n, repetition=repetition)
+                if config in REPLAY_CONFIGS:
+                    row["plan_sha256"] = (plan or {}).get("plan_sha256")
+                    row["plan_tasks"] = (plan or {}).get("tasks")
+            row["experiment_id"] = manifest["experiment_id"]
+            row["git_commit"] = manifest["git_commit"]
+            row["suite_sha256"] = manifest["spec"]["suite_sha256"][str(n)]
+            row["schedule_index"] = int(block["index"])
+            if previous is not None:
+                row["rerun_of"] = previous.get("run_id")
+                row["rerun_index"] = int(previous.get("rerun_index") or 0) + 1
+            rows.append(row)
+            effective[key] = row
+            with jsonl.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, default=str) + "\n")
     if args.dry_run:
         return 0
     summary = aggregate(rows)
@@ -753,7 +1055,7 @@ def main(argv=None) -> int:
         }
     )
     (args.output / "completion.json").write_text(json.dumps(done, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    write_analysis(summary, manifest, done, args.output / "analysis.md")
+    write_analysis(summary, manifest, done, plans, args.output / "analysis.md")
     print(
         f"\nresults: {args.output} ({done['effective_runs']}/{done['expected_runs']} effective runs, {len(rows)} rows; "
         f"evidence_complete={done['evidence_complete']}; all_passed={done['all_passed']}; "

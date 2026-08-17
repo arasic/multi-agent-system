@@ -65,8 +65,10 @@ failure, worker death, a client that lost the run — cannot answer the value qu
 their cell is rerun
 (the last row per cell counts, and only if every earlier row was infrastructure-invalid). `python scripts/mvp_gate.py`
 audits the *raw* rows: it recomputes completion, regenerates the report and requires the summaries on disk to match, and
-requires the evidence commit to be the clean, currently checked-out one. It rejects incomplete, mixed-revision, dirty,
-infrastructure-invalid or unpriced evidence and does not require MAS to win—the measured result is the point of M3.
+requires the evidence commit to be the clean, currently checked-out one. It also audits the experimental design
+(ADR-009): a frozen randomized block schedule covering every cell, a frozen environment fingerprint, and one recorded
+plan per block that C and D both executed. It rejects incomplete, mixed-revision, dirty, infrastructure-invalid,
+unpriced or unpaired evidence and does not require MAS to win—the measured result is the point of M3.
 
 ---
 
@@ -89,12 +91,32 @@ Through M3, the execution mode is **explicitly configured and frozen**. The plan
 `solve` task plus system integration and forced to concurrency 1; their deterministic repair policy preserves that shape.
 C is forced to concurrency 1; D alone honors N. Model specs stay explicit at the experiment boundary.
 
+**Paired C/D (ADR-009, 2026-08-17):** C and D of one (N, repetition) **execute the same validated plan**. The harness
+produces it once per block with `mas plan` (a real, metered planning round, under the parallel budget
+`max_concurrency = N`), records the DAG and its SHA-256 in `plans.jsonl`, and replays it in both configurations
+(`mas run --dag`). Before this, each run planned for itself and the planner was even told a different concurrency
+budget, so a C-versus-D difference measured *a different plan plus different concurrency*. Consequences to quote with
+the result: (1) planning cost/latency is measured once per block and sits in **neither** C nor D — a system-level
+comparison against A/B must add it back; (2) C installs the shared plan under its own frozen budget, so a
+decomposition that cannot fit sequentially is rejected by validator rule 8 and recorded as an experimental `C` failure
+— that is a finding about C, not a harness error; (3) A-versus-D and B-versus-D remain unpaired system-level
+comparisons, as intended.
+
+**Execution order (ADR-009):** cells run on a deterministic randomized **block schedule** — the order of the
+(N, repetition) blocks and of A/B/C/D inside each block is drawn from a seed frozen with the experiment, so provider
+load, rate limits, cache warmth and time of day cannot line up with a configuration. The seed and the exact schedule
+are recorded in `experiment.json` and replayed verbatim on resume; `analysis.md` quotes the seed.
+
 ### Fairness rules (non-negotiable)
 
 - A/B run **inside the same runtime**: one `solve` task + system integration task, same worktree/tool layer, same read-only acceptance, same verifier stage, failure report fed back on the next cycle.
 - Equal **total** budgets: tokens, cost, wall-clock. Equal number of verifier-driven repair cycles (single-agent "re-plan" = next attempt with the failure report).
-- C and D are the same code path with one knob. Never two implementations.
+- C and D are the same code path with one knob, running **one and the same validated plan** per (N, repetition)
+  (ADR-009). Never two implementations, and never two plans.
 - Same acceptance suite version across all configs and all N.
+- The experiment's identity is frozen in `experiment.json` and enforced on resume: models, prices, budgets, suite
+  hashes, the schedule seed **and the environment** (Python/platform, provider timeout/retries and Anthropic request
+  shape, per-attempt call budget, sandbox/verifier image ids and limits). A changed environment is a new experiment.
 - Each (config, N) cell run ≥ 5 times; report distributions, not single runs.
 - Clarifying questions (ADR-006): every config may ask through the same channel; a fixed, pre-written answer key per benchmark is used so answers are identical across configs. Report `questions` and `human_wait_s` separately and compare on `machine_s` — a config is not "faster" because a human answered quickly, nor "slower" because it asked a good question.
 

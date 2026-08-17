@@ -4,7 +4,11 @@ Needs `git` on PATH (skipped otherwise) and Postgres for the end-to-end parts.
 """
 
 import shutil
+import subprocess
+import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -81,6 +85,146 @@ def test_repo_and_worktree_lifecycle(conn, gws):
     assert h2.start_sha == base and not (h2.path / "docs" / "design.md").exists()
     assert gws.publish(h2, "no changes") is None  # nothing written → no commit → no artifact
     gws.cleanup(h2)
+
+
+def test_attempt_creation_never_runs_a_global_worktree_prune(conn, gws, monkeypatch):
+    """`git worktree prune` is global: it deletes the admin entry of every worktree whose directory is missing —
+    including one a sibling `git worktree add` is creating right now (git makes <repo>/worktrees/<name>/ first and
+    writes `gitdir` after). That race cost one attempt at config D / N=16 in the offline matrix:
+    "fatal: could not open 'worktrees/<task>-1/gitdir' for writing". Only run-terminal GC may prune."""
+    import mas.workers.workspace as ws_mod
+
+    run = runs_mod.create_run_from_dag(conn, diamond(), budgets=default_budgets(), capabilities=set(CAPS))
+    t1 = next(t for t in sm.tasks_for_run(conn, run.id) if t.key == "T1")
+    att = Attempt(id=t1.id, task_id=t1.id, attempt_number=1, status=AttemptStatus.RUNNING)
+
+    calls: list[tuple[str, ...]] = []
+    real = ws_mod._git
+    monkeypatch.setattr(ws_mod, "_git", lambda *a, **kw: (calls.append(a), real(*a, **kw))[1])
+
+    handle = gws.create(run, t1, att, inputs=[])  # includes ensure_repo on a fresh run
+    assert not any(a[:2] == ("worktree", "prune") for a in calls), "the per-attempt path must not prune globally"
+    gws.cleanup(handle)
+    assert not any(a[:2] == ("worktree", "prune") for a in calls)
+
+    calls.clear()
+    gws.gc_run(run.id)  # ...but the terminal-run GC still cleans up what dead workers registered
+    assert any(a[:2] == ("worktree", "prune") for a in calls)
+
+
+def test_concurrent_attempt_worktrees_never_administer_the_repo_at_the_same_time(conn, gws, monkeypatch):
+    """The width-16 shape: many attempts of one run create worktrees in the same bare repo at once.
+
+    `worktree add|remove|prune` and `branch -f` all enumerate <repo>/worktrees/ and read each entry's gitdir/commondir,
+    which `worktree add` writes *after* creating the directory — so two of them running at once can read a sibling
+    being born ("fatal: failed to read worktrees/<id>/commondir"). Asserting "no run failed" only samples the race;
+    this asserts the property that removes it: the administrative commands never overlap in time."""
+    import mas.workers.workspace as ws_mod
+
+    run = runs_mod.create_run_from_dag(conn, diamond(), budgets=default_budgets(), capabilities=set(CAPS))
+    tasks = sm.tasks_for_run(conn, run.id)
+    gws.ensure_repo(run.id)  # the repo exists; the race under test is worktree administration, not initialization
+    admin = {("worktree", "add"), ("worktree", "remove"), ("worktree", "prune"), ("branch", "-f")}
+    spans: list[tuple[str, float, float]] = []
+    guard = threading.Lock()
+    real = ws_mod._git
+
+    def timed(*args, **kw):
+        if args[:2] not in admin:
+            return real(*args, **kw)
+        t0 = time.monotonic()
+        try:
+            return real(*args, **kw)
+        finally:
+            with guard:
+                spans.append((" ".join(args[:2]), t0, time.monotonic()))
+
+    monkeypatch.setattr(ws_mod, "_git", timed)
+    results: dict[str, object] = {}
+    barrier = threading.Barrier(len(tasks))
+
+    def make(task) -> None:
+        att = Attempt(id=task.id, task_id=task.id, attempt_number=1, status=AttemptStatus.RUNNING)
+        try:
+            barrier.wait(timeout=30)
+            results[task.key] = gws.create(run, task, att, inputs=[])
+        except Exception as exc:  # noqa: BLE001 - the failure is the assertion
+            results[task.key] = exc
+
+    threads = [threading.Thread(target=make, args=(t,)) for t in tasks]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    failures = {k: v for k, v in results.items() if isinstance(v, Exception)}
+    assert not failures, failures
+    assert len(results) == len(tasks) and all(h.path.is_dir() for h in results.values())
+    assert len(spans) >= 2 * len(tasks)  # each create did at least `branch -f` and `worktree add`
+    ordered = sorted(spans, key=lambda s: s[1])
+    overlaps = [(a, b) for a, b in zip(ordered, ordered[1:], strict=False) if b[1] < a[2]]
+    assert not overlaps, f"git administration overlapped: {overlaps}"
+    for h in results.values():
+        gws.cleanup(h)
+
+
+def test_repo_admin_lock_excludes_another_process_and_is_released_on_exit(gws):
+    """Cross-process, because workers are processes (and containers): one holder blocks every other holder."""
+    from mas.workers.workspace import ADMIN_LOCK_FILE, FILE_LOCKING, WorkspaceError, repo_admin_lock
+
+    if FILE_LOCKING == "none":  # pragma: no cover - neither fcntl nor msvcrt
+        pytest.skip("no file locking on this platform")
+    run_id = uuid.uuid4()
+    repo = gws.ensure_repo(run_id)
+    holder = subprocess.Popen(  # noqa: S603 - fixed argv, test-only
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from mas.workers.workspace import repo_admin_lock\n"
+            "with repo_admin_lock(Path(sys.argv[1])):\n"
+            "    print('held', flush=True)\n"
+            "    time.sleep(float(sys.argv[2]))\n",
+            str(repo),
+            "2.0",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == "held"
+        with pytest.raises(WorkspaceError, match="administration lock"):
+            with repo_admin_lock(repo, timeout_s=0.3):
+                pass
+        with repo_admin_lock(repo, timeout_s=0.3, required=False) as may_administer:
+            assert may_administer is False  # cleanup/GC skip instead of failing
+        assert holder.wait(timeout=20) == 0
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+    with repo_admin_lock(repo, timeout_s=5.0) as may_administer:  # released when the holder exited
+        assert may_administer is True
+    assert (repo / ADMIN_LOCK_FILE).exists()
+
+
+def test_a_filesystem_without_locking_degrades_to_in_process_serialization(gws, monkeypatch, caplog):
+    """Some bind mounts refuse advisory locks. Failing every attempt there would be worse than the race: the
+    in-process mutex still serializes this process's threads, and the fallback is logged, not silent."""
+    import mas.workers.workspace as ws_mod
+
+    run_id = uuid.uuid4()
+    repo = gws.ensure_repo(run_id)
+    monkeypatch.setattr(ws_mod, "_try_lock", lambda fd: None)  # ENOLCK/EINVAL: locking unsupported here
+    monkeypatch.setattr(ws_mod, "_unsupported_warned", False)
+    with caplog.at_level("WARNING"), ws_mod.repo_admin_lock(repo, timeout_s=0.2) as may_administer:
+        assert may_administer is True  # proceed, do not raise
+    assert any("does not support file locking" in r.message for r in caplog.records)
+
+    monkeypatch.setattr(ws_mod, "_try_lock", lambda fd: False)  # ...but a lock genuinely held elsewhere still waits out
+    with pytest.raises(ws_mod.WorkspaceError, match="administration lock"):
+        with ws_mod.repo_admin_lock(repo, timeout_s=0.2):
+            pass
 
 
 def test_dead_worker_worktree_is_pruned_and_branch_reset(conn, gws):

@@ -217,6 +217,13 @@ record. Frozen configs A/B/C/D are executable policy rather than labels; the ada
 trusted suites, key-less real-verifier gate, and `scripts/benchmark.py` matrix/report runner are built. The M3 experiment
 itself and the live-provider smoke remain open because this environment has no provider/model/price/key configuration.
 
+**Experiment fairness ([ADR-009](docs/adr/009-paired-cd-evidence.md), 2026-08-17):** configs C and D of one
+(N, repetition) execute **the same** validated plan — produced once by `mas plan`, hashed into the evidence, with its
+planner cost reported separately — so their difference is concurrency and nothing else; cells run on a deterministic
+randomized block schedule frozen with the experiment; and the manifest pins the environment (Python/platform, provider
+timeout/retries and request shape, attempt call budget, sandbox/verifier image ids and limits) so a changed machine
+cannot masquerade as a resumed run. `scripts/mvp_gate.py` audits all of it from the raw rows.
+
 ## Post-MVP direction
 
 The MVP keeps execution modes explicit so the fair A/B/C/D experiment can establish when parallel MAS actually helps. After that evidence exists, the planned progression is:

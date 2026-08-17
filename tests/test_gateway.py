@@ -4,6 +4,7 @@ server, the ordinary `openai:` provider as the client, and the whole LLM loop ac
 from __future__ import annotations
 
 import json
+import re
 import threading
 import urllib.request
 from pathlib import Path
@@ -12,7 +13,7 @@ from uuid import uuid4
 
 import pytest
 
-from mas import providers
+from mas import cli, providers
 from mas.providers.base import ProviderRateLimited, ProviderRequestError, ProviderUnavailable, ToolCall
 from mas.providers.fake import FakeProvider
 from mas.providers.gateway import ModelGateway
@@ -179,3 +180,56 @@ def test_llm_loop_through_the_gateway_with_the_builder_upstream(tmp_path: Path):
     finally:
         g.close()
         t.join(5)
+
+
+# ----------------------------------------------------------------------------- deployment: who holds the vendor key
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _compose_service_environment(service: str) -> dict[str, str | None]:
+    """The `environment:` map of one Compose service. Hand-parsed: the core suite must run without extra packages
+    (no PyYAML), and this only needs keys plus their literal values. `KEY:` with no value -> None (pass-through)."""
+    env: dict[str, str | None] = {}
+    in_service = in_env = False
+    for line in (ROOT / "docker-compose.yml").read_text(encoding="utf-8").splitlines():
+        if re.match(rf"^  {re.escape(service)}:\s*$", line):
+            in_service, in_env = True, False
+            continue
+        if in_service and re.match(r"^  \S", line):  # the next service at the same indent ends this one
+            break
+        if in_service and re.match(r"^    environment:\s*$", line):
+            in_env = True
+            continue
+        if in_env:
+            if re.match(r"^    \S", line):  # another key of the service (command:, networks:, ...)
+                in_env = False
+                continue
+            entry = re.match(r"^      ([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
+            if entry:
+                value = entry.group(2).strip()
+                env[entry.group(1)] = value or None
+    return env
+
+
+def test_compose_gateway_forwards_every_credential_doctor_accepts():
+    """`mas doctor --require-live` passes when ANY of the upstream provider's credential variables is set, and the
+    gateway is the only process that talks to the vendor. If Compose forwarded a narrower set, preflight would
+    green-light a live distributed run whose gateway has no credential at all — the gap that hid
+    ANTHROPIC_AUTH_TOKEN (accepted by doctor, never forwarded)."""
+    env = _compose_service_environment("gateway")
+    assert env, "gateway service or its environment block not found in docker-compose.yml"
+    missing = [name for name in cli.VENDOR_KEY_VARIABLES if name not in env]
+    assert not missing, f"docker-compose.yml gateway must forward every credential doctor accepts: {missing}"
+    # Valueless on purpose: `${VAR:-}` defines an EMPTY variable in the container, which an SDK may read as a
+    # configured-but-blank credential instead of falling back to the provider's other variable name.
+    assert {n: env[n] for n in cli.VENDOR_KEY_VARIABLES} == dict.fromkeys(cli.VENDOR_KEY_VARIABLES, None)
+
+
+def test_compose_keeps_vendor_credentials_out_of_workers_and_orchestrator():
+    """Only the gateway holds a vendor key (invariant I-11: workers have no egress). The one credential-shaped
+    variable they do get is the gateway's own bearer token."""
+    for service in ("worker", "orchestrator"):
+        env = _compose_service_environment(service)
+        leaked = [n for n in cli.VENDOR_KEY_VARIABLES if n in env and env[n] != "${MAS_GATEWAY_TOKEN:-mas-gateway}"]
+        assert not leaked, f"{service} must not receive vendor credentials: {leaked}"

@@ -201,9 +201,19 @@ def test_openai_compat_clamps_http_timeout_and_backoff_to_the_budget():
 
 
 class _RetryingClient:
-    """Fake Anthropic client: fails N times with a rate limit, records with_options() calls, then succeeds."""
+    """Fake Anthropic client: fails N times with a rate limit, records with_options() calls, then succeeds.
+
+    The SDK import and the error object are built in __init__, never inside `create`: these tests measure what fits
+    inside a small provider-call budget, and importing anthropic/httpx on the first call once cost enough seconds
+    under parallel test load to eat the budget the retry needed (flake seen at `-n 4`)."""
 
     def __init__(self, fail_times: int, retry_after: str | None = None):
+        anthropic = pytest.importorskip("anthropic")
+        httpx = pytest.importorskip("httpx")
+        headers = {"retry-after": retry_after} if retry_after else {}
+        request = httpx.Request("POST", "https://example.invalid/v1/messages")
+        response = httpx.Response(429, request=request, headers=headers)
+        self.error = anthropic.RateLimitError("busy", response=response, body=None)
         self.fail_times = fail_times
         self.retry_after = retry_after
         self.options: list[dict] = []
@@ -218,11 +228,7 @@ class _RetryingClient:
     def create(self, **params):
         self.creates += 1
         if self.creates <= self.fail_times:
-            anthropic = pytest.importorskip("anthropic")
-            httpx = pytest.importorskip("httpx")
-            headers = {"retry-after": self.retry_after} if self.retry_after else {}
-            req = httpx.Request("POST", "https://example.invalid/v1/messages")
-            raise anthropic.RateLimitError("busy", response=httpx.Response(429, request=req, headers=headers), body=None)
+            raise self.error
         return SimpleNamespace(
             model="m",
             content=[SimpleNamespace(type="text", text="ok")],
