@@ -1,6 +1,6 @@
 """Live provider smoke — the M2 gate's one mandatory step that cannot run without a vendor key.
 
-    python scripts/live_smoke.py --worker <provider>:<model> [--planner <provider>:<model>] [--step ping|worker|planner|all]
+    python scripts/live_smoke.py --worker <provider>:<model> [--planner <provider>:<model>] [--step ping|worker|planner|repair|all]
 
 Runs, in order, against the REAL provider (each step is a gate — the next one runs only if the previous passed):
 
@@ -11,6 +11,10 @@ Runs, in order, against the REAL provider (each step is a gate — the next one 
               proposal and approves it for you unless --no-auto-approve, in which case it waits for `mas approve` from
               another terminal — the human decision stays a human decision) → planner produces the DAG → LLM workers →
               real verifier → PASS required. Bounded repair is on (--max-replans 1).
+  4. repair   induced verifier failure → live repair → PASS: the hand-written DAG again, but the FIRST verification is
+              replaced by an induced FAIL naming one real check id (the real verifier ran; its PASS is withheld once);
+              the LLM planner must propose an amendment, LLM workers execute it, the second verification is the real
+              one → PASS with replans_used == 1. (The failure is induced; the amendment and the re-verification are not.)
 
 Model specs come ONLY from --worker/--planner or MAS_MODEL_WORKER/MAS_MODEL_PLANNER (model names never live in code
 outside mas/providers/ and config). Prices come from MAS_MODEL_PRICES; unpriced usage is flagged, never hidden.
@@ -67,7 +71,7 @@ def _preflight(args: argparse.Namespace) -> list[str]:
         problems.append("no vendor key in this process's environment (inject it into the shell that runs this script)")
     if not args.worker:
         problems.append("no worker model: --worker <provider>:<model> or MAS_MODEL_WORKER")
-    if args.step in ("planner", "all") and not args.planner:
+    if args.step in ("planner", "repair", "all") and not args.planner:
         problems.append("no planner model: --planner <provider>:<model> or MAS_MODEL_PLANNER (or --step worker)")
     if not settings().model_prices:
         print("WARNING: MAS_MODEL_PRICES is empty — usage will be recorded but flagged unpriced (the cost budget cannot bite)")
@@ -88,7 +92,7 @@ def _preflight(args: argparse.Namespace) -> list[str]:
 
 
 def step_ping(args: argparse.Namespace) -> bool:
-    _hr(f"1/3 ping  {args.worker}")
+    _hr(f"1/4 ping  {args.worker}")
     rc = cli.main(["models", "--ping", "--spec", args.worker])
     return rc == 0
 
@@ -107,7 +111,37 @@ def _budgets(args: argparse.Namespace) -> Budgets:
     )
 
 
-def _execute(conn, run_id, *, args: argparse.Namespace, planner) -> RunStatus:
+class InducedFirstFail:
+    """Wraps the real verifier: runs it every time, but withholds the first verdict and returns FAIL with one real check
+    id marked failed — a deterministic, visible induction of the repair path (evaluation §5.3 / A8, live)."""
+
+    name = "induced-first-fail"
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.calls = 0
+
+    def verify(self, request):
+        from mas.verifier.base import CheckResult, CheckStatus, VerificationResult, VerificationStatus
+
+        self.calls += 1
+        real = self.inner.verify(request)
+        if self.calls > 1 or real.status is not VerificationStatus.PASS:
+            return real
+        checks = list(real.checks)
+        if not checks:
+            return VerificationResult.fail("induced failure (no checks to name)", status=VerificationStatus.FAIL)
+        first, rest = checks[0], checks[1:]
+        induced = CheckResult(first.id, CheckStatus.FAIL, f"INDUCED by live_smoke: {first.detail or 'treated as failing'}")
+        return VerificationResult.fail(
+            "induced failure: one real check reported as failed (the real run passed; verdict withheld once)",
+            status=VerificationStatus.FAIL,
+            checks=(induced, *rest),
+            evidence={**real.evidence, "induced": True},
+        )
+
+
+def _execute(conn, run_id, *, args: argparse.Namespace, planner, verifier=None) -> RunStatus:
     """Workers (in-process threads, LLM agent, sandboxed command tools) + orchestrator loop with the real verifier."""
     caps = set(settings().worker_capabilities)
     provider = cli._worker_provider(args.worker)
@@ -133,7 +167,7 @@ def _execute(conn, run_id, *, args: argparse.Namespace, planner) -> RunStatus:
         final = scheduler.run_until_terminal(
             conn,
             run_id,
-            verifier=cli._acceptance_verifier(),
+            verifier=verifier or cli._acceptance_verifier(),
             planner=planner,
             capabilities=caps,
             workspace=ws,
@@ -157,7 +191,7 @@ def _execute(conn, run_id, *, args: argparse.Namespace, planner) -> RunStatus:
 
 
 def step_worker(args: argparse.Namespace) -> bool:
-    _hr(f"2/3 worker  benchmarks/url_shortener/dag.json  workers={args.workers}  model={args.worker}")
+    _hr(f"2/4 worker  benchmarks/url_shortener/dag.json  workers={args.workers}  model={args.worker}")
     conn = connect()
     dag = DagSpec.from_file(str(ROOT / "benchmarks" / "url_shortener" / "dag.json"))
     run = runs_mod.create_run_from_dag(
@@ -168,7 +202,7 @@ def step_worker(args: argparse.Namespace) -> bool:
 
 
 def step_planner(args: argparse.Namespace) -> bool:
-    _hr(f"3/3 planner  goal -> contract -> approve -> DAG -> workers -> verifier   planner={args.planner}")
+    _hr(f"3/4 planner  goal -> contract -> approve -> DAG -> workers -> verifier   planner={args.planner}")
     conn = connect()
     caps = set(settings().worker_capabilities)
     planner = cli._planner("llm", spec=args.planner)
@@ -198,11 +232,33 @@ def step_planner(args: argparse.Namespace) -> bool:
     return _execute(conn, run.id, args=args, planner=planner) is RunStatus.PASSED
 
 
+def step_repair(args: argparse.Namespace) -> bool:
+    _hr(f"4/4 repair  induced verifier FAIL -> LLM amendment -> real re-verification   planner={args.planner}")
+    conn = connect()
+    dag = DagSpec.from_file(str(ROOT / "benchmarks" / "url_shortener" / "dag.json"))
+    budgets = _budgets(args)
+    if budgets.max_replans < 1:
+        print("--max-replans must be >= 1 for the repair step")
+        return False
+    run = runs_mod.create_run_from_dag(
+        conn, dag, budgets=budgets, capabilities=set(settings().worker_capabilities), pool=f"live:{os.getpid()}"
+    )
+    print(f"run {run.id}  ({len(dag.tasks)} tasks; the first verification will be an induced FAIL)")
+    planner = cli._planner("llm", spec=args.planner)
+    verifier = InducedFirstFail(cli._acceptance_verifier())
+    status = _execute(conn, run.id, args=args, planner=planner, verifier=verifier)
+    final = runs_mod.sm.get_run(conn, run.id)
+    ok = status is RunStatus.PASSED and final.replans_used == 1 and verifier.calls == 2
+    verdict = "PASS" if ok else "FAIL"
+    print(f"repair check: status={status.value} replans_used={final.replans_used} verifications={verifier.calls} -> {verdict}")
+    return ok
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--worker", default=os.environ.get("MAS_MODEL_WORKER") or None, help="<provider>:<model> for workers")
     ap.add_argument("--planner", default=os.environ.get("MAS_MODEL_PLANNER") or None, help="<provider>:<model> for the planner")
-    ap.add_argument("--step", choices=["ping", "worker", "planner", "all"], default="all")
+    ap.add_argument("--step", choices=["ping", "worker", "planner", "repair", "all"], default="all")
     ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--max-concurrency", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=1_500_000)
@@ -229,9 +285,9 @@ def main(argv: list[str]) -> int:
     if args.dry_run:
         return 0
     results: dict[str, bool] = {}
-    order = ["ping", "worker", "planner"] if args.step == "all" else [args.step]
+    order = ["ping", "worker", "planner", "repair"] if args.step == "all" else [args.step]
     for step in order:
-        ok = {"ping": step_ping, "worker": step_worker, "planner": step_planner}[step](args)
+        ok = {"ping": step_ping, "worker": step_worker, "planner": step_planner, "repair": step_repair}[step](args)
         results[step] = ok
         print(f"\n--> {step}: {'PASS' if ok else 'FAIL'}")
         if not ok:

@@ -164,7 +164,7 @@ def write_svg(summary: list[dict], path: Path) -> None:
         ymax = max(values or [1.0]) or 1.0
         chunks += [
             f'<text x="{x0}" y="25" font-family="sans-serif" font-size="16">{title}</text>',
-            f'<path d="M{x0},{y0} V{y0+ph} H{x0+pw}" fill="none" stroke="#777"/>',
+            f'<path d="M{x0},{y0} V{y0 + ph} H{x0 + pw}" fill="none" stroke="#777"/>',
         ]
         for config in CONFIGS:
             pts = []
@@ -177,19 +177,15 @@ def write_svg(summary: list[dict], path: Path) -> None:
                 chunks.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{colors[config]}"/>')
             if pts:
                 points = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
-                chunks.append(
-                    f'<polyline points="{points}" fill="none" stroke="{colors[config]}" stroke-width="2"/>'
-                )
+                chunks.append(f'<polyline points="{points}" fill="none" stroke="{colors[config]}" stroke-width="2"/>')
         for i, n in enumerate(WIDTHS):
             x = x0 + i * pw / (len(WIDTHS) - 1)
             chunks.append(
-                f'<text x="{x:.1f}" y="{y0+ph+18}" text-anchor="middle" '
-                f'font-family="sans-serif" font-size="11">{n}</text>'
+                f'<text x="{x:.1f}" y="{y0 + ph + 18}" text-anchor="middle" font-family="sans-serif" font-size="11">{n}</text>'
             )
     for i, config in enumerate(CONFIGS):
         chunks.append(
-            f'<text x="{30+i*70}" y="345" fill="{colors[config]}" '
-            f'font-family="sans-serif" font-size="13">{config}</text>'
+            f'<text x="{30 + i * 70}" y="345" fill="{colors[config]}" font-family="sans-serif" font-size="13">{config}</text>'
         )
     chunks.append("</svg>")
     path.write_text("\n".join(chunks) + "\n", encoding="utf-8")
