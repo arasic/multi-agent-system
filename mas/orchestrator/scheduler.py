@@ -146,7 +146,17 @@ def _verification_request(conn: Conn, run: Run, workspace: Any | None) -> Verifi
             repository = repo_path(run.id)
         except Exception:
             log.warning("could not resolve verification repository for run %s", run.id, exc_info=True)
-    return VerificationRequest(run_id=run.id, benchmark=run.benchmark, repository=repository, commit_sha=sha)
+    expected = None
+    frozen = conn.execute(
+        "SELECT meta FROM artifacts WHERE run_id = %s AND type = 'acceptance_contract' AND status = 'accepted' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (run.id,),
+    ).fetchone()
+    if frozen is not None:  # ad-hoc goal: the approved contract pins the suite the verifier must run (ADR-007)
+        expected = frozen["meta"].get("suite_sha256")
+    return VerificationRequest(
+        run_id=run.id, benchmark=run.benchmark, repository=repository, commit_sha=sha, expected_suite_sha256=expected
+    )
 
 
 def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None = None) -> Run:

@@ -21,3 +21,4 @@ worktrees/
 Thumbs.db
 .idea/
 .vscode/
+acceptance/adhoc-*/

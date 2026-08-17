@@ -1,16 +1,17 @@
 """`mas` command line.
 
 mas migrate                              apply schema migrations
-mas run --dag FILE [--workers N ...]     in-process run: orchestrator + N workers (--agent stub|llm) (dev/demo)
+mas run --dag FILE | --goal TEXT --planner llm|fake [--workers N ...]   in-process run (dev/demo)
 mas submit --dag FILE [--wait]           create a run for the orchestrator/worker services to execute
 mas orchestrate --watch [--verifier external|acceptance|stub] [--parallel N]   orchestrator service (bounded, concurrent)
 mas verify --watch | --once              verifier service: real sandboxed verdicts for runs left in VERIFYING
-mas execute --watch | --once             execution-runner service: workers' command requests → per-attempt sandboxes
+mas execute --watch | --once             execution-runner service: workers' command requests -> per-attempt sandboxes
 mas worker [--agent stub|llm] [--model <provider>:<model>] [--exec-backend sandbox|none]   worker service (compose)
 mas models [--ping]                      configured model roles, pricing status; --ping makes one metered test call
-mas gateway [--upstream P:M]             model gateway: the one process holding a vendor key (compose: workers → gateway)
+mas gateway [--upstream P:M]             model gateway: the one process holding a vendor key (compose: workers -> gateway)
 mas status RUN_ID                        summary + metrics (+ pending questions when AWAITING_INPUT)
 mas answer RUN_ID "text"                 answer the planner's clarifying questions (ADR-006)
+mas approve RUN_ID [--contract f.json]   approve the planner's acceptance-contract proposal -> frozen definition of done (ADR-007)
 mas artifacts RUN_ID                     list artifacts (git_commit shas, sha:path documents, decisions, verification)
 mas contract FILE                        validate an acceptance contract against the trusted adapters (ADR-007)
 mas replay RUN_ID                        event timeline (invariant I-12)
@@ -60,7 +61,9 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    dag = DagSpec.from_file(args.dag)
+    if not args.dag and not args.goal:
+        raise SystemExit("mas run needs --dag FILE, or --goal TEXT with --planner llm|fake")
+    dag = DagSpec.from_file(args.dag) if args.dag else None
     budgets = Budgets(
         max_concurrency=args.max_concurrency,
         lease_s=args.lease_s,
@@ -74,24 +77,30 @@ def cmd_run(args: argparse.Namespace) -> int:
     # in-process runs live in their own pool so long-running services on the same DB leave them alone
     pool = f"local:{os.getpid()}"
     planner = None
-    if args.ask:
+    if dag is None:
+        # ad-hoc goal (step 11): the planner asks / assumes, proposes the acceptance contract (approve with `mas approve`),
+        # then plans the DAG; every planner output goes through the deterministic driver
+        planner = _planner(args.planner or "llm", spec=args.planner_model)
+        if planner is None:
+            raise SystemExit("--goal needs a planner: --planner llm|fake")
+        run = runs_mod.create_run(conn, goal=args.goal, budgets=budgets, benchmark=args.benchmark, config=args.config, pool=pool)
+        run = runs_mod.plan_run(conn, run.id, planner, capabilities=caps)
+        print(f"run {run.id}  status={run.status.value}  pool={pool}  planner={planner.name}")
+        _print_waiting(conn, run.id)
+    elif args.ask:
         # ADR-006 demo: a stub planner that asks first; answer from another terminal with `mas answer <run_id> "..."`
         planner = StubPlanner(dag, questions=[[q.strip() for q in args.ask.split(";") if q.strip()]])
         run = runs_mod.create_run(
             conn,
             goal=args.goal or dag.goal or "(no goal)",
             budgets=budgets,
-            benchmark=args.benchmark,
+            benchmark=args.benchmark or dag.benchmark,  # the DAG file's suite; an ad-hoc goal without one needs a contract first
             config=args.config,
             pool=pool,
         )
         run = runs_mod.plan_run(conn, run.id, planner, capabilities=caps)
         print(f"run {run.id}  status={run.status.value}  pool={pool}")
-        for i, q in enumerate(runs_mod.pending_questions(conn, run.id), 1):
-            print(f"  Q{i}: {q}")
-        print(
-            f'  -> answer with:  mas answer {run.id} "your answer"   (clock is running: max_wallclock_s={args.max_wallclock_s})'
-        )
+        _print_waiting(conn, run.id)
     else:
         run = runs_mod.create_run_from_dag(
             conn,
@@ -106,6 +115,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(
             f"run {run.id}  ({len(dag.tasks)} tasks, {args.workers} workers, max_concurrency={args.max_concurrency}, pool={pool})"
         )
+    if args.chaos_kill_after is not None and dag is None:
+        raise SystemExit("--chaos-kill-after needs --dag")
 
     stop = threading.Event()
     provider = _worker_provider(args.model)  # $MAS_MODEL_WORKER; stub agents ignore it, the llm agent uses ctx.model
@@ -174,6 +185,31 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if final.status.value == "PASSED" else 1
 
 
+def _print_waiting(conn, run_id) -> None:
+    """What a run parked in AWAITING_INPUT is waiting for: the planner's questions, or a contract proposal to approve."""
+    from mas.planner import contracts as contract_mod
+
+    qs = runs_mod.pending_questions(conn, run_id)
+    if qs:
+        print("  AWAITING_INPUT - the planner asked:")
+        for i, q in enumerate(qs, 1):
+            print(f"    Q{i}: {q}")
+        print(f'  -> mas answer {run_id} "your answer"')
+        return
+    prop = contract_mod.pending_proposal(conn, run_id)
+    if prop and runs_mod.sm.get_run(conn, run_id).status.value == "AWAITING_INPUT":
+        p = prop["proposal"]
+        print("  AWAITING_INPUT - the planner proposes this acceptance contract (definition of done):")
+        for r in p.get("requirements", []):
+            print(f"    - {r}")
+        print(f"    checks: {[c.get('id') + ':' + c.get('type', '') for c in p['contract'].get('checks', [])]}")
+        if p.get("assumptions"):
+            print(f"    assumptions: {p['assumptions']}")
+        if p.get("exclusions"):
+            print(f"    exclusions: {p['exclusions']}")
+        print(f"  -> mas approve {run_id}            (or: mas approve {run_id} --contract edited.json)")
+
+
 def _print_metrics(m: metrics.RunMetrics) -> None:
     print(
         f"  tasks={m.tasks} {m.tasks_by_status}\n"
@@ -200,8 +236,11 @@ def _print_metrics(m: metrics.RunMetrics) -> None:
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
-    """Create a run and exit; the compose `orchestrator` + `worker` services execute it."""
-    dag = DagSpec.from_file(args.dag)
+    """Create a run and exit; the compose `orchestrator` + `worker` services execute it. With --goal and no --dag the
+    orchestrator's planner (`mas orchestrate --planner llm|fake`) plans it: contract proposal -> `mas approve` -> DAG."""
+    if not args.dag and not args.goal:
+        raise SystemExit("mas submit needs --dag FILE or --goal TEXT")
+    dag = DagSpec.from_file(args.dag) if args.dag else None
     budgets = Budgets(
         max_concurrency=args.max_concurrency,
         lease_s=args.lease_s,
@@ -211,25 +250,35 @@ def cmd_submit(args: argparse.Namespace) -> int:
     )
     conn = connect()
     migrate(conn)
-    run = runs_mod.create_run_from_dag(
-        conn,
-        dag,
-        goal=args.goal,
-        budgets=budgets,
-        benchmark=args.benchmark,
-        config=args.config,
-        capabilities=set(settings().worker_capabilities),
-        pool=args.pool,
-    )
-    print(f"submitted run {run.id} ({len(dag.tasks)} tasks) status={run.status.value} pool={args.pool}")
+    if dag is None:
+        run = runs_mod.create_run(
+            conn, goal=args.goal, budgets=budgets, benchmark=args.benchmark, config=args.config, pool=args.pool
+        )
+        print(f"submitted run {run.id} (goal, to be planned) status={run.status.value} pool={args.pool}")
+    else:
+        run = runs_mod.create_run_from_dag(
+            conn,
+            dag,
+            goal=args.goal,
+            budgets=budgets,
+            benchmark=args.benchmark,
+            config=args.config,
+            capabilities=set(settings().worker_capabilities),
+            pool=args.pool,
+        )
+        print(f"submitted run {run.id} ({len(dag.tasks)} tasks) status={run.status.value} pool={args.pool}")
     if not args.wait:
         conn.close()
         return 0
     t0 = time.monotonic()
+    shown = None
     while True:
         cur = runs_mod.sm.get_run(conn, run.id)
         if cur.status.terminal:
             break
+        if cur.status.value == "AWAITING_INPUT" and shown != cur.questions_asked:
+            shown = cur.questions_asked
+            _print_waiting(conn, run.id)
         if time.monotonic() - t0 > args.timeout:
             print(f"timeout: run still {cur.status.value}")
             conn.close()
@@ -259,8 +308,12 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
     migrate(conn)
     kind = "stub" if args.stub_verifier else args.verifier
     verifier = _service_verifier(kind)
+    planner = _planner(args.planner, spec=args.planner_model)
+    caps = set(settings().worker_capabilities)
     if args.run:
-        final = scheduler.run_until_terminal(conn, UUID(args.run), verifier=verifier, tick_s=args.tick_s)
+        final = scheduler.run_until_terminal(
+            conn, UUID(args.run), verifier=verifier, tick_s=args.tick_s, planner=planner, capabilities=caps
+        )
         print(f"{final.status.value} verdict={final.verdict}")
         return 0 if final.status.value == "PASSED" else 1
     pools = _pools(args.pool)
@@ -268,7 +321,7 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
     conn.close()
     print(
         f"orchestrator: watching open runs in pools={pools} workspace={ws.name} verifier={kind} "
-        f"parallel={args.parallel} (Ctrl-C to stop)"
+        f"planner={planner.name if planner else 'none'} parallel={args.parallel} (Ctrl-C to stop)"
     )
     stop = threading.Event()
     try:
@@ -280,6 +333,8 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
             pools=pools,
             workspace=ws,
             max_parallel=args.parallel,
+            planner=planner,
+            capabilities=caps,
         )
     except KeyboardInterrupt:
         stop.set()
@@ -371,7 +426,7 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
 
 def cmd_contract(args: argparse.Namespace) -> int:
     """Validate an ADR-007 acceptance contract with the trusted adapter schema; print its check ids and, if the
-    contract sits inside an acceptance suite dir, the suite digest a freeze would pin. Unmappable → exit 2."""
+    contract sits inside an acceptance suite dir, the suite digest a freeze would pin. Unmappable -> exit 2."""
     from mas.verifier.acceptance import AcceptanceVerifier, InvalidSuite
     from mas.verifier.adapters import InvalidContract, parse_contract
 
@@ -399,11 +454,35 @@ def cmd_contract(args: argparse.Namespace) -> int:
 
 
 def _pools(arg: str | None) -> list[str] | None:
-    """--pool 'a,b' → ['a','b']; --pool '*' → None (serve every pool); default → [MAS_POOL]."""
+    """--pool 'a,b' -> ['a','b']; --pool '*' -> None (serve every pool); default -> [MAS_POOL]."""
     raw = arg if arg is not None else settings().pool
     if raw.strip() == "*":
         return None
     return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _planner(kind: str | None, *, spec: str | None = None):
+    """--planner llm (provider from --planner-model or $MAS_MODEL_PLANNER) | fake (offline demo double `fake:planner`)
+    | none. The planner proposes; runs.plan_run decides (validator, contract gate, budgets)."""
+    kind = (kind or "none").strip().lower()
+    if kind in ("none", "", "off"):
+        return None
+    from mas import providers
+    from mas.db import connect as _connect
+    from mas.planner.llm import LLMPlanner
+    from mas.providers.telemetry import DbSink
+
+    if kind == "fake":
+        provider = providers.from_spec("fake:planner")
+    elif kind == "llm":
+        spec = spec if spec is not None else settings().model_planner
+        if not spec:
+            raise SystemExit("--planner llm needs a model: pass --planner-model <provider>:<model> or set MAS_MODEL_PLANNER")
+        provider = providers.from_spec(spec)
+    else:
+        raise SystemExit(f"unknown planner {kind!r} (llm | fake | none)")
+    tconn = _connect()  # planner telemetry connection (role=planner rows in model_calls)
+    return LLMPlanner(provider, sink_factory=lambda run_id: DbSink(tconn), pricing=providers.pricing_from_settings())
 
 
 def _worker_provider(spec: str | None):
@@ -431,7 +510,7 @@ def _exec_backend_factory(kind: str | None, *, worker_id: str = "worker"):
     """MAS_EXEC_BACKEND / --exec-backend:
     sandbox (default; one hardened container per attempt, needs Docker on this host) |
     remote  (compose workers: no docker.sock; commands go through Postgres to `mas execute --watch` on a Docker host) |
-    none.   Never 'local' — that backend is test-only. Without Docker the sandbox is unavailable → no command tools."""
+    none.   Never 'local' — that backend is test-only. Without Docker the sandbox is unavailable -> no command tools."""
     from mas.workers.execution import SandboxExecutionBackend, sandbox_spec_from_settings
 
     kind = (kind or settings().exec_backend).strip().lower()
@@ -608,13 +687,33 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"{m.status}  verdict={m.verdict}")
         _print_metrics(m)
         if report:
-            if report.get("pending_questions"):
-                print("  AWAITING_INPUT - the planner asked:")
-                for i, q in enumerate(report["pending_questions"], 1):
-                    print(f"    Q{i}: {q}")
-                print(f'  -> mas answer {args.run_id} "your answer"')
+            if m.status == "AWAITING_INPUT":
+                with connect() as conn2:
+                    _print_waiting(conn2, UUID(args.run_id))
             else:
                 print(f"  open: {json.dumps(report, default=str)}")
+    return 0
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    """Approve (optionally edited) the planner's acceptance-contract proposal: freezes it as the run's definition of done
+    (ADR-007) — suite written under acceptance/, immutable artifact, run back to PLANNING."""
+    from mas.planner import contracts as contract_mod
+
+    doc = None
+    if args.contract:
+        doc = json.loads(Path(args.contract).read_text(encoding="utf-8"))
+    with connect() as conn:
+        try:
+            frozen = contract_mod.approve(
+                conn, UUID(args.run_id), acceptance_root=Path(settings().acceptance_root), contract_doc=doc, approved_by=args.by
+            )
+        except (contract_mod.InvalidProposal, runs_mod.sm.IllegalTransition) as e:
+            print(f"cannot approve: {e}", file=sys.stderr)
+            return 2
+    print(f"contract frozen for run {args.run_id}: benchmark={frozen.benchmark} sha256={frozen.sha256[:12]}")
+    print(f"  suite: {frozen.suite_dir}")
+    print("  run is PLANNING again; the planner will now produce the DAG")
     return 0
 
 
@@ -656,7 +755,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("migrate", help="apply schema migrations").set_defaults(fn=cmd_migrate)
 
     r = sub.add_parser("run", help="in-process run with stub workers")
-    r.add_argument("--dag", required=True, help="hand-written DAG JSON file")
+    r.add_argument("--dag", default=None, help="hand-written DAG file (or use --goal with --planner)")
     r.add_argument("--goal", default=None)
     r.add_argument("--benchmark", default=None)
     r.add_argument("--config", default="D", help="A|B|C|D (evaluation.md)")
@@ -668,6 +767,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--max-attempt-runtime-s", type=int, default=120)
     r.add_argument("--stub-sleep", type=float, default=0.5, help="simulated work per attempt (s)")
     r.add_argument("--agent", default="stub", choices=["stub", "llm"], help="stub (no model) | llm (bounded tool-call loop)")
+    r.add_argument("--planner", default=None, help="llm | fake — plans an ad-hoc --goal (contract -> approve -> DAG)")
+    r.add_argument("--planner-model", default=None, help="<provider>:<model> for --planner llm (default: $MAS_MODEL_PLANNER)")
     r.add_argument("--model", default=None, help="<provider>:<model> for --agent llm (default: $MAS_MODEL_WORKER)")
     r.add_argument("--exec-backend", default=None, help="sandbox (default, needs Docker) | none — command tools for llm agents")
     r.add_argument("--chaos-kill-after", type=float, default=None, help="kill a busy worker after N seconds (A5 demo)")
@@ -692,6 +793,12 @@ def build_parser() -> argparse.ArgumentParser:
     ar.add_argument("run_id")
     ar.set_defaults(fn=cmd_artifacts)
 
+    ap = sub.add_parser("approve", help="approve the planner's acceptance-contract proposal (freezes the definition of done)")
+    ap.add_argument("run_id")
+    ap.add_argument("--contract", default=None, help="edited contract JSON to freeze instead of the proposal as-is")
+    ap.add_argument("--by", default="human")
+    ap.set_defaults(fn=cmd_approve)
+
     an = sub.add_parser("answer", help="answer a run's pending clarifying questions (ADR-006)")
     an.add_argument("run_id")
     an.add_argument("text")
@@ -699,7 +806,7 @@ def build_parser() -> argparse.ArgumentParser:
     an.set_defaults(fn=cmd_answer)
 
     sb = sub.add_parser("submit", help="create a run from a DAG file and exit (services pick it up)")
-    sb.add_argument("--dag", required=True)
+    sb.add_argument("--dag", default=None, help="DAG file; omit to submit an ad-hoc --goal for the orchestrator planner")
     sb.add_argument("--goal", default=None)
     sb.add_argument("--benchmark", default=None)
     sb.add_argument("--config", default="D")
@@ -727,6 +834,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     o.add_argument("--stub-verifier", action="store_true", help="alias for --verifier stub (explicit test mode only)")
     o.add_argument("--parallel", type=int, default=4, help="max runs ticked concurrently (bounded executor)")
+    o.add_argument("--planner", default=None, help="llm | fake — plan ad-hoc goals submitted with `mas submit --goal`")
+    o.add_argument("--planner-model", default=None, help="<provider>:<model> for --planner llm (default: $MAS_MODEL_PLANNER)")
     o.set_defaults(fn=cmd_orchestrate)
 
     vf = sub.add_parser("verify", help="verifier service: real sandboxed verdicts for runs left in VERIFYING")

@@ -10,6 +10,7 @@ Rules (numbering follows architecture.md):
   7  task count exceeds max_tasks; per-task max_attempts outside [1, max_attempts_per_task]  ✔
   8  estimated cost exceeds remaining budget – roadmap step 12 (no cost model yet)
   9  amendment rules                         – roadmap step 13
+  shape  ADR-008 task-shape metadata is advisory but must be well-formed (never selects the execution mode)  ✔
 Extra: duplicate ids, unsafe ids, empty DAG, blank capability.
 """
 
@@ -51,6 +52,53 @@ class ValidationResult:
         return not self.errors
 
 
+SHAPE_MODES = ("single_agent", "sequential_workflow", "parallel_centralized_mas")
+SHAPE_LEVELS = ("low", "medium", "high")
+SHAPE_KEYS = {
+    "estimated_width",  # int >= 1: how many tasks can run independently at once
+    "dependency_density",  # 0..1
+    "critical_path_ratio",  # 0..1: critical path length / task count
+    "overlapping_outputs",  # list[str]: paths/artifacts several tasks would touch
+    "coupling_risk",  # low|medium|high
+    "integration_risk",  # low|medium|high
+    "suggested_mode",  # SHAPE_MODES — a suggestion; A/B/C/D config decides through M3
+    "rationale",  # short free text
+}
+
+
+def validate_shape(shape: dict | None) -> list[ValidationError]:
+    """Task-shape metadata (ADR-008): optional, advisory, but if present it must be well-formed. Never selects a mode."""
+    errs: list[ValidationError] = []
+    if not shape:
+        return errs
+    if not isinstance(shape, dict):
+        return [ValidationError("shape", "shape must be an object")]
+    unknown = sorted(set(shape) - SHAPE_KEYS)
+    if unknown:
+        errs.append(ValidationError("shape", f"unknown shape keys {unknown}; allowed: {sorted(SHAPE_KEYS)}"))
+    w = shape.get("estimated_width")
+    if w is not None and (isinstance(w, bool) or not isinstance(w, int) or w < 1 or w > 1000):
+        errs.append(ValidationError("shape", "estimated_width must be an integer >= 1"))
+    for k in ("dependency_density", "critical_path_ratio"):
+        v = shape.get(k)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, int | float) or not (0.0 <= float(v) <= 1.0)):
+            errs.append(ValidationError("shape", f"{k} must be a number in [0, 1]"))
+    oo = shape.get("overlapping_outputs")
+    if oo is not None and (not isinstance(oo, list) or not all(isinstance(x, str) for x in oo) or len(oo) > 200):
+        errs.append(ValidationError("shape", "overlapping_outputs must be a list of strings"))
+    for k in ("coupling_risk", "integration_risk"):
+        v = shape.get(k)
+        if v is not None and v not in SHAPE_LEVELS:
+            errs.append(ValidationError("shape", f"{k} must be one of {SHAPE_LEVELS}"))
+    m = shape.get("suggested_mode")
+    if m is not None and m not in SHAPE_MODES:
+        errs.append(ValidationError("shape", f"suggested_mode must be one of {SHAPE_MODES}"))
+    r = shape.get("rationale")
+    if r is not None and (not isinstance(r, str) or len(r) > 2000):
+        errs.append(ValidationError("shape", "rationale must be a string (<= 2000 chars)"))
+    return errs
+
+
 def validate(
     dag: DagSpec,
     *,
@@ -63,11 +111,16 @@ def validate(
     budgets = budgets or Budgets()
     errors: list[ValidationError] = []
     tasks = [TaskSpec.from_dict(t.to_dict()) for t in dag.tasks]  # defensive copy
-    result = DagSpec(tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions))
+    result = DagSpec(
+        tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions), shape=dict(dag.shape)
+    )
 
     if not tasks:
         errors.append(ValidationError("empty", "DAG has no tasks"))
         return ValidationResult(result, errors)
+
+    # shape — ADR-008 task-shape metadata is advisory but must be well-formed (it is recorded and later evaluated)
+    errors.extend(validate_shape(dag.shape))
 
     ids = [t.id for t in tasks]
     seen: set[str] = set()
@@ -196,5 +249,7 @@ def validate(
         errors.append(ValidationError("7", f"task count {total} exceeds max_tasks {budgets.max_tasks}"))
 
     return ValidationResult(
-        DagSpec(tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions)), errors, auto_added
+        DagSpec(tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions), shape=dict(dag.shape)),
+        errors,
+        auto_added,
     )

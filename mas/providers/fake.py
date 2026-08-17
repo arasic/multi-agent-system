@@ -181,3 +181,54 @@ def builder_script(messages: list[dict[str, Any]], tools: list[dict[str, Any]] |
 
 
 FakeProvider.SCRIPTS = {"builder": builder_script}  # type: ignore[attr-defined]
+
+
+# ----------------------------------------------------------------------------- fake:planner (offline demo double)
+
+
+def planner_script(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> str:
+    """Deterministic scripted 'planner model' (`fake:planner`): proposes the canned URL-shortener acceptance contract when
+    the brief says the goal has no contract yet, else returns the canned URL-shortener DAG (with advisory shape metadata).
+    Proves the whole gate — goal → contract → approval → DAG → workers → verifier — without a key; never intelligence."""
+    brief = messages[-1]["content"] if messages else ""
+    if "REJECTED" in brief and "produce the DAG" in brief:
+        pass  # a contract was already frozen; fall through to the DAG
+    elif "NO acceptance contract yet" in brief:
+        contract = json.loads(_asset("contract.json"))
+        return json.dumps(
+            {
+                "kind": "contract",
+                "requirements": [
+                    "POST /shorten with a URL returns 201 and a short code",
+                    "GET /<code> redirects (302) to the original URL",
+                    "GET /stats reports the number of stored URLs",
+                    "stored URLs survive a service restart",
+                    "the service has its own tests",
+                ],
+                "assumptions": ["single process, sqlite file storage under {state_dir}", "no authentication"],
+                "exclusions": ["custom short codes", "analytics dashboards"],
+                "quality": {"tests_required": True},
+                "contract": contract,
+            }
+        )
+    dag = json.loads(_asset("dag.json"))
+    return json.dumps(
+        {
+            "kind": "dag",
+            "assumptions": ["Python 3.12 standard library only", "sqlite for persistence"],
+            "shape": {
+                "estimated_width": 3,
+                "dependency_density": 0.4,
+                "critical_path_ratio": 0.5,
+                "overlapping_outputs": [],
+                "coupling_risk": "low",
+                "integration_risk": "medium",
+                "suggested_mode": "parallel_centralized_mas",
+                "rationale": "API, storage and tests are independent after the contract; integration merges them.",
+            },
+            "tasks": dag["tasks"],
+        }
+    )
+
+
+FakeProvider.SCRIPTS["planner"] = planner_script  # type: ignore[attr-defined]

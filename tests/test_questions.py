@@ -21,7 +21,8 @@ pytestmark = pytest.mark.db
 
 
 def _run(conn, budgets=None):
-    return runs_mod.create_run(conn, goal="build the diamond", budgets=budgets or default_budgets())
+    # a benchmark names an existing acceptance suite; without one an ad-hoc goal must get a contract first (ADR-007)
+    return runs_mod.create_run(conn, goal="build the diamond", budgets=budgets or default_budgets(), benchmark="diamond")
 
 
 def test_planner_asks_then_plans_then_run_passes(conn):

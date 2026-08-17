@@ -15,7 +15,9 @@ from mas.db.events import emit
 from mas.models.enums import RunStatus
 from mas.models.types import Budgets, Run
 from mas.orchestrator import state_machine as sm
-from mas.planner.dag import QA, DagSpec, Questions
+from mas.planner import contracts as contract_mod
+from mas.planner.capabilities import DEFAULT_CAPABILITY_TOOLS
+from mas.planner.dag import QA, ContractProposal, DagSpec, Questions
 from mas.planner.planner import Planner, PlanRequest
 from mas.planner.validator import ValidationResult, validate
 
@@ -94,6 +96,7 @@ def install_dag(
     created_by: str = "planner",
     capabilities: set[str] | None = None,
     start: bool = True,
+    plan_attempt: int = 1,
 ) -> ValidationResult:
     """Validate and insert the DAG's tasks; move the run CREATED → PLANNING → RUNNING (if `start`).
 
@@ -114,6 +117,8 @@ def install_dag(
                 "auto_added": result.auto_added,
                 "task_count": len(result.dag.tasks),
                 "created_by": created_by,
+                "plan_attempt": plan_attempt,
+                "shape": result.dag.shape or None,
             },
         )
         if not result.ok:
@@ -132,6 +137,19 @@ def install_dag(
                 )
                 emit(conn, run_id, "plan.assumptions", payload={"assumptions": list(result.dag.assumptions)})
             _insert_tasks(conn, run_id, run, result, created_by)
+            # the plan itself is evidence: the validated DAG + advisory task-shape metadata (ADR-008), on record
+            store.publish(
+                conn,
+                run_id=run_id,
+                type="plan",
+                ref=f"plan:{run_id}:{plan_attempt}",
+                meta={
+                    "dag": result.dag.to_dict(),
+                    "shape": result.dag.shape,
+                    "planner": created_by,
+                    "plan_attempt": plan_attempt,
+                },
+            )
             if start:
                 sm.transition_run(conn, run_id, RunStatus.RUNNING)
     if invalid is not None:  # raised outside the transaction so the FAILED verdict is committed
@@ -282,10 +300,44 @@ def pending_questions(conn: Conn, run_id: UUID) -> list[str]:
     return list(row["meta"].get("questions", [])) if row else []
 
 
-def plan_run(conn: Conn, run_id: UUID, planner: Planner, *, capabilities: set[str]) -> Run:
-    """One planning step: ask the planner; install the DAG or record its questions. Deterministic driver.
+def _plan_request(conn: Conn, run: Run, capabilities: set[str], *, plan_attempt: int, errors: tuple[str, ...]) -> PlanRequest:
+    contract = contract_mod.approved(conn, run.id)
+    remaining_s = None
+    if run.created_at is not None:
+        row = conn.execute("SELECT extract(epoch from (now() - %s)) AS e", (run.created_at,)).fetchone()
+        remaining_s = max(0.0, float(run.budgets.max_wallclock_s) - float(row["e"]))  # type: ignore[index]
+    return PlanRequest(
+        goal=run.goal,
+        capabilities=frozenset(capabilities),
+        qa=tuple(qa_history(conn, run.id)),
+        remaining={
+            "questions": run.budgets.max_questions - run.questions_asked,
+            "tasks": run.budgets.max_tasks - run.tasks_created,
+            "tokens": run.budgets.max_tokens - run.tokens_used,
+            "plan_attempts": run.budgets.max_plan_attempts - plan_attempt + 1,
+            "max_concurrency": run.budgets.max_concurrency,
+            "max_attempts_per_task": run.budgets.max_attempts_per_task,
+        },
+        plan_attempt=plan_attempt,
+        validation_errors=errors,
+        run_id=run.id,
+        benchmark=run.benchmark,
+        needs_contract=run.benchmark is None and contract is None,
+        contract=contract,
+        deadline_s=remaining_s,
+        tool_registry={c: tuple(sorted(DEFAULT_CAPABILITY_TOOLS.get(c, ()))) for c in sorted(capabilities)},
+    )
 
-    Call when the run is CREATED/PLANNING (or REPLANNING at step 13). Idempotent on other states.
+
+def plan_run(conn: Conn, run_id: UUID, planner: Planner, *, capabilities: set[str]) -> Run:
+    """One planning round: ask the planner up to `max_plan_attempts` times; every rejection goes back to it as data.
+
+    Deterministic driver (ADR-001). Exactly one of the planner's typed outcomes is acted on per call:
+      questions  → `ask_questions` (AWAITING_INPUT), the human answers with `mas answer`
+      contract   → only for an ad-hoc goal without a frozen contract: validated, recorded, AWAITING_INPUT for approval
+      dag        → validated (rules 1–7 + shape) and installed → RUNNING; a DAG before the contract is frozen is rejected
+    Anything invalid is returned to the planner with the errors; when the plan-attempt budget is gone the run FAILS
+    with a verdict. Call when the run is CREATED/PLANNING; idempotent on other states.
     """
     run = sm.get_run(conn, run_id)
     if run.status is RunStatus.CREATED:
@@ -293,21 +345,56 @@ def plan_run(conn: Conn, run_id: UUID, planner: Planner, *, capabilities: set[st
             run = sm.transition_run(conn, run_id, RunStatus.PLANNING)
     if run.status is not RunStatus.PLANNING:
         return run
-    req = PlanRequest(
-        goal=run.goal,
-        capabilities=frozenset(capabilities),
-        qa=tuple(qa_history(conn, run_id)),
-        remaining={
-            "questions": run.budgets.max_questions - run.questions_asked,
-            "tasks": run.budgets.max_tasks - run.tasks_created,
-            "tokens": run.budgets.max_tokens - run.tokens_used,
-        },
-    )
-    out = planner.plan(req)
-    if isinstance(out, Questions):
-        return ask_questions(conn, run_id, out, planner=getattr(planner, "name", "planner"))
-    install_dag(conn, run_id, out, created_by=getattr(planner, "name", "planner"), capabilities=capabilities)
-    return sm.get_run(conn, run_id)
+    who = getattr(planner, "name", "planner")
+    errors: tuple[str, ...] = ()
+    last: str = ""
+    for attempt in range(1, run.budgets.max_plan_attempts + 1):
+        req = _plan_request(conn, run, capabilities, plan_attempt=attempt, errors=errors)
+        try:
+            out = planner.plan(req)
+        except Exception as e:  # noqa: BLE001 - a planner error (provider outage, budget, malformed output) is a run verdict
+            with conn.transaction():
+                emit(conn, run_id, "plan.error", payload={"attempt": attempt, "error": f"{type(e).__name__}: {e}"[:500]})
+                return sm.fail_run(conn, run_id, f"planner failed: {type(e).__name__}: {e}"[:400])
+        if isinstance(out, Questions):
+            return ask_questions(conn, run_id, out, planner=who)
+        if isinstance(out, ContractProposal):
+            if not req.needs_contract:
+                errors = ("a contract already exists for this run (benchmark suite or frozen contract): produce the DAG",)
+                last = errors[0]
+                with conn.transaction():
+                    emit(conn, run_id, "plan.rejected", payload={"attempt": attempt, "kind": "contract", "errors": list(errors)})
+                continue
+            errs = contract_mod.validate_proposal(out)
+            if errs:
+                errors = tuple(errs)
+                last = "; ".join(errs)
+                with conn.transaction():
+                    emit(conn, run_id, "plan.rejected", payload={"attempt": attempt, "kind": "contract", "errors": errs})
+                continue
+            return contract_mod.propose(conn, run_id, out, planner=who)
+        # a DAG
+        if req.needs_contract:
+            errors = ("this goal has no acceptance contract yet: propose the contract first (kind=contract), not a DAG",)
+            last = errors[0]
+            with conn.transaction():
+                emit(conn, run_id, "plan.rejected", payload={"attempt": attempt, "kind": "dag", "errors": list(errors)})
+            continue
+        with conn.transaction():
+            existing = conn.execute("SELECT count(*) AS n FROM tasks WHERE run_id = %s", (run_id,)).fetchone()["n"]  # type: ignore[index]
+        result = validate(out, budgets=run.budgets, capabilities=capabilities, existing_task_count=existing)
+        if not result.ok:
+            errors = tuple(str(e) for e in result.errors)
+            last = "; ".join(errors)
+            with conn.transaction():
+                emit(conn, run_id, "plan.rejected", payload={"attempt": attempt, "kind": "dag", "errors": list(errors)})
+            continue
+        install_dag(conn, run_id, out, created_by=who, capabilities=capabilities, plan_attempt=attempt)
+        return sm.get_run(conn, run_id)
+    with conn.transaction():
+        return sm.fail_run(
+            conn, run_id, f"planner exhausted max_plan_attempts ({run.budgets.max_plan_attempts}); last: {last}"[:400]
+        )
 
 
 def summary(conn: Conn, run_id: UUID) -> dict[str, Any]:

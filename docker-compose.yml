@@ -36,9 +36,15 @@ services:
     environment:
       MAS_DATABASE_URL: postgresql://mas:mas@postgres:5432/mas
       MAS_POOL: ${MAS_POOL:-default}
+      # Planner model (step 11), reached only through the gateway like the workers' model: openai:<allowed name>.
+      MAS_MODEL_PLANNER: ${MAS_MODEL_PLANNER:-}
+      MAS_MODEL_PRICES: ${MAS_MODEL_PRICES:-}
+      MAS_OPENAI_BASE_URL: http://gateway:8080/v1
+      MAS_OPENAI_API_KEY: ${MAS_GATEWAY_TOKEN:-mas-gateway}
     # The hardened orchestrator has no Docker: it moves runs to VERIFYING and leaves them for the verifier service
     # (`mas verify --watch` on the host, which has Docker). Never mount docker.sock here. `--verifier stub` = test mode.
-    command: ["mas", "orchestrate", "--watch", "--verifier", "${MAS_ORCH_VERIFIER:-external}", "--parallel", "4"]
+    # --planner: how ad-hoc goals (`mas submit --goal`) get planned: none | fake (offline double) | llm (MAS_MODEL_PLANNER).
+    command: ["mas", "orchestrate", "--watch", "--verifier", "${MAS_ORCH_VERIFIER:-external}", "--parallel", "4", "--planner", "${MAS_ORCH_PLANNER:-none}"]
     volumes:
       - ${MAS_DATA_DIR:-./.mas}:/data
     networks: [backend]

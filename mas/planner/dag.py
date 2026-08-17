@@ -84,11 +84,68 @@ class QA:
     answer: str
 
 
-def parse_plan(d: dict[str, Any]) -> DagSpec | Questions:
-    """Planner output is a union: a DAG or a question batch. Anything else is a validation failure upstream."""
-    if "questions" in d and "tasks" not in d:
+@dataclass
+class ContractProposal:
+    """Planner output for an ad-hoc goal (ADR-007): the *proposed* definition of done. `checks`/`service` follow the
+    trusted adapters' schema (mas/verifier/adapters/schema.py) — the planner names criteria, never writes tests. A human
+    approves (possibly edits) it once; approval freezes it as an immutable `acceptance_contract` artifact and a
+    suite directory the verifier loads like any other."""
+
+    requirements: list[str]
+    checks: list[dict[str, Any]]
+    service: dict[str, Any] | None = None
+    quality: dict[str, Any] = field(default_factory=dict)
+    assumptions: list[str] = field(default_factory=list)
+    exclusions: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ContractProposal:
+        c = d.get("contract") if isinstance(d.get("contract"), dict) else d
+        return cls(
+            requirements=[str(x) for x in d.get("requirements", []) or []],
+            checks=[dict(x) for x in (c.get("checks", []) or []) if isinstance(x, dict)],
+            service=dict(c["service"]) if isinstance(c.get("service"), dict) else None,
+            quality=dict(d.get("quality", {}) or {}),
+            assumptions=[str(x) for x in d.get("assumptions", []) or []],
+            exclusions=[str(x) for x in d.get("exclusions", []) or []],
+        )
+
+    def contract_dict(self) -> dict[str, Any]:
+        """The executable half, in the adapters' schema (protocol 1)."""
+        d: dict[str, Any] = {"protocol_version": 1, "checks": [dict(c) for c in self.checks]}
+        if self.service is not None:
+            d["service"] = dict(self.service)
+        return d
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "contract",
+            "requirements": list(self.requirements),
+            "contract": self.contract_dict(),
+            "quality": dict(self.quality),
+            "assumptions": list(self.assumptions),
+            "exclusions": list(self.exclusions),
+        }
+
+
+PLAN_KINDS = ("dag", "questions", "contract")
+
+
+def parse_plan(d: dict[str, Any]) -> DagSpec | Questions | ContractProposal:
+    """Planner output is a union of exactly one kind: a DAG, a question batch, or an acceptance-contract proposal.
+    `kind` decides when present; otherwise the shape does. Anything else is rejected upstream."""
+    if not isinstance(d, dict):
+        raise ValueError("planner output must be a JSON object")
+    kind = d.get("kind")
+    if kind is not None and kind not in PLAN_KINDS:
+        raise ValueError(f"unknown plan kind {kind!r}; expected one of {PLAN_KINDS}")
+    if kind == "questions" or (kind is None and "questions" in d and "tasks" not in d and "contract" not in d):
         return Questions.from_dict(d)
-    return DagSpec.from_dict(d)
+    if kind == "contract" or (kind is None and ("contract" in d or "checks" in d) and "tasks" not in d):
+        return ContractProposal.from_dict(d)
+    if kind == "dag" or "tasks" in d:
+        return DagSpec.from_dict(d)
+    raise ValueError("planner output is neither a DAG (tasks), a question batch (questions) nor a contract proposal")
 
 
 @dataclass
@@ -98,6 +155,9 @@ class DagSpec:
     benchmark: str | None = None
     # ADR-006 policy: a planner that proceeds without asking states what it assumed. Recorded as an artifact.
     assumptions: list[str] = field(default_factory=list)
+    # ADR-008: task-shape metadata — ADVISORY. Recorded with the plan, validated for shape, never selects the mode:
+    # A/B/C/D configuration controls execution through M3.
+    shape: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DagSpec:
@@ -106,6 +166,7 @@ class DagSpec:
             goal=d.get("goal"),
             benchmark=d.get("benchmark"),
             assumptions=[str(a) for a in d.get("assumptions", []) or []],
+            shape=dict(d.get("shape", {}) or {}),
         )
 
     @classmethod
@@ -124,6 +185,8 @@ class DagSpec:
             d["benchmark"] = self.benchmark
         if self.assumptions:
             d["assumptions"] = list(self.assumptions)
+        if self.shape:
+            d["shape"] = dict(self.shape)
         return d
 
     def by_id(self) -> dict[str, TaskSpec]:

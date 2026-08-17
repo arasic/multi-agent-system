@@ -21,10 +21,11 @@ If code and docs disagree, the docs win until an ADR changes them. If you need t
 
 These restate the invariants as coding constraints. Violating one is a bug even if tests pass.
 
-- **No LLM calls in `mas/orchestrator/`, `mas/planner/validator.py`, `mas/verifier/`, or `mas/db/`.** Only `mas/planner/planner.py` and worker agents talk to models, and only through `mas/providers/`.
+- **No LLM calls in `mas/orchestrator/`, `mas/planner/validator.py`, `mas/planner/contracts.py`, `mas/verifier/`, or `mas/db/`.** Only `mas/planner/llm.py` (the LLM planner) and worker agents (`mas/workers/llm.py`) talk to models, and only through `mas/providers/`.
 - **State transitions live only in `mas/orchestrator/state_machine.py`.** Nothing else sets `status` on runs, tasks, or attempts. Agents never decide their own task's outcome; they report, the orchestrator transitions.
 - **Artifacts are immutable.** No `UPDATE` on artifact content/ref. Only `status` and `superseded_by` change, via the artifact module.
 - **The verifier is not a task and not callable by agents.** `acceptance/` is mounted read-only into every worker. The verdict comes only from `mas/verifier/`.
+- **The planner proposes; the driver decides.** `Planner.plan()` returns exactly one typed outcome (DAG | questions | contract proposal); `runs.plan_run` validates and records it, returns rejections as data within `max_plan_attempts`, and fails the run with a verdict after that. The planner never writes acceptance suites, freezes contracts (`mas approve` + `mas/planner/contracts.py` do), changes budgets, sets run state, or selects the execution mode (task-shape metadata is advisory).
 - **Every state change emits an event.** If it isn't in `events`, it didn't happen.
 - **Budgets are enforced in the orchestrator, not requested from agents.** Every run must terminate with a verdict inside its budget.
 - **Workers only write inside their own worktree.** No shared checkout, no writes to `main`, no network side effects other than the model API.
@@ -78,6 +79,8 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 .venv/Scripts/mas replay <run_id>                                # event timeline (I-12)
 .venv/Scripts/mas run --dag ... --ask "Which DB?;Which Python?"  # ADR-006 demo: planner asks first, run waits (on the clock)
 .venv/Scripts/mas answer <run_id> "sqlite; 3.12"                 # ...answer from another terminal; run continues
+.venv/Scripts/mas run --goal "Build a URL shortener..." --planner fake --agent llm --model fake:builder   # step 11 gate offline: contract → approve → DAG → workers → verifier
+.venv/Scripts/mas approve <run_id> [--contract edited.json]     # freeze the proposed acceptance contract (ADR-007); the planner then produces the DAG
 .venv/Scripts/mas artifacts <run_id>                             # git_commit shas, <sha>:path documents, verification
 .venv/Scripts/mas run --dag ... --agent llm --model fake:demo    # LLM worker loop (fake provider: no key; real: anthropic:<model> / openai:<model>)
 .venv/Scripts/mas models                                         # configured model roles + pricing status (MAS_MODEL_*, MAS_MODEL_PRICES)
