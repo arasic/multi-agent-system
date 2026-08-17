@@ -1,4 +1,13 @@
-"""Run metrics from attempts + events (docs/evaluation.md §4). Pure SQL/Python; used by `mas status` and tests."""
+"""Run metrics from attempts + events (docs/evaluation.md §4). Pure SQL/Python; used by `mas status` and tests.
+
+Besides the counters, this module owns two deterministic classifications the M3 evidence depends on:
+
+- `critical_path_seconds`: the longest dependency chain of the run's task work — the wall-clock a perfectly parallel
+  scheduler could not have beaten (evaluation.md §4 "critical-path duration"; compare with `parallelism_efficiency`).
+- `classify_attempt_failure`: what an attempt's failure was *about* — the model's own output/behaviour (`model`), a
+  budget the experiment set (`budget`/`timeout`), a worker death (`abandoned`), a cancellation, or the machinery
+  around the model (`infrastructure`: workspace, sandbox, provider outage, agent crash). Never an LLM self-report.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +17,67 @@ from uuid import UUID
 
 from mas.db.connection import Conn
 from mas.orchestrator import state_machine as sm
+
+# attempt failure reasons whose cause is the machinery, not the model or the experiment's budgets (prefix match on the
+# runtime's own failure_reason strings — mas/workers/runtime.py, mas/workers/llm.py)
+_INFRASTRUCTURE_FAILURE_PREFIXES = (
+    "workspace",  # "workspace: ...", "workspace publish: ..."
+    "agent crashed",
+    "llm agent crashed",
+    "llm agent: no model provider",
+    "model provider error",
+    "cancelled: attempt no longer running",
+    "sandbox",
+    "execution backend",
+    "exec runner",
+)
+ATTEMPT_FAILURE_CLASSES = ("model", "budget", "timeout", "abandoned", "cancelled", "infrastructure")
+
+
+def classify_attempt_failure(status: str, reason: str | None) -> str | None:
+    """Deterministic class of a non-successful attempt (None for SUCCESS/RUNNING). See ATTEMPT_FAILURE_CLASSES."""
+    if status in ("SUCCESS", "RUNNING"):
+        return None
+    if status == "ABANDONED":
+        return "abandoned"
+    if status == "TIMEOUT":
+        return "timeout"
+    if status == "CANCELLED":
+        return "cancelled"
+    text = (reason or "").strip().lower()
+    if text.startswith("attempt ended:"):
+        if "budget" in text:
+            return "budget"
+        if "deadline" in text or "timeout" in text:
+            return "timeout"
+        return "cancelled"
+    if text.startswith(_INFRASTRUCTURE_FAILURE_PREFIXES):
+        return "infrastructure"
+    return "model"
+
+
+def critical_path_seconds(durations: dict[str, float], deps: dict[str, set[str]]) -> float:
+    """Longest path through the dependency graph, weighted by each node's own duration (seconds).
+
+    `deps[node]` are the nodes it depends on. Nodes missing from `durations` weigh 0. The graph is a validated DAG; a
+    cycle (impossible for a recorded plan) is broken by ignoring the back edge rather than recursing forever.
+    """
+    memo: dict[str, float] = {}
+    active: set[str] = set()
+
+    def longest(node: str) -> float:
+        if node in memo:
+            return memo[node]
+        if node in active:  # cycle guard
+            return 0.0
+        active.add(node)
+        upstream = max((longest(d) for d in deps.get(node, ())), default=0.0)
+        active.discard(node)
+        memo[node] = float(durations.get(node, 0.0)) + upstream
+        return memo[node]
+
+    nodes = set(durations) | set(deps) | {d for ds in deps.values() for d in ds}
+    return round(max((longest(n) for n in nodes), default=0.0), 3)
 
 
 @dataclass
@@ -53,6 +123,19 @@ class RunMetrics:
     call_cost_usd: float = 0.0
     call_seconds: float = 0.0
     per_model: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # evaluation.md §4 additions for the M3 evidence: structure, failures, task shape
+    config: str | None = None  # frozen A/B/C/D configuration recorded on the run (None outside the benchmark)
+    critical_path_s: float | None = None  # longest dependency chain of task work (all attempts of a task count)
+    workers_seen: int = 0  # distinct worker ids that held an attempt
+    worker_utilisation: float | None = None  # sum_attempt_s / (wall_clock_s × workers_seen)
+    plan_artifacts: int = 0  # validated plans on record (initial + amendments)
+    plan_rejections: int = 0  # planner rounds the validator sent back as data
+    assumptions: int = 0  # assumptions the planner recorded instead of asking
+    verifier_fails: int = 0  # verifier verdicts of FAIL — checks ran, some failed (acceptance failures, incl. repaired ones)
+    verifier_incomplete: int = 0  # verifications that did not reach a verdict on the checks (ERROR/TIMEOUT/INVALID)
+    verifier_retries: int = 0  # bounded re-verifications after ERROR/TIMEOUT (infrastructure)
+    attempt_failure_classes: dict[str, int] = field(default_factory=dict)  # see classify_attempt_failure
+    task_shape: dict[str, Any] | None = None  # advisory planner metadata from the first recorded plan (ADR-008)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,6 +181,8 @@ def compute(conn: Conn, run_id: UUID) -> RunMetrics:
 
     per_task: dict[str, dict[str, Any]] = {}
     by_task_id = {t.id: t for t in tasks}
+    failure_classes: dict[str, int] = {}
+    workers: set[str] = set()
     for a in attempts:
         t = by_task_id.get(a.task_id)
         if t is None:
@@ -108,8 +193,52 @@ def compute(conn: Conn, run_id: UUID) -> RunMetrics:
             d["seconds"] += (a.finished_at - a.started_at).total_seconds()
         if a.worker_id and a.worker_id not in d["workers"]:
             d["workers"].append(a.worker_id)
+        if a.worker_id:
+            workers.add(a.worker_id)
+        cls = classify_attempt_failure(a.status.value, a.failure_reason)
+        if cls is not None:
+            failure_classes[cls] = failure_classes.get(cls, 0) + 1
+
+    # critical path: task work (all attempts of a task, retries included — they were real time on that chain) along
+    # the recorded dependency edges
+    edges = conn.execute(
+        """
+        SELECT t.key AS task_key, u.key AS depends_on
+        FROM task_dependencies d
+        JOIN tasks t ON t.id = d.task_id
+        JOIN tasks u ON u.id = d.depends_on_task_id
+        WHERE t.run_id = %s
+        """,
+        (run_id,),
+    ).fetchall()
+    deps: dict[str, set[str]] = {t.key: set() for t in tasks}
+    for e in edges:
+        deps.setdefault(e["task_key"], set()).add(e["depends_on"])
+    critical = critical_path_seconds({k: v["seconds"] for k, v in per_task.items()}, deps) if tasks else None
 
     n_events = conn.execute("SELECT count(*) AS n FROM events WHERE run_id = %s", (run_id,)).fetchone()["n"]  # type: ignore[index]
+    counted = conn.execute(
+        """
+        SELECT type, count(*) AS n FROM events
+        WHERE run_id = %s AND type IN ('plan.rejected', 'verify.failed', 'verify.fingerprint', 'verify.retry')
+        GROUP BY type
+        """,
+        (run_id,),
+    ).fetchall()
+    event_counts = {r["type"]: int(r["n"]) for r in counted}
+    assumptions = 0
+    for r in conn.execute("SELECT payload FROM events WHERE run_id = %s AND type = 'plan.assumptions'", (run_id,)).fetchall():
+        payload = r["payload"] if isinstance(r["payload"], dict) else {}
+        listed = payload.get("assumptions")
+        assumptions += len(listed) if isinstance(listed, list) else 0
+    plans = conn.execute(
+        "SELECT meta FROM artifacts WHERE run_id = %s AND type = 'plan' ORDER BY created_at, id", (run_id,)
+    ).fetchall()
+    task_shape = None
+    if plans:
+        first = plans[0]["meta"] if isinstance(plans[0]["meta"], dict) else {}
+        shape = first.get("shape")
+        task_shape = dict(shape) if isinstance(shape, dict) and shape else None
 
     # human wait: sum of intervals spent in AWAITING_INPUT (run.awaiting_input → next run.* transition)
     human_wait = 0.0
@@ -163,6 +292,19 @@ def compute(conn: Conn, run_id: UUID) -> RunMetrics:
         events=int(n_events),
         per_task=per_task,
         **calls,
+        config=run.config,
+        critical_path_s=critical,
+        workers_seen=len(workers),
+        worker_utilisation=(round(sum_s / (wall * len(workers)), 3) if wall and workers else None),
+        plan_artifacts=len(plans),
+        plan_rejections=event_counts.get("plan.rejected", 0),
+        assumptions=assumptions,
+        # a fingerprint is recorded for every verifier FAIL (checks ran); verify.failed also covers ERROR/TIMEOUT/INVALID
+        verifier_fails=event_counts.get("verify.fingerprint", 0),
+        verifier_incomplete=max(0, event_counts.get("verify.failed", 0) - event_counts.get("verify.fingerprint", 0)),
+        verifier_retries=event_counts.get("verify.retry", 0),
+        attempt_failure_classes=failure_classes,
+        task_shape=task_shape,
     )
 
 

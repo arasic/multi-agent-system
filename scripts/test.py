@@ -45,7 +45,7 @@ AREAS: dict[str, list[str]] = {
     "verifier": ["test_acceptance.py", "test_adapters.py", "test_orchestrate_service.py"],
     "contracts": ["test_planner_llm.py", "test_adapters.py"],
     "cli": ["test_cli.py", "test_questions.py", "test_evaluation.py"],
-    "evaluation": ["test_evaluation.py", "test_cli.py", "test_mvp_gate.py"],
+    "evaluation": ["test_evaluation.py", "test_cli.py", "test_mvp_gate.py", "test_metrics.py"],
     "conflicts": ["test_conflicts.py", "test_llm_agent.py"],
     "service": ["test_orchestrate_service.py", "test_gateway.py", "test_exec_runner.py"],
 }

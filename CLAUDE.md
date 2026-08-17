@@ -116,8 +116,13 @@ Frozen MVP evidence (run on one clean commit with a real provider and exact `MAS
 python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m> --step all --no-auto-approve --output mvp-evidence/live-smoke.json
 python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-smoke.json
 python scripts/benchmark.py --cheap-model <p:m> --strong-model <p:m> --planner-model <p:m> --worker-model <p:m> --repeats 5 --output benchmark-results
-python scripts/mvp_gate.py                                      # direct live + distributed + priced 100-run matrix
+python scripts/mvp_gate.py                                      # direct live + distributed + priced 100-run matrix, recomputed from raw rows, bound to the current clean HEAD
 ```
+
+`live_smoke.py --resume` (with `--output`) skips stages already PASSED in that file when it came from the same commit,
+models, approval mode and pricing rule. `benchmark.py` re-invoked with the same arguments resumes: recorded cells are
+skipped, cells whose last row is `infrastructure`-invalid (verifier crash/timeout, unusable suite, provider outage,
+sandbox/workspace failure, lost client) are rerun; `experimental` failures are kept as evidence.
 
 Tests and lint (no API key needed; DB tests skip if Postgres is unreachable). **Run the tier a change can affect, not
 the whole suite every time** (`scripts/test.py`; every worker process gets its own test DB, so `-n 4` is safe):

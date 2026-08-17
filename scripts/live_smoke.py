@@ -76,6 +76,31 @@ def _write_evidence(args: argparse.Namespace) -> None:
     tmp.replace(args.output)
 
 
+# evidence fields that must be identical for an earlier file's passed stages to count towards this invocation
+_RESUME_IDENTITY = ("git", "models", "manual_contract_approval", "allow_unpriced")
+
+
+def merge_resume(previous: dict, current: dict) -> tuple[dict, list[str], str | None]:
+    """Carry an earlier evidence file's PASSED stages (and their runs) into `current`.
+
+    Returns (merged evidence, stages to skip, refusal reason). Nothing is carried over unless the earlier file was
+    produced by the same commit with a clean/dirty state, the same worker/planner models, the same approval mode and
+    the same pricing rule — otherwise a paid stage from a different setup could be smuggled into this gate."""
+    if not isinstance(previous, dict) or previous.get("schema") != current.get("schema"):
+        return current, [], "earlier evidence has a different schema"
+    for key in _RESUME_IDENTITY:
+        if previous.get(key) != current.get(key):
+            return current, [], f"earlier evidence differs in {key}: {previous.get(key)!r} vs {current.get(key)!r}"
+    prev_steps = previous.get("steps") if isinstance(previous.get("steps"), dict) else {}
+    prev_runs = previous.get("runs") if isinstance(previous.get("runs"), list) else []
+    skip = [s for s in current["requested_steps"] if prev_steps.get(s) is True]
+    merged = dict(current)
+    merged["steps"] = {s: True for s in skip}
+    merged["runs"] = [r for r in prev_runs if isinstance(r, dict) and r.get("step") in skip]
+    merged["resumed_from"] = {"started_at": previous.get("started_at"), "steps": skip}
+    return merged, skip, None
+
+
 def _hr(title: str) -> None:
     print("\n" + "=" * 100 + f"\n{title}\n" + "=" * 100, flush=True)
 
@@ -308,7 +333,17 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "--no-auto-approve", action="store_true", help="wait for `mas approve` instead of approving the proposal here"
     )
-    ap.add_argument("--output", type=Path, help="write resumable machine-readable gate evidence to this JSON file")
+    ap.add_argument(
+        "--output",
+        type=Path,
+        help="write incremental machine-readable gate evidence to this JSON file after every stage (overwritten unless --resume)",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip stages already PASSED in --output when it was produced by this same commit, models, approval mode "
+        "and pricing rule; their runs are carried forward, everything else is re-run",
+    )
     ap.add_argument(
         "--allow-unpriced",
         action="store_true",
@@ -329,6 +364,22 @@ def main(argv: list[str]) -> int:
         "runs": [],
         "complete": False,
     }
+    skip: list[str] = []
+    if args.resume:
+        if args.output is None:
+            ap.error("--resume needs --output")
+        if args.output.is_file():
+            try:
+                previous = json.loads(args.output.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                ap.error(f"cannot resume from {args.output}: {exc}")
+            args.evidence, skip, refusal = merge_resume(previous, args.evidence)
+            if refusal:
+                print(f"not resuming: {refusal}")
+            elif skip:
+                print(f"resuming: skipping already-passed stages {skip} from {args.output}")
+        else:
+            print(f"nothing to resume: {args.output} does not exist yet")
 
     problems = _preflight(args)
     if problems:
@@ -349,6 +400,10 @@ def main(argv: list[str]) -> int:
         return 0
     results: dict[str, bool] = {}
     for step in order:
+        if step in skip:
+            results[step] = True
+            print(f"\n--> {step}: PASS (carried forward from earlier evidence)")
+            continue
         ok = {"ping": step_ping, "worker": step_worker, "planner": step_planner, "repair": step_repair}[step](args)
         results[step] = ok
         args.evidence["steps"][step] = ok
@@ -358,7 +413,7 @@ def main(argv: list[str]) -> int:
             break
     _hr("live smoke summary")
     for k, v in results.items():
-        print(f"  {k:8s} {'PASS' if v else 'FAIL'}")
+        print(f"  {k:8s} {'PASS' if v else 'FAIL'}" + ("  (resumed)" if k in skip else ""))
     complete = bool(results) and all(results.values()) and len(results) == len(order)
     args.evidence["complete"] = complete
     args.evidence["finished_at"] = datetime.now(UTC).isoformat()

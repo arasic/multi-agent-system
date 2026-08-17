@@ -57,9 +57,15 @@ Run at **N = 1, 2, 4, 8, 16**. This is where the value question is answered: whe
 Fixtures for stub workers exist for both benchmarks so the pipeline is testable without an LLM. The width family is
 generated deterministically by `mas.evaluation.width_dag(N)` and verified by immutable `acceptance/adapters_<N>` suites;
 `tests/test_benchmark.py` permanently gates N=4 through real Git worktrees and the Docker verifier. The full experiment
-is `python scripts/benchmark.py` (immutable experiment manifest + resumable JSONL + CSV/JSON + SVG + completion record);
-real evidence requires at least five repetitions per cell. `python scripts/mvp_gate.py` rejects incomplete, mixed-revision,
-dirty or unpriced evidence and does not require MAS to win—the measured result is the point of M3.
+is `python scripts/benchmark.py` (immutable experiment manifest + append-only JSONL + CSV/JSON + SVG + completion record +
+generated report); real evidence requires at least five repetitions per cell. Every run is classified deterministically
+(`benchmark.classify_run`): `experimental` failures — the model, the plan or the run's budgets decided the outcome — are
+evidence and stay; `infrastructure` failures — verifier crash/timeout, unusable suite, provider outage, sandbox/workspace
+failure, a client that lost the run — cannot answer the value question, stay in the log for audit, and their cell is rerun
+(the last row per cell counts, and only if every earlier row was infrastructure-invalid). `python scripts/mvp_gate.py`
+audits the *raw* rows: it recomputes completion, regenerates the report and requires the summaries on disk to match, and
+requires the evidence commit to be the clean, currently checked-out one. It rejects incomplete, mixed-revision, dirty,
+infrastructure-invalid or unpriced evidence and does not require MAS to win—the measured result is the point of M3.
 
 ---
 
@@ -102,6 +108,12 @@ Cost: input tokens · output/thinking tokens · cache-read tokens · total USD �
 Structure: tasks created · attempts · retries · re-plans · plan-attempts · agent calls · worker utilisation.
 Task shape: estimated independent width · dependency density · estimated critical-path ratio · overlapping-output risk · coupling/risk flags · planner-suggested mode versus configured mode. These fields are descriptive through M3 and become selector inputs only after the fixed-mode evidence exists.
 Failures: acceptance failures · integration failures · planning/validation failures · abandoned attempts.
+
+Where they live: `mas.metrics.compute` records the per-run values (`critical_path_s` = the longest dependency chain of
+task work, all attempts of a task included; `worker_utilisation`; `plan_rejections`; `assumptions`; `verifier_fails` /
+`verifier_incomplete`; `attempt_failure_classes` from `classify_attempt_failure`; the planner's advisory `task_shape`).
+`scripts/benchmark.py` reports each of them per (config, N) cell as a distribution — min / p25 / median / p75 / max /
+mean over the cell's evidence runs — plus failure-class, verdict-reason and planner-suggested-mode histograms.
 
 Report: for each config, plot **N vs wall-clock**, **N vs cost**, **N vs success rate**; table of A/B/C/D at each N.
 

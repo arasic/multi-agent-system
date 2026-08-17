@@ -184,8 +184,10 @@ python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-sm
 ```
 
 The second command proves the configured provider through the actual gateway, Compose workers, trusted host executor,
-external verifier, and verified-result export. The final M3 experiment is resumable and refuses to mix changed code,
-suites, models, prices or budgets in one output:
+external verifier, and verified-result export. (`live_smoke.py --resume` carries already-passed stages forward, but only
+from the same commit, models, approval mode and pricing rule.) The final M3 experiment is resumable and refuses to mix
+changed code, suites, models, prices or budgets in one output; infrastructure-invalid cells are rerun, experimental
+failures are kept, and the gate recomputes everything from the raw rows on the clean, checked-out commit:
 
 ```
 python scripts/benchmark.py --cheap-model <p:m> --strong-model <p:m> --planner-model <p:m> --worker-model <p:m> --repeats 5 --output benchmark-results

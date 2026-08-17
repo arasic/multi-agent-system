@@ -45,6 +45,11 @@ def test_diamond_passes_with_real_concurrency(conn):
     # `max_concurrent_attempts` is the deterministic A3 criterion. Efficiency includes orchestration/verifier time in
     # its denominator and can fall below 1 on a loaded CI host even though three attempts genuinely overlapped.
     assert m.parallelism_efficiency and m.parallelism_efficiency > 0
+    # critical path (evaluation.md §4): T1 -> one of T2/T3/T4 -> T5 = three sleeps on the chain, and never more than
+    # the total work; the two parallel siblings are off the path
+    assert m.critical_path_s is not None and 3 * 0.4 <= m.critical_path_s <= m.sum_attempt_s, m
+    assert m.critical_path_s < m.sum_attempt_s
+    assert m.workers_seen == 3 and m.worker_utilisation and m.attempt_failure_classes == {}
     # integration artifact accepted by verifier PASS; others remain candidates (chosen-for-final semantics)
     integ = next(t for t in sm.tasks_for_run(conn, out.run.id) if t.key == "T5")
     assert [a.status for a in store.for_task(conn, integ.id)] == [ArtifactStatus.ACCEPTED]
