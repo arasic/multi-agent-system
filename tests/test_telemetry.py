@@ -221,9 +221,12 @@ def test_call_evidence_survives_worker_death(conn):
         wait_all([t2], 10)
     assert final.status is RunStatus.PASSED
     m = metrics.compute(conn, run.id)
-    assert m.model_calls == 2 + 5 and m.input_tokens == 5 * 10  # settlement counts 5 healthy calls; evidence shows 7
+    # the reaper settled the dead attempt's spend from its telemetry rows (hard total budget): 7 calls, all counted
+    assert m.model_calls == 2 + 5 and m.input_tokens == 7 * 10
     dead_rows = [r for r in _calls(conn, run.id) if r["attempt_id"] == att.id]
-    assert len(dead_rows) == 2 and sm.get_attempt(conn, att.id).status is AttemptStatus.ABANDONED
+    dead = sm.get_attempt(conn, att.id)
+    assert len(dead_rows) == 2 and dead.status is AttemptStatus.ABANDONED and dead.input_tokens == 20
+    assert final.tokens_used == 7 * 11  # attempts' spend (dead one included); no planner in this run
 
 
 def test_worker_without_provider_hands_over_no_model(conn):

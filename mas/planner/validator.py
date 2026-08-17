@@ -13,9 +13,9 @@ Rules (numbering follows architecture.md):
                   run's per-attempt allocation `max_attempt_tokens`: open × allocation ≤ remaining tokens. System-owned:
                   the meter hands exactly this allocation to attempts; planner estimates play no part.
        time     — no per-attempt time allocation exists (the runtime cap is a timeout), so time is checked from what
-                  is *known*: this run's observed mean attempt duration (re-plans) and the planner's own per-task
-                  estimates, which may only tighten: weighted critical path ≤ remaining wall-clock and total work /
-                  max_concurrency ≤ remaining wall-clock; remaining wall-clock must be > 0.
+                  is *known*: this run's shortest successful attempt so far (a lower bound, never the mean) and the
+                  planner's own per-task estimates, which may only tighten: weighted critical path ≤ remaining
+                  wall-clock and total work / max_concurrency ≤ remaining wall-clock; remaining wall-clock must be > 0.
        estimate — optional `estimate: {"tokens": int, "seconds": number}` per task is validated; an estimate above the
                   per-attempt allocation (tokens) or the per-attempt runtime cap (seconds) is infeasible → rejected.
        cost     — no price model here (model names never reach the validator); the run's cost budget is enforced at
@@ -77,7 +77,7 @@ class Remaining:
     wallclock_s: float | None = None
     cost_usd: float | None = None
     open_tasks: int = 0  # existing non-terminal tasks (re-plan): they still need funding alongside the new ones
-    observed_attempt_s: float | None = None  # mean duration of this run's settled attempts, None until there are any
+    observed_attempt_s: float | None = None  # lower bound: shortest SUCCESS attempt so far (else shortest settled); None = none
 
 
 @dataclass(frozen=True)
@@ -196,7 +196,7 @@ def validate_budget(tasks: list[TaskSpec], budgets: Budgets, remaining: Remainin
             weight = {t.id: max(floor, estimated_seconds(t)) for t in tasks}
             total = sum(weight.values())
             path_s, path = critical_path_s(tasks, weight)
-            basis = f"observed mean attempt {floor:.1f}s" if floor else "planner estimates"
+            basis = f"shortest observed attempt {floor:.1f}s" if floor else "planner estimates"
             if path_s > remaining.wallclock_s:
                 errs.append(
                     ValidationError(

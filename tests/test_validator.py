@@ -192,10 +192,11 @@ def test_rule8_time_uses_observed_attempts_and_estimates_which_only_tighten():
     # nothing known yet: only "some wall-clock left" is required
     assert validate(d, budgets=b, remaining=Remaining(wallclock_s=1.0)).ok
     assert "no wall-clock left" in str(validate(d, budgets=b, remaining=Remaining(wallclock_s=0)).errors[0])
-    # this run's observed mean attempt duration floors every task: 3-task critical path x 10s = 30s
+    # this run's shortest observed attempt floors every task: 3-task critical path x 10s = 30s
     assert validate(d, budgets=b, remaining=Remaining(wallclock_s=30, observed_attempt_s=10)).ok
     r = validate(d, budgets=b, remaining=Remaining(wallclock_s=29, observed_attempt_s=10))
-    assert rules(r) == {"8"} and "critical path ['T1', 'T2', 'T5']" in str(r.errors[0]) and "observed mean" in str(r.errors[0])
+    assert rules(r) == {"8"} and "critical path ['T1', 'T2', 'T5']" in str(r.errors[0])
+    assert "shortest observed" in str(r.errors[0])
     # throughput bound: 5 tasks x 10s / concurrency 1 = 50s > 45s (the chain alone, 30s, would fit)
     r = validate(
         d, budgets=Budgets(max_attempt_tokens=1, max_concurrency=1), remaining=Remaining(wallclock_s=45, observed_attempt_s=10)

@@ -65,6 +65,8 @@ class Workspace(Protocol):
     def create(self, run: Run, task: Task, attempt: Attempt, inputs: list[Artifact]) -> WorkspaceHandle | None: ...
     def publish(self, handle: WorkspaceHandle | None, message: str, *, since: str = "start") -> str | None: ...
     def cleanup(self, handle: WorkspaceHandle | None) -> None: ...
+
+    def gc_run(self, run_id: UUID) -> int: ...
     def promote(self, run_id: UUID, name: str, sha: str) -> None: ...
     def show(self, run_id: UUID, ref: str) -> str: ...
 
@@ -80,6 +82,9 @@ class NullWorkspace:
 
     def cleanup(self, handle: WorkspaceHandle | None) -> None:
         return None
+
+    def gc_run(self, run_id: UUID) -> int:
+        return 0
 
     def promote(self, run_id: UUID, name: str, sha: str) -> None:
         return None
@@ -237,6 +242,40 @@ class GitWorkspace:
         except WorkspaceError:
             log.debug("worktree remove failed; falling back to rmtree", exc_info=True)
         shutil.rmtree(handle.path, ignore_errors=True)
+        try:  # the per-run directory goes when its last worktree does (best effort; a sibling may still be busy)
+            handle.path.parent.rmdir()
+        except OSError:
+            pass
+
+    def gc_run(self, run_id: UUID) -> int:
+        """Remove every worktree directory of a run — called by the orchestrator once the run is terminal, so what a
+        crashed or abandoned worker left behind on purpose (its worktree is evidence while the run is live) does not
+        leak. Returns how many attempt worktrees were removed. Commits and branches stay in the bare repo."""
+        if self.keep_worktrees:
+            return 0
+        run_dir = self.worktree_root / str(run_id)
+        if not run_dir.exists():
+            return 0
+        repo = self.repo_path(run_id)
+        has_repo = (repo / "HEAD").exists()
+        removed = 0
+        for child in sorted(run_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            if has_repo:
+                try:
+                    _git("worktree", "remove", "--force", str(child), cwd=repo, check=False)
+                except WorkspaceError:
+                    log.debug("worktree remove failed during gc; falling back to rmtree", exc_info=True)
+            shutil.rmtree(child, ignore_errors=True)
+            removed += 1
+        if has_repo:
+            try:
+                _git("worktree", "prune", cwd=repo, check=False)
+            except WorkspaceError:
+                log.debug("worktree prune failed during gc", exc_info=True)
+        shutil.rmtree(run_dir, ignore_errors=True)
+        return removed
 
     # ------------------------------------------------------------------ run-level
 

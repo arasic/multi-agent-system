@@ -222,6 +222,21 @@ def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None 
                         if a.type == "git_commit":
                             _promote_integration_ref(run_id, a.ref, workspace)
                 return sm.pass_run(conn, run_id)
+            if result.status is not VerificationStatus.FAIL:
+                # Not the code's failure: the suite did not run to a verdict on the checks (TIMEOUT: the trusted runner
+                # itself did not finish — per-check timeouts are check FAILs; ERROR: verifier/sandbox crashed; INVALID:
+                # the suite as frozen/configured could not be executed or validated). Never a repair trigger — an
+                # amendment cannot fix infrastructure — and never a fingerprint: a coded terminal verdict instead.
+                if result.status is VerificationStatus.INVALID and getattr(verifier, "name", "") != "missing":
+                    code = VerdictReason.UNSUPPORTED
+                else:
+                    code = VerdictReason.UNRECOVERABLE_FAILURE
+                return sm.fail_run(
+                    conn,
+                    run_id,
+                    f"verification not completed ({result.status.value}): {result.reason or 'no reason given'}"[:400],
+                    code=code,
+                )
             # bounded repair (step 13-lite, ADR-008 §7): a deterministic decision from the progress fingerprint and
             # max_replans — never from the planner. REPLANNING is then driven by the orchestrator's next tick.
             return _after_fail(conn, locked, report, request, workspace)
@@ -289,6 +304,23 @@ def _after_fail(conn: Conn, run: Run, report: dict[str, Any], request: Verificat
     return sm.fail_run(conn, run.id, f"verification failed: {decision.detail}", code=decision.reason)
 
 
+def gc_workspace(run_id: UUID, workspace: Any | None) -> None:
+    """A terminal run keeps no worktrees: remove whatever attempts left behind (crashed / abandoned workers leave theirs
+    on purpose while the run is live). Best effort, idempotent; the run's bare repo (its history) stays."""
+    try:
+        if workspace is None:
+            from mas.workers.workspace import workspace_from_settings
+
+            workspace = workspace_from_settings()
+        gc = getattr(workspace, "gc_run", None)
+        if callable(gc):
+            n = gc(run_id)
+            if n:
+                log.info("run %s: removed %d leftover worktree(s)", run_id, n)
+    except Exception:  # never let cleanup change an outcome
+        log.warning("worktree GC failed for run %s", run_id, exc_info=True)
+
+
 def tick(
     conn: Conn,
     run_id: UUID,
@@ -298,9 +330,25 @@ def tick(
     capabilities: set[str] | None = None,
     workspace: Any | None = None,
 ) -> Run:
-    """One orchestrator step for a run. `planner` is optional: when given, PLANNING runs are planned here
-    (ADR-006 driver); when None, someone else drives planning (e.g. create_run_from_dag) and PLANNING is left alone.
+    """One orchestrator step for a run. `planner` is optional: when given, PLANNING/REPLANNING runs are planned here
+    (ADR-006 driver / 13-lite amendments); when None, someone else drives planning and PLANNING is left alone.
+    When the run reaches a terminal state its worktrees are garbage-collected.
     """
+    run = _tick(conn, run_id, verifier=verifier, planner=planner, capabilities=capabilities, workspace=workspace)
+    if run.status.terminal:
+        gc_workspace(run_id, workspace)
+    return run
+
+
+def _tick(
+    conn: Conn,
+    run_id: UUID,
+    *,
+    verifier: Verifier | None = None,
+    planner: Planner | None = None,
+    capabilities: set[str] | None = None,
+    workspace: Any | None = None,
+) -> Run:
     verifier = verifier or MissingVerifier()
     reap_expired(conn, run_id)
 
@@ -593,7 +641,10 @@ def verifying_runs(conn: Conn, pools: list[str] | tuple[str, ...] | None = None)
 def _verify_job(database_url: str | None, run_id: UUID, verifier: Verifier, workspace: Any | None) -> Run:
     conn = connect(database_url)
     try:
-        return _verify(conn, run_id, verifier, workspace)  # takes the verify advisory lock; re-entrant; DB-free verifier
+        run = _verify(conn, run_id, verifier, workspace)
+        if run.status.terminal:
+            gc_workspace(run_id, workspace)
+        return run  # takes the verify advisory lock; re-entrant; DB-free verifier
     finally:
         conn.close()
 
@@ -609,6 +660,8 @@ def verify_once(
     out: list[tuple[UUID, RunStatus]] = []
     for rid in verifying_runs(conn, pools):
         run = _verify(conn, rid, verifier, workspace)
+        if run.status.terminal:
+            gc_workspace(rid, workspace)
         out.append((rid, run.status))
     return out
 

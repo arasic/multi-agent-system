@@ -142,6 +142,7 @@ class Attempt:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+    token_allocation: int | None = None  # reserved at claim from the run's unreserved tokens (migration 0008)
     started_at: datetime | None = None
     finished_at: datetime | None = None
     failure_reason: str | None = None
@@ -160,6 +161,7 @@ class Attempt:
             input_tokens=r.get("input_tokens", 0),
             output_tokens=r.get("output_tokens", 0),
             cost_usd=float(r.get("cost_usd", 0) or 0),
+            token_allocation=r.get("token_allocation"),
             started_at=r.get("started_at"),
             finished_at=r.get("finished_at"),
             failure_reason=r.get("failure_reason"),

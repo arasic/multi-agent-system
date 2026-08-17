@@ -14,7 +14,8 @@ from mas.db.connection import Conn, Jsonb
 from mas.db.events import emit
 from mas.models.enums import RunStatus, VerdictReason
 from mas.models.types import Budgets, Run
-from mas.orchestrator import progress
+from mas.orchestrator import budgets as budget_rules
+from mas.orchestrator import leases, progress
 from mas.orchestrator import state_machine as sm
 from mas.planner import contracts as contract_mod
 from mas.planner.capabilities import DEFAULT_CAPABILITY_TOOLS
@@ -105,19 +106,22 @@ def create_run(
 
 
 def remaining_budget(conn: Conn, run: Run) -> Remaining:
-    """What the run has left right now, measured by the driver for validator rule 8 (budget allocation): tokens, cost,
-    wall-clock (one clock from creation, I-4), the existing tasks that still need funding, and this run's observed mean
-    attempt duration (the only per-attempt time figure the system owns; None until an attempt has settled)."""
+    """What the run has left right now, measured by the driver for validator rule 8 (budget allocation): tokens (net of
+    what RUNNING attempts have reserved), cost, wall-clock (one clock from creation, I-4), the existing tasks that still
+    need funding, and this run's observed *minimum* attempt duration (a lower bound; None until an attempt settled)."""
     row = conn.execute(
         """
         SELECT extract(epoch from (now() - %s)) AS elapsed,
                (SELECT count(*) FROM tasks t WHERE t.run_id = %s
                   AND t.status NOT IN ('COMPLETED', 'FAILED', 'BLOCKED', 'CANCELLED')) AS open_tasks,
-               (SELECT avg(extract(epoch from (a.finished_at - a.started_at)))
+               (SELECT min(extract(epoch from (a.finished_at - a.started_at)))
                   FROM attempts a JOIN tasks t ON t.id = a.task_id
-                 WHERE t.run_id = %s AND a.status <> 'RUNNING' AND a.finished_at IS NOT NULL) AS observed_s
+                 WHERE t.run_id = %s AND a.status = 'SUCCESS' AND a.finished_at IS NOT NULL) AS observed_ok_s,
+               (SELECT min(extract(epoch from (a.finished_at - a.started_at)))
+                  FROM attempts a JOIN tasks t ON t.id = a.task_id
+                 WHERE t.run_id = %s AND a.status <> 'RUNNING' AND a.finished_at IS NOT NULL) AS observed_any_s
         """,
-        (run.created_at, run.id, run.id),
+        (run.created_at, run.id, run.id, run.id),
     ).fetchone()
     assert row is not None
     b = run.budgets
@@ -126,12 +130,22 @@ def remaining_budget(conn: Conn, run: Run) -> Remaining:
         left = conn.execute("SELECT extract(epoch from (%s - now())) AS s", (b.deadline_at,)).fetchone()
         wall = min(wall, float(left["s"]))  # type: ignore[index]
     return Remaining(
-        tokens=b.max_tokens - run.tokens_used,
+        tokens=b.max_tokens - run.tokens_used - leases.reserved_tokens(conn, run.id),
         wallclock_s=wall,
         cost_usd=float(b.max_cost_usd) - float(run.cost_used_usd),
         open_tasks=int(row["open_tasks"] or 0),
-        observed_attempt_s=float(row["observed_s"]) if row["observed_s"] is not None else None,
+        observed_attempt_s=_observed(row),
     )
+
+
+def _observed(row: dict[str, Any]) -> float | None:
+    """A *lower bound* on how long a task takes here: the shortest successful attempt so far (a slow history — one
+    long timeout — must not reject a plan that can complete faster); only if nothing succeeded yet, the shortest
+    settled attempt of any kind."""
+    v = row.get("observed_ok_s")
+    if v is None:
+        v = row.get("observed_any_s")
+    return float(v) if v is not None else None
 
 
 def install_dag(
@@ -522,9 +536,16 @@ def plan_run(conn: Conn, run_id: UUID, planner: Planner, *, capabilities: set[st
         try:
             out = planner.plan(req)
         except Exception as e:  # noqa: BLE001 - a planner error (provider outage, budget, malformed output) is a run verdict
+            settle_planner_usage(conn, run_id)  # what it spent before failing is charged all the same
             with conn.transaction():
                 emit(conn, run_id, "plan.error", payload={"attempt": attempt, "error": f"{type(e).__name__}: {e}"[:500]})
+                if sm.get_run(conn, run_id).status.terminal:
+                    return sm.get_run(conn, run_id)  # the settlement already ended it (budget)
                 return sm.fail_run(conn, run_id, f"planner failed: {type(e).__name__}: {e}"[:400], code=_planner_error_reason(e))
+        settle_planner_usage(conn, run_id)  # planner tokens/cost count against the run's hard budget (I-4)
+        run = sm.get_run(conn, run_id)
+        if run.status.terminal:
+            return run  # the planning round itself exhausted a budget: verdict, nothing installed
         if isinstance(out, Questions):
             return ask_questions(conn, run_id, out, planner=who)
         if isinstance(out, ContractProposal):
@@ -586,6 +607,38 @@ def plan_run(conn: Conn, run_id: UUID, planner: Planner, *, capabilities: set[st
             f"planner exhausted max_plan_attempts ({run.budgets.max_plan_attempts}); last: {last}"[:400],
             code=reason_for(last_errors),
         )
+
+
+def settle_planner_usage(conn: Conn, run_id: UUID) -> dict[str, Any] | None:
+    """Charge the planner's model calls to the run (hard total budget, I-4). Settled from telemetry — the meter's
+    `model_calls` rows written as each call finished — never from anything the planner reports. Idempotent: rows are
+    marked settled. Returns what was charged (or None), and aborts the run with a verdict if that crossed a budget."""
+    with conn.transaction():
+        run = sm.lock_run(conn, run_id)
+        rows = conn.execute(
+            """
+            UPDATE model_calls SET settled = true
+             WHERE run_id = %s AND attempt_id IS NULL AND NOT settled
+            RETURNING input_tokens, output_tokens, cost_usd, priced, role
+            """,
+            (run_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        tokens = sum(int(r["input_tokens"]) + int(r["output_tokens"]) for r in rows)
+        cost = float(sum(float(r["cost_usd"]) for r in rows))
+        unpriced = sum(1 for r in rows if not r["priced"])
+        conn.execute(
+            "UPDATE runs SET tokens_used = tokens_used + %s, cost_used_usd = cost_used_usd + %s WHERE id = %s",
+            (tokens, cost, run_id),
+        )
+        charged = {"calls": len(rows), "tokens": tokens, "cost_usd": round(cost, 6), "unpriced_calls": unpriced}
+        emit(conn, run_id, "plan.usage", payload=charged)
+        run = sm.get_run(conn, run_id)
+        reason = budget_rules.violation(run)
+        if reason and not run.status.terminal:
+            sm.abort_run(conn, run_id, reason)
+        return charged
 
 
 def _planner_error_reason(e: Exception) -> VerdictReason:

@@ -5,7 +5,7 @@ Scenarios (defaults; override with flags):
   --chaos 50        git-workspace diamond runs where a busy worker is killed mid-attempt (deliberate death)
   --parallel 20     runs submitted simultaneously to a shared pool of unpinned workers (service-like)
 Pass criteria: zero deadlocks (any log line mentioning "deadlock"), zero stale reports outside deliberate deaths,
-exactly one ABANDONED attempt per deliberate death, zero leaked worktrees, every run PASSED.
+exactly one ABANDONED attempt per deliberate death, zero leaked worktrees (dead workers' included), every run PASSED.
 
 Usage:  .venv/Scripts/python scripts/stress_step6.py [--diamonds N] [--chaos N] [--parallel N] [--db URL]
 Uses its own throwaway database (mas_stress_<uuid>) and temp repo/worktree roots. Exit code 0 = gate passed.
@@ -140,15 +140,12 @@ def one_run(db_url, gws, *, chaos: bool, tally: Tally, sleep=0.05):
             tally.failures.append(f"{run.id}: died={died} abandoned={ab}")
         if not chaos and ab:
             tally.failures.append(f"{run.id}: unexpected abandoned={ab}")
+        # a terminal run keeps no worktrees — the dead worker's one included (gc_run at run end, 2026-08-17); the
+        # orchestrator gc runs in the tick, and the CLI/gate gc again after the workers are joined
+        scheduler.gc_workspace(run.id, gws)
         d = gws.worktree_root / str(run.id)
-        if chaos:
-            # the dead worker's worktree is intentionally left; everything else must be gone
-            leaked = [p for p in (d.iterdir() if d.exists() else [])]
-            if len(leaked) > died:
-                tally.leaked_worktrees += len(leaked) - died
-        else:
-            if d.exists() and any(d.iterdir()):
-                tally.leaked_worktrees += 1
+        if d.exists() and any(d.iterdir()):
+            tally.leaked_worktrees += 1
     finally:
         conn.close()
 

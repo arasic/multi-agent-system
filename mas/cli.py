@@ -179,6 +179,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         stop.set()
         for t in threads:
             t.join(timeout=5)
+        scheduler.gc_workspace(run.id, ws)  # workers are gone: nothing of this run stays on disk but its bare repo
     elapsed = time.monotonic() - t0
     m = metrics.compute(conn, run.id)
     reason = f"  reason={final.verdict_reason}" if final.verdict_reason else ""
@@ -227,7 +228,8 @@ def _print_metrics(m: metrics.RunMetrics) -> None:
         f"max_concurrent={m.max_concurrent_attempts}  parallelism_eff={m.parallelism_efficiency}\n"
         f"  total={m.total_s}s  machine={m.machine_s}s  human_wait={m.human_wait_s}s  questions={m.questions}"
         f"  replans={m.replans_used}\n"
-        f"  tokens in/out={m.input_tokens}/{m.output_tokens} cost=${m.cost_usd}  events={m.events}"
+        f"  tokens in/out={m.input_tokens}/{m.output_tokens} cost=${m.cost_usd}  events={m.events}\n"
+        f"  budget used: tokens={m.tokens_used}/{m.max_tokens} (attempts + planner)  cost=${m.cost_used_usd}/{m.max_cost_usd}"
     )
     for k, v in m.per_task.items():
         print(f"    {k:14s} {v['status']:10s} attempts={v['attempts']} {v['seconds']:.2f}s workers={v['workers']}")

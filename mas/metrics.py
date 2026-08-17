@@ -17,6 +17,10 @@ class RunMetrics:
     verdict: str | None
     verdict_reason: str | None  # ADR-008 §6 reason code for non-passing terminal runs
     replans_used: int  # bounded repair cycles taken (13-lite)
+    tokens_used: int  # the run's hard budget counter (attempt settlements + planner rounds)
+    max_tokens: int
+    cost_used_usd: float
+    max_cost_usd: float
     wall_clock_s: float | None  # started_at → finished_at (execution phase)
     total_s: float | None  # created_at → finished_at (includes planning and any human wait)
     human_wait_s: float  # time spent AWAITING_INPUT (ADR-006) — reported separately so comparisons aren't confounded
@@ -133,6 +137,10 @@ def compute(conn: Conn, run_id: UUID) -> RunMetrics:
         verdict=run.verdict,
         verdict_reason=run.verdict_reason,
         replans_used=run.replans_used,
+        tokens_used=run.tokens_used,
+        max_tokens=run.budgets.max_tokens,
+        cost_used_usd=round(float(run.cost_used_usd), 6),
+        max_cost_usd=float(run.budgets.max_cost_usd),
         wall_clock_s=round(wall, 3) if wall is not None else None,
         total_s=round(total, 3) if total is not None else None,
         human_wait_s=round(human_wait, 3),

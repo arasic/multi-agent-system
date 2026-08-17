@@ -184,6 +184,7 @@ class Worker:
             lease_s=self.lease_s,
             run_id=self.run_id,
             pools=self.pools,
+            token_ceiling=self.attempt_max_tokens,  # optional worker-side ceiling; the run's allocation applies anyway
         )
         if claim is None:
             return False
@@ -198,16 +199,18 @@ class Worker:
 
     def _metered(self, claim: Claim, *, cancel: threading.Event, deadline: float) -> MeteredProvider | None:
         """The model handed to the agent for this attempt: telemetry to model_calls on the worker's own connection
-        (idle while the agent runs; the heartbeat has its own), priced from config, bounded by the per-attempt budget
-        AND by what is left of the run's token budget (a run that is nearly out of tokens gets short attempts), and by
-        the attempt's deadline / cancel event: no model call — including provider retries — outlives the attempt."""
+        (idle while the agent runs; the heartbeat has its own), priced from config, bounded by the attempt's **reserved
+        token allocation** (claimed from the run's unreserved budget — concurrent attempts can never jointly exceed
+        what the run has left, overshoot ≤ one call each) and by the attempt's deadline / cancel event: no model call —
+        including provider retries — outlives the attempt."""
         if self.provider is None:
             return None
-        remaining_run = max(0, claim.run.budgets.max_tokens - claim.run.tokens_used)
-        alloc = min(claim.run.budgets.max_attempt_tokens, remaining_run)  # the run's per-attempt allocation (rule 8 unit)
-        if self.attempt_max_tokens is not None:
-            alloc = min(alloc, self.attempt_max_tokens)
-        budget = CallBudget(max_calls=self.attempt_max_calls, max_tokens=alloc)
+        alloc = claim.attempt.token_allocation
+        if alloc is None:  # attempt claimed before migration 0008: fall back to the unreserved-at-claim view
+            alloc = min(claim.run.budgets.max_attempt_tokens, max(0, claim.run.budgets.max_tokens - claim.run.tokens_used))
+            if self.attempt_max_tokens is not None:
+                alloc = min(alloc, self.attempt_max_tokens)
+        budget = CallBudget(max_calls=self.attempt_max_calls, max_tokens=int(alloc))
         return MeteredProvider(
             self.provider,
             sink=DbSink(self.conn, self._telemetry_lock),

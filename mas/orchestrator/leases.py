@@ -56,8 +56,13 @@ def claim_task(
     run_id: UUID | None = None,
     pools: list[str] | tuple[str, ...] | None = None,
     scan_limit: int = 8,
+    token_ceiling: int | None = None,
 ) -> Claim | None:
-    """Atomically claim one READY task this worker can do, respecting the run's max_concurrency.
+    """Atomically claim one READY task this worker can do, respecting the run's max_concurrency, and **reserve** the
+    attempt's token allocation from the run's unreserved budget (I-4, hard total budget): allocation =
+    min(run.max_attempt_tokens, token_ceiling, max_tokens - tokens_used - Σ allocations of RUNNING attempts), never
+    below 0. Reserved tokens are simply the RUNNING attempts' allocations — settlement moves an attempt out of RUNNING
+    and its actual usage into tokens_used, so nothing is released by hand and no counter can drift.
 
     `run_id` pins the worker to one run; `pools` restricts it to runs in those pools; None = any.
     """
@@ -104,13 +109,14 @@ def claim_task(
                 continue  # someone else took it (or it moved on) between scan and lock
             n = conn.execute("SELECT count(*) AS n FROM attempts WHERE task_id = %s", (row["id"],)).fetchone()["n"]  # type: ignore[index]
             lease = lease_s if lease_s is not None else run_row["lease_s"]
+            allocation = reserve_allocation(conn, run_row, token_ceiling)
             att_row = conn.execute(
                 """
-                INSERT INTO attempts (task_id, attempt_number, status, worker_id, lease_until)
-                VALUES (%s, %s, 'RUNNING', %s, now() + make_interval(secs => %s))
+                INSERT INTO attempts (task_id, attempt_number, status, worker_id, lease_until, token_allocation)
+                VALUES (%s, %s, 'RUNNING', %s, now() + make_interval(secs => %s), %s)
                 RETURNING *
                 """,
-                (row["id"], n + 1, worker_id, lease),
+                (row["id"], n + 1, worker_id, lease, allocation),
             ).fetchone()
             assert att_row is not None
             task = sm.transition_task(conn, row["id"], TaskStatus.RUNNING, attempt_id=att_row["id"], worker_id=worker_id)
@@ -121,10 +127,32 @@ def claim_task(
                 task_id=row["id"],
                 attempt_id=att_row["id"],
                 worker_id=worker_id,
-                payload={"key": row["key"], "attempt_number": n + 1, "lease_s": lease},
+                payload={"key": row["key"], "attempt_number": n + 1, "lease_s": lease, "token_allocation": allocation},
             )
             return Claim(run=Run.from_row(run_row), task=task, attempt=Attempt.from_row(att_row))
     return None
+
+
+def reserved_tokens(conn: Conn, run_id: UUID) -> int:
+    """Tokens currently reserved by the run's RUNNING attempts (their allocations)."""
+    row = conn.execute(
+        """
+        SELECT coalesce(sum(a.token_allocation), 0) AS reserved
+        FROM attempts a JOIN tasks t ON t.id = a.task_id
+        WHERE t.run_id = %s AND a.status = 'RUNNING'
+        """,
+        (run_id,),
+    ).fetchone()
+    return int(row["reserved"] or 0)  # type: ignore[index]
+
+
+def reserve_allocation(conn: Conn, run_row: dict[str, Any], token_ceiling: int | None) -> int:
+    """The token allocation for a new attempt of this run (caller holds the run lock — claims serialize per run)."""
+    want = int(run_row["max_attempt_tokens"])
+    if token_ceiling is not None:
+        want = min(want, int(token_ceiling))
+    free = int(run_row["max_tokens"]) - int(run_row["tokens_used"]) - reserved_tokens(conn, run_row["id"])
+    return max(0, min(want, free))
 
 
 def heartbeat(conn: Conn, attempt_id: UUID, lease_s: int) -> bool:
@@ -139,10 +167,29 @@ def heartbeat(conn: Conn, attempt_id: UUID, lease_s: int) -> bool:
     return row is not None
 
 
+def telemetry_usage(conn: Conn, attempt_id: UUID) -> dict[str, Any] | None:
+    """What an attempt spent according to the meter's rows (written call by call, so present even when the worker died
+    without reporting). The reaper settles this into the attempt and the run — a hard total budget counts dead
+    attempts' spend too. In-flight calls that finish after settlement stay evidence only (overshoot ≤ one call)."""
+    row = conn.execute(
+        """
+        SELECT coalesce(sum(input_tokens), 0) AS i, coalesce(sum(output_tokens), 0) AS o,
+               coalesce(sum(cost_usd), 0) AS c, count(*) AS n, min(model) AS model
+        FROM model_calls WHERE attempt_id = %s
+        """,
+        (attempt_id,),
+    ).fetchone()
+    if row is None or int(row["n"]) == 0:
+        return None
+    return {"model": row["model"], "input_tokens": int(row["i"]), "output_tokens": int(row["o"]), "cost_usd": float(row["c"])}
+
+
 def reap_expired(conn: Conn, run_id: UUID | None = None) -> list[tuple[UUID, AttemptStatus]]:
     """Settle attempts whose lease expired (ABANDONED) or whose runtime exceeded the run limit (TIMEOUT).
 
-    Unlocked scan, then per attempt one transaction locking task → attempt (SKIP LOCKED) and re-checking the condition.
+    Unlocked scan, then per attempt one transaction in lock order run → task → attempt (task/attempt SKIP LOCKED),
+    re-checking the condition. The run lock comes first because settlement charges the dead attempt's metered spend
+    to the run (`telemetry_usage`); a reaper that touched `runs` after locking a task would reverse the lock order.
     """
     settled: list[tuple[UUID, AttemptStatus]] = []
     params: list[Any] = []
@@ -152,7 +199,7 @@ def reap_expired(conn: Conn, run_id: UUID | None = None) -> list[tuple[UUID, Att
         params.append(run_id)
     rows = conn.execute(
         f"""
-        SELECT a.id, a.task_id
+        SELECT a.id, a.task_id, t.run_id
         FROM attempts a
         JOIN tasks t ON t.id = a.task_id
         JOIN runs r ON r.id = t.run_id
@@ -163,6 +210,7 @@ def reap_expired(conn: Conn, run_id: UUID | None = None) -> list[tuple[UUID, Att
     ).fetchall()
     for r in rows:
         with conn.transaction():
+            sm.lock_run(conn, r["run_id"])
             if sm.lock_task(conn, r["task_id"], skip_locked=True) is None:
                 continue
             a = conn.execute(
@@ -177,11 +225,14 @@ def reap_expired(conn: Conn, run_id: UUID | None = None) -> list[tuple[UUID, Att
             ).fetchone()
             if a is None or a["status"] != "RUNNING" or not (a["lease_expired"] or a["timed_out"]):
                 continue  # settled or heartbeat renewed in the meantime
+            usage = telemetry_usage(conn, r["id"])  # the dead/hung attempt's metered spend counts against the run
             if a["timed_out"]:
-                sm.settle_failed_attempt(conn, r["id"], AttemptStatus.TIMEOUT, reason="attempt runtime exceeded")
+                sm.settle_failed_attempt(conn, r["id"], AttemptStatus.TIMEOUT, reason="attempt runtime exceeded", usage=usage)
                 settled.append((r["id"], AttemptStatus.TIMEOUT))
             else:
-                sm.settle_failed_attempt(conn, r["id"], AttemptStatus.ABANDONED, reason="lease expired (worker presumed dead)")
+                sm.settle_failed_attempt(
+                    conn, r["id"], AttemptStatus.ABANDONED, reason="lease expired (worker presumed dead)", usage=usage
+                )
                 settled.append((r["id"], AttemptStatus.ABANDONED))
     return settled
 
