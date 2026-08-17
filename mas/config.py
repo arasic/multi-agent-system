@@ -56,10 +56,13 @@ class Settings:
     gateway_token: str = field(default_factory=lambda: _env("MAS_GATEWAY_TOKEN", ""))
     gateway_listen: str = field(default_factory=lambda: _env("MAS_GATEWAY_LISTEN", "0.0.0.0:8080"))
     gateway_max_body: int = field(default_factory=lambda: int(_env("MAS_GATEWAY_MAX_BODY", "2000000")))
-    # Per-attempt call budget enforced by the metered provider (bounded loops, antipatterns E1); the run's remaining
-    # token budget caps it further.
+    # Per-attempt call budget enforced by the metered provider (bounded loops, antipatterns E1). Tokens per attempt are
+    # a *run* budget (budgets.max_attempt_tokens, validator rule 8); MAS_ATTEMPT_MAX_TOKENS is an optional worker-side
+    # ceiling on top of it (unset = the run's allocation alone).
     attempt_max_calls: int = field(default_factory=lambda: int(_env("MAS_ATTEMPT_MAX_CALLS", "40")))
-    attempt_max_tokens: int = field(default_factory=lambda: int(_env("MAS_ATTEMPT_MAX_TOKENS", "300000")))
+    attempt_max_tokens: int | None = field(
+        default_factory=lambda: int(_env("MAS_ATTEMPT_MAX_TOKENS", "")) if _env("MAS_ATTEMPT_MAX_TOKENS", "") else None
+    )
     # Execution sandbox for command tools (step 10): one hardened container per attempt (mas/workers/execution.py).
     # Default image = the verifier image (python + pytest + sh + coreutils timeout, non-root). Workers without Docker
     # get NO command tools (fail closed) until the execution-runner service exists.

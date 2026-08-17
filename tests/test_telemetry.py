@@ -167,7 +167,8 @@ def test_run_token_budget_caps_the_attempt_budget(conn):
     """A run that is nearly out of tokens gets attempts bounded by what is left. Token usage is only known after a response,
     so the call that crosses the line completes (overshoot ≤ one call); the next call is refused and the run then aborts."""
     provider = FakeProvider("x", input_tokens=40, output_tokens=10)  # 50 tokens per call
-    run_budgets = default_budgets(max_tokens=100_000, max_attempts_per_task=1)
+    # coherent budgets (rule 8): 5 tasks x 10k allocation fits 100k; the worker-side ceiling below matches it
+    run_budgets = default_budgets(max_tokens=100_000, max_attempt_tokens=10_000, max_attempts_per_task=1)
     dag = diamond()
     run = runs_mod.create_run_from_dag(conn, dag, budgets=run_budgets, capabilities=set(CAPS))
     conn.execute("UPDATE runs SET tokens_used = %s WHERE id = %s", (100_000 - 120, run.id))  # 120 tokens left

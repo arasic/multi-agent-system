@@ -341,3 +341,80 @@ def test_fake_planner_double_and_orchestrator_tick_drive_the_gate(conn, tmp_path
     assert [r["role"] for r in rows] == ["planner", "planner"] and all(r["status"] == "ok" for r in rows)
     m = metrics.compute(conn, run.id)
     assert m.per_model and any(k.endswith("/planner") for k in m.per_model)
+
+
+# ----------------------------------------------------------------------------- rule 8 through the driver
+
+
+def _wide_dag_json(n: int, **over):
+    tasks = [
+        {
+            "id": f"T{i}",
+            "capability": "implementation",
+            "goal": f"part {i}",
+            "depends_on": [],
+            "output_contract": {"artifacts": ["git_commit"]},
+        }
+        for i in range(1, n + 1)
+    ]
+    return _dag_json(tasks=tasks, **over)
+
+
+def test_rule8_rejections_return_to_the_planner_as_data_then_a_fitting_plan_installs(conn):
+    """The run can fund 4 attempts (400k / 100k); a 6-task plan (+ auto integration = 7) is rejected with the allocation
+    arithmetic as data, the planner shrinks it, the 3-task plan (+ integration = 4) installs."""
+    b = default_budgets(max_tokens=400_000, max_attempt_tokens=100_000)
+    run = runs_mod.create_run(conn, goal="benchmark run", benchmark="url_shortener", budgets=b)
+    planner, _, inner = _planner([_wide_dag_json(6), _wide_dag_json(3)])
+    r = runs_mod.plan_run(conn, run.id, planner, capabilities=set(CAPS))
+    assert r.status is RunStatus.RUNNING, r.verdict
+    retry_brief = inner.calls[1]["messages"][1]["content"]
+    want = "[8] 7 open tasks x max_attempt_tokens 100000 = 700000 tokens needed, 400000 remain: at most 4 new tasks fit"
+    assert want in retry_brief
+    assert '"max_attempt_tokens": 100000' in retry_brief  # the allocation unit is in the planner's budget brief
+    evs = [e for e in __import__("mas.db.events", fromlist=["for_run"]).for_run(conn, run.id) if e.type == "plan.rejected"]
+    assert len(evs) == 1 and evs[0].payload["errors"][0].startswith("[8]")
+    assert len(sm.tasks_for_run(conn, run.id)) == 4
+
+
+def test_rule8_estimates_above_the_allocation_and_exhausted_budgets_end_in_a_verdict(conn):
+    run = runs_mod.create_run(
+        conn,
+        goal="benchmark run",
+        benchmark="url_shortener",
+        budgets=default_budgets(max_tokens=400_000, max_attempt_tokens=100_000, max_plan_attempts=2),
+    )
+    tasks = json.loads(_wide_dag_json(2))["tasks"]
+    tasks[0]["estimate"] = {"tokens": 150_000, "seconds": 5}  # more than one attempt can ever get
+    planner, _, inner = _planner([_dag_json(tasks=tasks), _dag_json(tasks=tasks)])
+    r = runs_mod.plan_run(conn, run.id, planner, capabilities=set(CAPS))
+    assert r.status is RunStatus.FAILED and "[8]" in (r.verdict or "") and "cannot finish within one attempt" in r.verdict
+    assert "estimate.tokens 150000 exceeds the per-attempt allocation" in inner.calls[1]["messages"][1]["content"]
+    # a run whose token budget is already spent cannot install any plan: verdict, no tasks. (With the LLM planner the
+    # metered planner call itself is refused first - also a verdict; the stub planner shows rule 8 doing it.)
+    from mas.planner.planner import StubPlanner
+
+    spent = default_budgets(max_tokens=1000, max_plan_attempts=1)
+    run2 = runs_mod.create_run(conn, goal="x", benchmark="url_shortener", budgets=spent)
+    with conn.transaction():
+        conn.execute("UPDATE runs SET tokens_used = 1000 WHERE id = %s", (run2.id,))
+    r2 = runs_mod.plan_run(conn, run2.id, StubPlanner(DagSpec.from_dict(json.loads(_wide_dag_json(1)))), capabilities=set(CAPS))
+    assert r2.status is RunStatus.FAILED and "0 remain" in (r2.verdict or "") and sm.tasks_for_run(conn, run2.id) == []
+    planner3, _, _ = _planner([_wide_dag_json(1)])
+    run3 = runs_mod.create_run(conn, goal="x", benchmark="url_shortener", budgets=spent)
+    with conn.transaction():
+        conn.execute("UPDATE runs SET tokens_used = 1000 WHERE id = %s", (run3.id,))
+    r3 = runs_mod.plan_run(conn, run3.id, planner3, capabilities=set(CAPS))
+    assert r3.status is RunStatus.FAILED and "AttemptBudgetExceeded" in (r3.verdict or "")
+
+
+def test_rule8_file_dags_are_checked_against_the_run_at_install(conn):
+    """`mas run --dag` goes through install_dag -> the same allocation check; an unfundable plan is a FAILED verdict."""
+    dag = DagSpec.from_dict(json.loads(_wide_dag_json(6)))
+    with pytest.raises(runs_mod.InvalidDag) as ei:
+        runs_mod.create_run_from_dag(
+            conn, dag, budgets=default_budgets(max_tokens=400_000, max_attempt_tokens=100_000), capabilities=set(CAPS)
+        )
+    assert "[8]" in str(ei.value)
+    row = conn.execute("SELECT status, verdict FROM runs ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert row["status"] == "FAILED" and "[8]" in row["verdict"]

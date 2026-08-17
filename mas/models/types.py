@@ -23,6 +23,9 @@ class Budgets:
     max_cost_usd: float = 20.0
     max_wallclock_s: int = 3600
     max_attempt_runtime_s: int = 600
+    # Per-attempt token allocation: what the meter hands every attempt (capped by what the run has left). Also the
+    # unit of validator rule 8 — a plan is admissible only if the run can fund one such attempt for every open task.
+    max_attempt_tokens: int = 200_000
     lease_s: int = 30
     max_questions: int = 3  # clarifying-question batches the planner may ask (ADR-006)
     deadline_at: datetime | None = None
@@ -68,6 +71,7 @@ class Run:
                 max_cost_usd=float(r["max_cost_usd"]),
                 max_wallclock_s=r["max_wallclock_s"],
                 max_attempt_runtime_s=r["max_attempt_runtime_s"],
+                max_attempt_tokens=r.get("max_attempt_tokens", 200_000),
                 lease_s=r["lease_s"],
                 max_questions=r.get("max_questions", 3),
                 deadline_at=r.get("deadline_at"),

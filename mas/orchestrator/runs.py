@@ -19,7 +19,7 @@ from mas.planner import contracts as contract_mod
 from mas.planner.capabilities import DEFAULT_CAPABILITY_TOOLS
 from mas.planner.dag import QA, ContractProposal, DagSpec, Questions
 from mas.planner.planner import Planner, PlanRequest
-from mas.planner.validator import ValidationResult, validate
+from mas.planner.validator import Remaining, ValidationResult, validate
 
 
 class InvalidDag(Exception):
@@ -48,8 +48,9 @@ def create_run(
             """
             INSERT INTO runs (goal, benchmark, config, base_ref, pool,
                 max_concurrency, max_tasks, max_attempts_per_task, max_replans, max_plan_attempts,
-                max_tokens, max_cost_usd, max_wallclock_s, max_attempt_runtime_s, lease_s, max_questions, deadline_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                max_tokens, max_cost_usd, max_wallclock_s, max_attempt_runtime_s, max_attempt_tokens, lease_s,
+                max_questions, deadline_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
@@ -67,6 +68,7 @@ def create_run(
                 b.max_cost_usd,
                 b.max_wallclock_s,
                 b.max_attempt_runtime_s,
+                b.max_attempt_tokens,
                 b.lease_s,
                 b.max_questions,
                 b.deadline_at,
@@ -88,6 +90,36 @@ def create_run(
     return Run.from_row(row)
 
 
+def remaining_budget(conn: Conn, run: Run) -> Remaining:
+    """What the run has left right now, measured by the driver for validator rule 8 (budget allocation): tokens, cost,
+    wall-clock (one clock from creation, I-4), the existing tasks that still need funding, and this run's observed mean
+    attempt duration (the only per-attempt time figure the system owns; None until an attempt has settled)."""
+    row = conn.execute(
+        """
+        SELECT extract(epoch from (now() - %s)) AS elapsed,
+               (SELECT count(*) FROM tasks t WHERE t.run_id = %s
+                  AND t.status NOT IN ('COMPLETED', 'FAILED', 'BLOCKED', 'CANCELLED')) AS open_tasks,
+               (SELECT avg(extract(epoch from (a.finished_at - a.started_at)))
+                  FROM attempts a JOIN tasks t ON t.id = a.task_id
+                 WHERE t.run_id = %s AND a.status <> 'RUNNING' AND a.finished_at IS NOT NULL) AS observed_s
+        """,
+        (run.created_at, run.id, run.id),
+    ).fetchone()
+    assert row is not None
+    b = run.budgets
+    wall = float(b.max_wallclock_s) - float(row["elapsed"] or 0.0) if run.created_at is not None else float(b.max_wallclock_s)
+    if b.deadline_at is not None:
+        left = conn.execute("SELECT extract(epoch from (%s - now())) AS s", (b.deadline_at,)).fetchone()
+        wall = min(wall, float(left["s"]))  # type: ignore[index]
+    return Remaining(
+        tokens=b.max_tokens - run.tokens_used,
+        wallclock_s=wall,
+        cost_usd=float(b.max_cost_usd) - float(run.cost_used_usd),
+        open_tasks=int(row["open_tasks"] or 0),
+        observed_attempt_s=float(row["observed_s"]) if row["observed_s"] is not None else None,
+    )
+
+
 def install_dag(
     conn: Conn,
     run_id: UUID,
@@ -107,7 +139,13 @@ def install_dag(
         if run.status is RunStatus.CREATED:
             sm.transition_run(conn, run_id, RunStatus.PLANNING)
         existing = conn.execute("SELECT count(*) AS n FROM tasks WHERE run_id = %s", (run_id,)).fetchone()["n"]  # type: ignore[index]
-        result = validate(dag, budgets=run.budgets, capabilities=capabilities, existing_task_count=existing)
+        result = validate(
+            dag,
+            budgets=run.budgets,
+            capabilities=capabilities,
+            existing_task_count=existing,
+            remaining=remaining_budget(conn, run),
+        )
         emit(
             conn,
             run_id,
@@ -317,6 +355,9 @@ def _plan_request(conn: Conn, run: Run, capabilities: set[str], *, plan_attempt:
             "plan_attempts": run.budgets.max_plan_attempts - plan_attempt + 1,
             "max_concurrency": run.budgets.max_concurrency,
             "max_attempts_per_task": run.budgets.max_attempts_per_task,
+            "max_attempt_tokens": run.budgets.max_attempt_tokens,
+            "max_attempt_runtime_s": run.budgets.max_attempt_runtime_s,
+            "wallclock_s": int(remaining_s) if remaining_s is not None else None,
         },
         plan_attempt=plan_attempt,
         validation_errors=errors,
@@ -335,7 +376,7 @@ def plan_run(conn: Conn, run_id: UUID, planner: Planner, *, capabilities: set[st
     Deterministic driver (ADR-001). Exactly one of the planner's typed outcomes is acted on per call:
       questions  → `ask_questions` (AWAITING_INPUT), the human answers with `mas answer`
       contract   → only for an ad-hoc goal without a frozen contract: validated, recorded, AWAITING_INPUT for approval
-      dag        → validated (rules 1–7 + shape) and installed → RUNNING; a DAG before the contract is frozen is rejected
+      dag        → validated (rules 1–8, 10 + shape) and installed → RUNNING; a DAG before the contract is frozen is rejected
     Anything invalid is returned to the planner with the errors; when the plan-attempt budget is gone the run FAILS
     with a verdict. Call when the run is CREATED/PLANNING; idempotent on other states.
     """
@@ -382,7 +423,8 @@ def plan_run(conn: Conn, run_id: UUID, planner: Planner, *, capabilities: set[st
             continue
         with conn.transaction():
             existing = conn.execute("SELECT count(*) AS n FROM tasks WHERE run_id = %s", (run_id,)).fetchone()["n"]  # type: ignore[index]
-        result = validate(out, budgets=run.budgets, capabilities=capabilities, existing_task_count=existing)
+            remaining = remaining_budget(conn, run)
+        result = validate(out, budgets=run.budgets, capabilities=capabilities, existing_task_count=existing, remaining=remaining)
         if not result.ok:
             errors = tuple(str(e) for e in result.errors)
             last = "; ".join(errors)

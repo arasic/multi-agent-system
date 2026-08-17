@@ -96,6 +96,8 @@ runs
   max_cost_usd          numeric
   max_wallclock_s       int
   max_attempt_runtime_s int         -- per-attempt runtime → TIMEOUT via reaper
+  max_attempt_tokens    int         -- per-attempt token allocation: the meter hands each attempt min(this, run remaining);
+                                    -- validator rule 8 unit (one funded attempt per open task)
   lease_s               int         -- default lease length for attempts (heartbeat extends)
   max_questions         int         -- clarifying-question batches the planner may ask (ADR-006)
   deadline_at           timestamptz
@@ -300,7 +302,7 @@ for attempt in RUNNING where lease_until < now():
 
 Killing a worker mid-task is a **standard demo**, not an edge case: lease expires → attempt `ABANDONED` → task back to `READY` → another worker claims it → the run continues. Artifacts published by the dead attempt persist as hints.
 
-Per-attempt limits: `max_runtime_s`, `max_tokens`. Exceeding runtime → `TIMEOUT`.
+Per-attempt limits: `max_attempt_runtime_s`, `max_attempt_tokens` (both run budgets). Exceeding runtime → `TIMEOUT`; the token allocation is what the meter hands the attempt (`min(max_attempt_tokens, tokens the run has left)`, further capped by an optional worker-side ceiling `MAS_ATTEMPT_MAX_TOKENS`).
 
 ---
 
@@ -373,7 +375,7 @@ Per-attempt limits: `max_runtime_s`, `max_tokens`. Exceeding runtime → `TIMEOU
 6. there is not exactly one `integration` sink (orchestrator may auto-append; validator re-checks)
 7. task count exceeds `max_tasks` (cumulative across re-plans), or a task's `max_attempts` override lies outside `[1, max_attempts_per_task]` (no bypassing the retry budget)
 10. `context_spec.artifacts_from` names a task that is not a (transitive) dependency — a task may not read what it does not depend on
-8. estimated cost exceeds remaining budget
+8. **budget allocation** — the plan must fit what the run has left, measured by the driver (`runs.remaining_budget`), never by planner estimates: (a) *tokens:* every open task (this plan's tasks incl. the auto-appended integration sink, plus existing non-terminal tasks on a re-plan) must be fundable for one attempt at the run's per-attempt allocation — `open_tasks × max_attempt_tokens ≤ remaining tokens`. This is the allocation the meter actually hands out, so the run can honor it; the rejection names how many tasks would fit. (b) *wall-clock:* there is no per-attempt time allocation (the runtime cap is a timeout), so time is checked from what is *known*: this run's observed mean attempt duration (present on re-plans) and the planner's optional per-task `estimate.seconds`, which may only tighten — weighted critical path ≤ remaining wall-clock, total work / `max_concurrency` ≤ remaining wall-clock, remaining wall-clock > 0. (c) *estimates:* an optional `estimate: {"tokens", "seconds"}` per task is validated; an estimate above `max_attempt_tokens` / `max_attempt_runtime_s` means the task cannot finish within one attempt → rejected ("split it"). (d) *cost:* no price model in the validator (model names never reach it); `max_cost_usd` is enforced at run time; only an already-exhausted cost budget rejects at plan time. Rejections carry the arithmetic so the planner can shrink the plan; hand-written DAG files (`mas run --dag`) get the same check at install.
 9. an amendment would exceed `max_replans`, or removes/alters a task that is `COMPLETED`
 
 Rejection → planner retried with the validation errors, up to `max_plan_attempts`; then run `FAILED`.
@@ -398,7 +400,7 @@ The deterministic driver `runs.plan_run` decides: **questions** → `AWAITING_IN
 
 ## 9. Budgets and termination
 
-Hard limits per run: `max_tokens`, `max_cost_usd`, `max_wallclock_s / deadline_at`, `max_tasks`, `max_attempts_per_task`, `max_replans`, `max_plan_attempts`, `max_concurrency`. Per attempt: `max_runtime_s`, `max_tokens`.
+Hard limits per run: `max_tokens`, `max_cost_usd`, `max_wallclock_s / deadline_at`, `max_tasks`, `max_attempts_per_task`, `max_replans`, `max_plan_attempts`, `max_concurrency`. Per attempt (also run budgets): `max_attempt_runtime_s`, `max_attempt_tokens`. Budgets must be coherent: rule 8 admits a plan only if `max_tokens` can fund one `max_attempt_tokens` attempt per open task (defaults 2 M / 200 k → up to 10 tasks).
 
 The orchestrator checks budgets on every transition and on a timer. Exceeding any → run `ABORTED:<reason>`, live attempts `CANCELLED`, non-terminal tasks `CANCELLED`. **No run ends without a verdict.**
 
@@ -432,7 +434,7 @@ An agent acts on the world only through `mas/workers/tools.py`, constructed per 
 
 **Concrete providers** (`mas/providers/`, the *only* package that may name a vendor): `anthropic` (official SDK; adaptive thinking, optional `effort`, streaming for large outputs, `refusal` surfaced as a stop reason, `temperature` deliberately not forwarded), `openai` (OpenAI-compatible Chat Completions over stdlib HTTP — api.openai.com or any compatible endpoint / in-cluster gateway; retries with backoff on 429/5xx), `fake` (deterministic scripted provider for tests and key-less runs). Selection is by **spec string** in config: `MAS_MODEL_PLANNER / MAS_MODEL_WORKER / MAS_MODEL_REVIEWER = "<provider>:<model>"` (empty = the role has no model; stub agents keep working). Prices are config too: `MAS_MODEL_PRICES` JSON per model id (or id prefix), USD per 1M tokens — see [models.md](models.md).
 
-**Metering.** Agents and the planner never build providers; the runtime hands them a `MeteredProvider` (`TaskContext.model` for workers). It (1) times and prices every call, (2) writes a `model_calls` row *immediately, in its own transaction* (`DbSink`), so cost evidence survives a worker that dies mid-attempt, (3) sums usage into the attempt's settlement (`AgentResult.usage` ← the meter; agents do not self-report), and (4) enforces a **per-attempt call budget** (`MAS_ATTEMPT_MAX_CALLS`, `MAS_ATTEMPT_MAX_TOKENS`, further capped by the run's *remaining* token budget): the call-count limit is strict; token usage is accounted after each response (it is only known then), and further calls are refused with `AttemptBudgetExceeded` once the limit is reached — so an agent loop cannot run away (antipatterns E1/C4), overshoot is bounded to one completed call (itself bounded by its `max_tokens`), and settlement then trips the run budget (`ABORTED`) if the run is out of tokens. Unpriced models are never hidden: `priced=false` rows, `unpriced_calls` in metrics and an explicit `UNPRICED` marker in `mas status`; cost claims in the evaluation must rest on priced usage only.
+**Metering.** Agents and the planner never build providers; the runtime hands them a `MeteredProvider` (`TaskContext.model` for workers). It (1) times and prices every call, (2) writes a `model_calls` row *immediately, in its own transaction* (`DbSink`), so cost evidence survives a worker that dies mid-attempt, (3) sums usage into the attempt's settlement (`AgentResult.usage` ← the meter; agents do not self-report), and (4) enforces a **per-attempt call budget** (`MAS_ATTEMPT_MAX_CALLS` calls; tokens = the run's `max_attempt_tokens` allocation, capped by the run's *remaining* token budget and by an optional worker-side ceiling `MAS_ATTEMPT_MAX_TOKENS`): the call-count limit is strict; token usage is accounted after each response (it is only known then), and further calls are refused with `AttemptBudgetExceeded` once the limit is reached — so an agent loop cannot run away (antipatterns E1/C4), overshoot is bounded to one completed call (itself bounded by its `max_tokens`), and settlement then trips the run budget (`ABORTED`) if the run is out of tokens. Unpriced models are never hidden: `priced=false` rows, `unpriced_calls` in metrics and an explicit `UNPRICED` marker in `mas status`; cost claims in the evaluation must rest on priced usage only.
 
 **Deadline and cancellation.** The meter also owns the attempt's clock for model calls: before reserving a call it refuses — `AttemptCancelled` when the runtime's cancel event is set (attempt reaped/cancelled), `AttemptDeadlineExceeded` when less than a minimum viable window (`MIN_CALL_S`) remains before the attempt's runtime deadline (`max_attempt_runtime_s` from claim), `AttemptBudgetExceeded` as above; all are `AttemptEnded`, never retryable. Otherwise the provider receives `timeout_s = min(caller's, per-call cap `MAS_PROVIDER_TIMEOUT_S`, remaining runtime)`, and that budget covers the *whole* call: SDK retries are disabled and every provider retries through `call_with_retries`, which recomputes the remaining time before every request and every backoff / Retry-After sleep and fails fast when a retry cannot fit — so no request or retry outlives the attempt. Refusals are recorded in `model_calls` too (status `cancelled | deadline | budget`, zero tokens); timeouts and other failures are `error` rows with `priced=false`, because what the provider billed for a failed request is unknowable here.
 

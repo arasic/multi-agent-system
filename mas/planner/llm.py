@@ -31,7 +31,7 @@ from mas.providers.telemetry import CallBudget, MeteredProvider, Sink
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "llm-planner/v1"
+PROMPT_VERSION = "llm-planner/v2"
 
 
 @dataclass(frozen=True)
@@ -72,11 +72,15 @@ that rejected your previous output. Reply with ONE JSON object and nothing else.
 
 3. {"kind": "dag", "assumptions": ["..."], "shape": {...}, "tasks": [ {"id": "T1", "capability": "...", "goal": "...",
    "depends_on": [], "output_contract": {"artifacts": ["document:<name>" | "git_commit"]}, "context_spec": {"artifacts_from":
-   [ids], "paths": [globs]}?, "tools": [families]?, "max_attempts": n? } ]} — a task DAG that satisfies the frozen
-   contract. Rules the validator enforces: ids [A-Za-z0-9][A-Za-z0-9_.-]*, unique; depends_on names existing tasks; no
-   cycles; every task has an output_contract with artifacts; capabilities only from the registered list; tools only
-   from the capability's families; exactly one task with capability "integration" that depends on the final producers
-   (or omit it and one is appended); at most the remaining task budget; max_attempts within budget. Tasks run in
+   [ids], "paths": [globs]}?, "tools": [families]?, "max_attempts": n?, "estimate": {"tokens": n, "seconds": n}? } ]} — a
+   task DAG that satisfies the frozen contract. Rules the validator enforces: ids [A-Za-z0-9][A-Za-z0-9_.-]*, unique;
+   depends_on names existing tasks; no cycles; every task has an output_contract with artifacts; capabilities only from
+   the registered list; tools only from the capability's families; exactly one task with capability "integration" that
+   depends on the final producers (or omit it and one is appended); at most the remaining task budget; max_attempts
+   within budget. Budget allocation: the run funds one attempt of max_attempt_tokens for EVERY task (integration
+   included) — tasks x max_attempt_tokens must fit the remaining tokens, so do not over-decompose; a task's "estimate"
+   is optional and can only make the check stricter (never looser); an estimate above max_attempt_tokens or
+   max_attempt_runtime_s means the task cannot finish in one attempt and is rejected — split it. Tasks run in
    isolated worktrees and only see the artifacts named in context_spec.artifacts_from — say what each task needs.
    "shape" is advisory metadata (it never selects the execution mode): {"estimated_width": int, "dependency_density":
    0..1, "critical_path_ratio": 0..1, "overlapping_outputs": ["paths several tasks would touch"], "coupling_risk":

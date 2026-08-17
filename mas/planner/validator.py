@@ -8,7 +8,18 @@ Rules (numbering follows architecture.md):
   5  task lacks an output_contract           ✔
   6  exactly one `integration` sink          ✔ (auto-append when allowed; capability re-checked after)
   7  task count exceeds max_tasks; per-task max_attempts outside [1, max_attempts_per_task]  ✔
-  8  estimated cost exceeds remaining budget – roadmap step 12 (no cost model yet)
+  8  budget allocation: the plan must fit what the run has left  ✔ when `remaining` is provided (the driver always does)
+       tokens   — every open task (this plan's + existing non-terminal ones) must be fundable for one attempt at the
+                  run's per-attempt allocation `max_attempt_tokens`: open × allocation ≤ remaining tokens. System-owned:
+                  the meter hands exactly this allocation to attempts; planner estimates play no part.
+       time     — no per-attempt time allocation exists (the runtime cap is a timeout), so time is checked from what
+                  is *known*: this run's observed mean attempt duration (re-plans) and the planner's own per-task
+                  estimates, which may only tighten: weighted critical path ≤ remaining wall-clock and total work /
+                  max_concurrency ≤ remaining wall-clock; remaining wall-clock must be > 0.
+       estimate — optional `estimate: {"tokens": int, "seconds": number}` per task is validated; an estimate above the
+                  per-attempt allocation (tokens) or the per-attempt runtime cap (seconds) is infeasible → rejected.
+       cost     — no price model here (model names never reach the validator); the run's cost budget is enforced at
+                  run time; a plan is rejected only when the cost budget is already exhausted.
   9  amendment rules                         – roadmap step 13
   shape  ADR-008 task-shape metadata is advisory but must be well-formed (never selects the execution mode)  ✔
 Extra: duplicate ids, unsafe ids, empty DAG, blank capability.
@@ -16,9 +27,11 @@ Extra: duplicate ids, unsafe ids, empty DAG, blank capability.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from graphlib import CycleError, TopologicalSorter
+from typing import Any
 
 from mas.models.enums import INTEGRATION_CAPABILITY
 from mas.models.types import Budgets
@@ -50,6 +63,144 @@ class ValidationResult:
     @property
     def ok(self) -> bool:
         return not self.errors
+
+
+@dataclass(frozen=True)
+class Remaining:
+    """What the run has left at plan time, measured by the driver (rule 8). `None` fields are not checked — hand-written
+    DAG files validated offline have no run; the driver always supplies the full picture."""
+
+    tokens: int | None = None
+    wallclock_s: float | None = None
+    cost_usd: float | None = None
+    open_tasks: int = 0  # existing non-terminal tasks (re-plan): they still need funding alongside the new ones
+    observed_attempt_s: float | None = None  # mean duration of this run's settled attempts, None until there are any
+
+
+ESTIMATE_KEYS = {"tokens", "seconds"}
+
+
+def _num(v: Any) -> float | None:
+    if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v) or v < 0:
+        return None
+    return float(v)
+
+
+def validate_estimate(t: TaskSpec, budgets: Budgets) -> list[ValidationError]:
+    """Rule 8, per task: the planner's optional cost estimate must be well-formed and feasible within one attempt."""
+    est = t.estimate or {}
+    if not isinstance(est, dict) or "_invalid" in est:
+        return [ValidationError("8", "estimate must be an object {tokens: int, seconds: number}", t.id)]
+    errs: list[ValidationError] = []
+    unknown = sorted(set(est) - ESTIMATE_KEYS)
+    if unknown:
+        errs.append(ValidationError("8", f"unknown estimate keys {unknown}; allowed: {sorted(ESTIMATE_KEYS)}", t.id))
+    if "tokens" in est:
+        tok = _num(est["tokens"])
+        if tok is None or int(tok) != tok:
+            errs.append(ValidationError("8", "estimate.tokens must be a non-negative integer", t.id))
+        elif tok > budgets.max_attempt_tokens:
+            errs.append(
+                ValidationError(
+                    "8",
+                    f"estimate.tokens {int(tok)} exceeds the per-attempt allocation max_attempt_tokens="
+                    f"{budgets.max_attempt_tokens}: the task cannot finish within one attempt - split it",
+                    t.id,
+                )
+            )
+    if "seconds" in est:
+        sec = _num(est["seconds"])
+        if sec is None:
+            errs.append(ValidationError("8", "estimate.seconds must be a non-negative number", t.id))
+        elif sec > budgets.max_attempt_runtime_s:
+            errs.append(
+                ValidationError(
+                    "8",
+                    f"estimate.seconds {sec:g} exceeds max_attempt_runtime_s={budgets.max_attempt_runtime_s}: "
+                    "the task cannot finish within one attempt - split it",
+                    t.id,
+                )
+            )
+    return errs
+
+
+def estimated_seconds(t: TaskSpec) -> float:
+    return _num((t.estimate or {}).get("seconds")) or 0.0
+
+
+def critical_path_s(tasks: list[TaskSpec], weight: dict[str, float]) -> tuple[float, list[str]]:
+    """Longest weighted dependency chain (seconds, task ids). Assumes the graph is acyclic (rule 1 ran first)."""
+    idset = {t.id for t in tasks}
+    deps = {t.id: [d for d in t.depends_on if d in idset] for t in tasks}
+    order = list(TopologicalSorter(deps).static_order())
+    best: dict[str, float] = {}
+    prev: dict[str, str | None] = {}
+    for tid in order:
+        pick: str | None = None
+        pick_w = -1.0
+        for d in deps[tid]:
+            if best.get(d, 0.0) > pick_w:
+                pick, pick_w = d, best.get(d, 0.0)
+        best[tid] = max(pick_w, 0.0) + weight.get(tid, 0.0)
+        prev[tid] = pick
+    if not best:
+        return 0.0, []
+    end = max(best, key=lambda k: (best[k], k))
+    path: list[str] = []
+    cur: str | None = end
+    while cur is not None:
+        path.append(cur)
+        cur = prev[cur]
+    return best[end], list(reversed(path))
+
+
+def validate_budget(tasks: list[TaskSpec], budgets: Budgets, remaining: Remaining, *, acyclic: bool) -> list[ValidationError]:
+    """Rule 8 - deterministic budget allocation (see module docstring). No planner estimate can loosen this check."""
+    errs: list[ValidationError] = []
+    for t in tasks:
+        errs.extend(validate_estimate(t, budgets))
+    # tokens: one attempt at the run's per-attempt allocation for every open task
+    if remaining.tokens is not None:
+        open_n = remaining.open_tasks + len(tasks)
+        need = open_n * budgets.max_attempt_tokens
+        if need > remaining.tokens:
+            fit = max(0, remaining.tokens // max(1, budgets.max_attempt_tokens) - remaining.open_tasks)
+            errs.append(
+                ValidationError(
+                    "8",
+                    f"{open_n} open tasks x max_attempt_tokens {budgets.max_attempt_tokens} = {need} tokens needed, "
+                    f"{remaining.tokens} remain: at most {fit} new tasks fit (or lower the per-attempt allocation)",
+                )
+            )
+    # cost: no price model here; reject only when the run's cost budget is already gone
+    if remaining.cost_usd is not None and remaining.cost_usd <= 0:
+        errs.append(ValidationError("8", f"cost budget exhausted ({remaining.cost_usd:.4f} USD remain)"))
+    # time: known lower bounds only - observed attempt duration in this run, planner estimates (tighten only)
+    if remaining.wallclock_s is not None:
+        if remaining.wallclock_s <= 0:
+            errs.append(ValidationError("8", "no wall-clock left"))
+        elif acyclic:
+            floor = float(remaining.observed_attempt_s or 0.0)
+            weight = {t.id: max(floor, estimated_seconds(t)) for t in tasks}
+            total = sum(weight.values())
+            path_s, path = critical_path_s(tasks, weight)
+            basis = f"observed mean attempt {floor:.1f}s" if floor else "planner estimates"
+            if path_s > remaining.wallclock_s:
+                errs.append(
+                    ValidationError(
+                        "8",
+                        f"critical path {path} needs at least {path_s:.0f}s ({basis}) but {remaining.wallclock_s:.0f}s remain",
+                    )
+                )
+            elif total / max(1, budgets.max_concurrency) > remaining.wallclock_s:
+                errs.append(
+                    ValidationError(
+                        "8",
+                        f"{len(tasks)} tasks need at least {total:.0f}s of work ({basis}) over max_concurrency "
+                        f"{budgets.max_concurrency} but {remaining.wallclock_s:.0f}s remain",
+                    )
+                )
+    return errs
 
 
 SHAPE_MODES = ("single_agent", "sequential_workflow", "parallel_centralized_mas")
@@ -107,6 +258,7 @@ def validate(
     existing_task_count: int = 0,
     auto_integration: bool = True,
     tool_registry: ToolRegistry | None = None,
+    remaining: Remaining | None = None,
 ) -> ValidationResult:
     budgets = budgets or Budgets()
     errors: list[ValidationError] = []
@@ -151,9 +303,11 @@ def validate(
             )
 
     # 1 — cycle
+    acyclic = True
     try:
         TopologicalSorter({t.id: [d for d in t.depends_on if d in idset] for t in tasks}).prepare()
     except CycleError as e:
+        acyclic = False
         errors.append(ValidationError("1", f"DAG has a cycle: {e.args[1] if len(e.args) > 1 else ''}"))
 
     # 6 — exactly one integration sink
@@ -247,6 +401,13 @@ def validate(
     total = existing_task_count + len(tasks)
     if total > budgets.max_tasks:
         errors.append(ValidationError("7", f"task count {total} exceeds max_tasks {budgets.max_tasks}"))
+
+    # 8 — budget allocation (after auto-integration: the synthesized sink needs funding too)
+    if remaining is not None:
+        errors.extend(validate_budget(tasks, budgets, remaining, acyclic=acyclic))
+    else:
+        for t in tasks:
+            errors.extend(validate_estimate(t, budgets))
 
     return ValidationResult(
         DagSpec(tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions), shape=dict(dag.shape)),

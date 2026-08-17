@@ -163,3 +163,69 @@ def test_synthesized_integration_task_capability_is_validated():
     assert r.auto_added == ["T_integrate"]
     assert any(e.rule == "3" and e.task_id == "T_integrate" for e in r.errors)
     assert validate(diamond(integration=False), capabilities={"architecture", "implementation", "integration"}).ok
+
+
+# ----------------------------------------------------------------------------- rule 8: deterministic budget allocation
+
+
+def test_rule8_tokens_one_attempt_per_open_task_at_the_run_allocation():
+    from mas.planner.validator import Remaining
+
+    d = diamond()  # 5 tasks
+    b = Budgets(max_attempt_tokens=100_000)
+    assert validate(d, budgets=b, remaining=Remaining(tokens=500_000)).ok
+    r = validate(d, budgets=b, remaining=Remaining(tokens=499_999))
+    assert rules(r) == {"8"} and "at most 4 new tasks fit" in str(r.errors[0])
+    # existing open tasks (re-plan) still need funding; the auto-appended integration sink counts too
+    assert "8" in rules(validate(d, budgets=b, remaining=Remaining(tokens=500_000, open_tasks=1)))
+    r = validate(diamond(integration=False), budgets=b, remaining=Remaining(tokens=400_000))
+    assert "8" in rules(r) and r.auto_added == [AUTO_INTEGRATION_ID]
+    # no `remaining` (offline validation of a DAG file) → not checked
+    assert validate(d, budgets=b).ok
+
+
+def test_rule8_time_uses_observed_attempts_and_estimates_which_only_tighten():
+    from mas.planner.validator import Remaining, critical_path_s
+
+    d = diamond()  # chain T1 -> {T2,T3,T4} -> T5: critical path 3 tasks, 5 tasks total
+    b = Budgets(max_attempt_tokens=1, max_concurrency=4)
+    # nothing known yet: only "some wall-clock left" is required
+    assert validate(d, budgets=b, remaining=Remaining(wallclock_s=1.0)).ok
+    assert "no wall-clock left" in str(validate(d, budgets=b, remaining=Remaining(wallclock_s=0)).errors[0])
+    # this run's observed mean attempt duration floors every task: 3-task critical path x 10s = 30s
+    assert validate(d, budgets=b, remaining=Remaining(wallclock_s=30, observed_attempt_s=10)).ok
+    r = validate(d, budgets=b, remaining=Remaining(wallclock_s=29, observed_attempt_s=10))
+    assert rules(r) == {"8"} and "critical path ['T1', 'T2', 'T5']" in str(r.errors[0]) and "observed mean" in str(r.errors[0])
+    # throughput bound: 5 tasks x 10s / concurrency 1 = 50s > 45s (the chain alone, 30s, would fit)
+    r = validate(
+        d, budgets=Budgets(max_attempt_tokens=1, max_concurrency=1), remaining=Remaining(wallclock_s=45, observed_attempt_s=10)
+    )
+    assert rules(r) == {"8"} and "over max_concurrency 1" in str(r.errors[0])
+    # planner estimates can only make it stricter: an optimistic 1s estimate does not beat the observed 10s
+    d.by_id()["T2"].estimate = {"seconds": 1}
+    assert "8" in rules(validate(d, budgets=b, remaining=Remaining(wallclock_s=29, observed_attempt_s=10)))
+    # ...a pessimistic one bites even with no history
+    d.by_id()["T2"].estimate = {"seconds": 30}
+    r = validate(d, budgets=b, remaining=Remaining(wallclock_s=29))
+    assert "8" in rules(r) and "planner estimates" in str(r.errors[0])
+    assert critical_path_s(d.tasks, {"T2": 30.0}) == (30.0, ["T1", "T2", "T5"])
+
+
+def test_rule8_estimates_are_validated_and_must_fit_one_attempt():
+    from mas.planner.validator import Remaining
+
+    b = Budgets(max_attempt_tokens=50_000, max_attempt_runtime_s=100)
+    d = diamond()
+    d.by_id()["T1"].estimate = {"tokens": 60_000}
+    r = validate(d, budgets=b, remaining=Remaining(tokens=10_000_000, wallclock_s=1e6))
+    assert [e.task_id for e in r.errors] == ["T1"] and "cannot finish within one attempt" in str(r.errors[0])
+    d.by_id()["T1"].estimate = {"seconds": 101}
+    assert "max_attempt_runtime_s=100" in str(validate(d, budgets=b).errors[0])
+    for bad in ({"tokens": -1}, {"tokens": 1.5}, {"seconds": float("nan")}, {"minutes": 3}, {"tokens": True}, "cheap"):
+        d.by_id()["T1"].estimate = bad if isinstance(bad, dict) else {"_invalid": bad}
+        assert "8" in rules(validate(d, budgets=b)), bad
+    d.by_id()["T1"].estimate = {"tokens": 50_000, "seconds": 100}
+    assert validate(d, budgets=b, remaining=Remaining(tokens=250_000, wallclock_s=100)).ok
+    # cost: enforced at run time; here only "already exhausted" is a plan-time rejection
+    assert "cost budget exhausted" in str(validate(d, budgets=b, remaining=Remaining(cost_usd=0.0)).errors[0])
+    assert validate(d, budgets=b, remaining=Remaining(cost_usd=0.01)).ok

@@ -70,6 +70,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_wallclock_s=args.max_wallclock_s,
         max_attempts_per_task=args.max_attempts,
         max_attempt_runtime_s=args.max_attempt_runtime_s,
+        max_tokens=args.max_tokens,
+        max_attempt_tokens=args.max_attempt_tokens,
     )
     caps = set(settings().worker_capabilities)
     conn = connect()
@@ -247,6 +249,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         max_wallclock_s=args.max_wallclock_s,
         max_attempts_per_task=args.max_attempts,
         max_attempt_runtime_s=args.max_attempt_runtime_s,
+        max_tokens=args.max_tokens,
+        max_attempt_tokens=args.max_attempt_tokens,
     )
     conn = connect()
     migrate(conn)
@@ -619,7 +623,8 @@ def cmd_models(args: argparse.Namespace) -> int:
             print(f"  {role:9s} {spec or '(none)'}{flag}")
             if spec:
                 specs.append((role, spec))
-    print(f"  attempt budget: max_calls={cfg.attempt_max_calls} max_tokens={cfg.attempt_max_tokens}")
+    ceiling = cfg.attempt_max_tokens if cfg.attempt_max_tokens is not None else "(run's max_attempt_tokens)"
+    print(f"  attempt budget: max_calls={cfg.attempt_max_calls} max_tokens={ceiling}")
     if not args.ping:
         return 0
     if not specs:
@@ -765,6 +770,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--lease-s", type=int, default=5)
     r.add_argument("--max-wallclock-s", type=int, default=300, help="run budget; the run ABORTS with a verdict when exceeded")
     r.add_argument("--max-attempt-runtime-s", type=int, default=120)
+    r.add_argument("--max-tokens", type=int, default=2_000_000, help="run token budget")
+    r.add_argument(
+        "--max-attempt-tokens",
+        type=int,
+        default=200_000,
+        help="per-attempt token allocation; validator rule 8 requires max_tokens to fund one attempt per open task",
+    )
     r.add_argument("--stub-sleep", type=float, default=0.5, help="simulated work per attempt (s)")
     r.add_argument("--agent", default="stub", choices=["stub", "llm"], help="stub (no model) | llm (bounded tool-call loop)")
     r.add_argument("--planner", default=None, help="llm | fake — plans an ad-hoc --goal (contract -> approve -> DAG)")
@@ -815,6 +827,8 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--lease-s", type=int, default=15)
     sb.add_argument("--max-wallclock-s", type=int, default=600)
     sb.add_argument("--max-attempt-runtime-s", type=int, default=120)
+    sb.add_argument("--max-tokens", type=int, default=2_000_000)
+    sb.add_argument("--max-attempt-tokens", type=int, default=200_000)
     sb.add_argument("--wait", action="store_true", help="block until the run is terminal, then print status")
     sb.add_argument("--timeout", type=float, default=600)
     sb.add_argument("--pool", default="default", help="pool the services must serve to pick this run up")

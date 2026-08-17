@@ -124,6 +124,7 @@ class Worker:
         self.provider = provider
         self.pricing = pricing if pricing is not None else Pricing.from_json(settings().model_prices)
         self.attempt_max_calls = attempt_max_calls if attempt_max_calls is not None else settings().attempt_max_calls
+        # optional worker-side ceiling; the run's own per-attempt allocation (budgets.max_attempt_tokens) always applies
         self.attempt_max_tokens = attempt_max_tokens if attempt_max_tokens is not None else settings().attempt_max_tokens
         self._telemetry_lock = threading.Lock()
         # confined execution for command tools, one backend per attempt: (worktree, claim) -> ExecutionBackend.
@@ -203,7 +204,10 @@ class Worker:
         if self.provider is None:
             return None
         remaining_run = max(0, claim.run.budgets.max_tokens - claim.run.tokens_used)
-        budget = CallBudget(max_calls=self.attempt_max_calls, max_tokens=min(self.attempt_max_tokens, remaining_run))
+        alloc = min(claim.run.budgets.max_attempt_tokens, remaining_run)  # the run's per-attempt allocation (rule 8 unit)
+        if self.attempt_max_tokens is not None:
+            alloc = min(alloc, self.attempt_max_tokens)
+        budget = CallBudget(max_calls=self.attempt_max_calls, max_tokens=alloc)
         return MeteredProvider(
             self.provider,
             sink=DbSink(self.conn, self._telemetry_lock),

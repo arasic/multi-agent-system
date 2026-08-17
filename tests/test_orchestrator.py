@@ -359,7 +359,9 @@ def test_usage_is_accounted_on_attempts_and_run(conn):
 def test_token_budget_aborts(conn):
     usage = {"model": "stub", "input_tokens": 1000, "output_tokens": 0, "cost_usd": 0.0}
     d = diamond({k: {"usage": usage} for k in ("T1", "T2", "T3", "T4", "T5")})
-    out = execute(conn, d, workers=1, stub_sleep=0.05, budgets=default_budgets(max_tokens=1500))
+    # rule 8 admits the plan only if the run can fund one attempt per task at its per-attempt allocation (5 x 200 <= 1500);
+    # the stubs then self-report 1000 tokens each and the run's own token budget aborts it (I-4)
+    out = execute(conn, d, workers=1, stub_sleep=0.05, budgets=default_budgets(max_tokens=1500, max_attempt_tokens=200))
     assert out.run.status is RunStatus.ABORTED and "max_tokens" in out.run.verdict
 
 

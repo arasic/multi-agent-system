@@ -20,10 +20,14 @@ class TaskSpec:
     meta: dict[str, Any] = field(default_factory=dict)
     tools: list[str] | None = None  # requested tools; None → the capability's default allow-list (validator fills)
     max_attempts: int | None = None
+    # planner's own cost estimate {"tokens": int, "seconds": number} — optional; validator rule 8 lets it only *tighten*
+    # the budget check (an estimate above the per-attempt allocation is infeasible), never loosen it
+    estimate: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> TaskSpec:
         tools = d.get("tools")
+        est = d.get("estimate")
         return cls(
             id=str(d["id"]),
             capability=str(d["capability"]),
@@ -35,6 +39,7 @@ class TaskSpec:
             meta=dict(d.get("meta", {}) or {}),
             tools=[str(x) for x in tools] if tools is not None else None,
             max_attempts=d.get("max_attempts"),
+            estimate=dict(est) if isinstance(est, dict) else ({"_invalid": est} if est is not None else {}),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -55,6 +60,8 @@ class TaskSpec:
             d["tools"] = list(self.tools)
         if self.max_attempts is not None:
             d["max_attempts"] = self.max_attempts
+        if self.estimate:
+            d["estimate"] = dict(self.estimate)
         return d
 
 

@@ -8,6 +8,7 @@
       "goal": "Decide storage, module layout and the HTTP API contract; write design.md",
       "depends_on": [],
       "output_contract": {"artifacts": ["document:design.md"]},
+      "estimate": {"tokens": 40000, "seconds": 5},
       "context_spec": {"paths": ["spec/**"]}
     },
     {
@@ -16,6 +17,7 @@
       "goal": "Write the OpenAPI/HTTP contract for shorten/resolve/stats endpoints",
       "depends_on": ["T1"],
       "output_contract": {"artifacts": ["document:api.md"]},
+      "estimate": {"tokens": 40000, "seconds": 5},
       "context_spec": {"artifacts_from": ["T1"]}
     },
     {
@@ -24,6 +26,7 @@
       "goal": "Implement the HTTP API against the contract",
       "depends_on": ["T2"],
       "output_contract": {"artifacts": ["git_commit"]},
+      "estimate": {"tokens": 40000, "seconds": 5},
       "context_spec": {"artifacts_from": ["T1", "T2"]}
     },
     {
@@ -32,6 +35,7 @@
       "goal": "Implement the persistent storage layer",
       "depends_on": ["T2"],
       "output_contract": {"artifacts": ["git_commit"]},
+      "estimate": {"tokens": 40000, "seconds": 5},
       "context_spec": {"artifacts_from": ["T1", "T2"]}
     },
     {
@@ -40,6 +44,7 @@
       "goal": "Write the service's own test suite (advisory; the external acceptance suite decides)",
       "depends_on": ["T2"],
       "output_contract": {"artifacts": ["git_commit"]},
+      "estimate": {"tokens": 40000, "seconds": 5},
       "context_spec": {"artifacts_from": ["T2"]}
     },
     {
@@ -48,6 +53,7 @@
       "goal": "Merge API, storage and tests; add Dockerfile and README; produce the integration commit",
       "depends_on": ["T3", "T4", "T5"],
       "output_contract": {"artifacts": ["git_commit"]},
+      "estimate": {"tokens": 40000, "seconds": 5},
       "context_spec": {"artifacts_from": ["T3", "T4", "T5"]}
     }
   ]

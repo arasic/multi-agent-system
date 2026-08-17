@@ -34,7 +34,9 @@ MAS_ANTHROPIC_THINKING=1                         # adaptive thinking on (default
 MAS_ANTHROPIC_FALLBACKS=                         # optional beta opt-in ("default"): server-side refusal fallbacks
 MAS_OPENAI_BASE_URL=https://api.openai.com/v1    # or an in-cluster gateway; OPENAI_API_KEY / MAS_OPENAI_API_KEY
 MAS_OPENAI_MAX_TOKENS_FIELD=max_completion_tokens  # older compatible servers want max_tokens
-MAS_ATTEMPT_MAX_CALLS=40  MAS_ATTEMPT_MAX_TOKENS=300000   # per-attempt call budget (metered provider)
+MAS_ATTEMPT_MAX_CALLS=40                         # per-attempt call budget (metered provider)
+MAS_ATTEMPT_MAX_TOKENS=                          # optional worker-side ceiling; tokens per attempt are a RUN budget:
+                                                 # --max-attempt-tokens (default 200000; validator rule 8 allocation unit)
 ```
 
 Anthropic credentials resolve the SDK way (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or an `ant auth login` profile). `mas models` prints the roles and which are unpriced; `mas models --ping --spec <provider>:<model>` makes one metered test call. `pip install -e ".[llm]"` installs the Anthropic SDK; the `openai` provider needs no SDK; `fake` needs nothing.
