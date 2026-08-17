@@ -10,7 +10,9 @@ Key-less rehearsal:
 
 The script starts `mas up`, waits for Compose, submits the frozen URL-shortener DAG to the default pool, waits for the
 real external verifier, exports the exact verified Git result, and shuts down services it started. It refuses to take
-over an already-running Compose project unless --reuse is explicit; reuse mode never stops those services.
+over an already-running Compose project (orchestrator / gateway / worker) unless --reuse is explicit; reuse mode never
+stops those services. A running `postgres` alone is the documented setup state (`docker compose up -d postgres` ->
+`mas doctor` -> `mas up`; the preflight needs it before `mas up` can start it): it is reused and left running.
 """
 
 from __future__ import annotations
@@ -35,6 +37,13 @@ from mas.metrics import compute  # noqa: E402
 
 RUN_ID = re.compile(r"\bsubmitted run ([0-9a-f-]{36})\b", re.I)
 SERVICES = {"postgres", "orchestrator", "gateway", "worker"}
+ACTORS = SERVICES - {"postgres"}  # the services another supervisor may own; postgres is the shared substrate
+
+
+def blocking_services(existing: set[str]) -> set[str]:
+    """Running services that mean another `mas up` may own the project. Postgres alone does not: the preflight
+    (`mas doctor`) needs it before `mas up` can start it, and `mas up` re-uses a running one."""
+    return set(existing) & ACTORS
 
 
 def _git_state() -> dict[str, object]:
@@ -98,8 +107,10 @@ def main(argv: list[str] | None = None) -> int:
     }
     _write(args.output, evidence)
     existing = running_services()
-    if existing and not args.reuse:
-        evidence["error"] = f"Compose services already running: {sorted(existing)} (use --reuse only if supervisors are ready)"
+    evidence["preexisting_services"] = sorted(existing)
+    blocking = blocking_services(existing)
+    if blocking and not args.reuse:
+        evidence["error"] = f"Compose services already running: {sorted(blocking)} (use --reuse only if supervisors are ready)"
         evidence["finished_at"] = datetime.now(UTC).isoformat()
         _write(args.output, evidence)
         print(evidence["error"], file=sys.stderr)
@@ -191,7 +202,11 @@ def main(argv: list[str] | None = None) -> int:
         _write(args.output, evidence)
         if up is not None:
             _stop_up(up)
-            subprocess.run([sys.executable, "-m", "mas", "down"], cwd=ROOT, check=False)
+            if "postgres" in existing:
+                # leave the substrate as found: stop and remove only the actors this smoke started
+                subprocess.run(["docker", "compose", "rm", "-sf", *sorted(ACTORS)], cwd=ROOT, check=False)
+            else:
+                subprocess.run([sys.executable, "-m", "mas", "down"], cwd=ROOT, check=False)
 
 
 if __name__ == "__main__":

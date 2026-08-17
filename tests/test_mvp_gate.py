@@ -1,6 +1,7 @@
 """The MVP evidence gate and the M3 runner's evidence integrity: raw rows are the truth, summaries must agree, evidence
 binds to one clean commit, infrastructure failures are rerun rather than counted, and the report is regenerable."""
 
+import argparse
 import json
 import os
 import subprocess
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts import benchmark, live_smoke
+from scripts import benchmark, distributed_smoke, live_smoke
 from scripts.benchmark import classify_run, completion, crossover, effective_rows
 from scripts.mvp_gate import evaluate
 
@@ -160,6 +161,8 @@ RETRIES = "FAIL:task T2 failed (retries exhausted)"
         (_failed_row("ABORTED:operator", "POLICY_DENIED", status="ABORTED"), "infrastructure"),
         (_failed_row("FAIL:verification not completed (ERROR): sandbox died", UNRECOVERABLE), "infrastructure"),
         (_failed_row("FAIL:verification not completed (INVALID): bad suite", "UNSUPPORTED"), "infrastructure"),
+        # UNSUPPORTED from the planner (a contract that maps to no trusted adapter, ADR-008 §6) is the model's outcome
+        (_failed_row("FAIL:planner rejected: unmappable acceptance criteria: check[0].type 'x'", "UNSUPPORTED"), "experimental"),
         (
             _failed_row("FAIL:verification failed; repair needs a planner and none is configured (--planner)", UNRECOVERABLE),
             "infrastructure",
@@ -168,7 +171,13 @@ RETRIES = "FAIL:task T2 failed (retries exhausted)"
         (_failed_row(RETRIES, UNRECOVERABLE, attempt_failure_classes={"infrastructure": 3}), "infrastructure"),
         (_failed_row(RETRIES, UNRECOVERABLE, attempt_failure_classes={"infrastructure": 2, "model": 1}), "experimental"),
         (_failed_row(RETRIES, UNRECOVERABLE, attempt_failure_classes={"model": 3, "abandoned": 1}), "experimental"),
-        (_failed_row(RETRIES, UNRECOVERABLE, attempt_failure_classes={"abandoned": 3}), "experimental"),
+        # worker death is never the model's doing: attempts that only ever ended abandoned/cancelled exonerate it
+        (_failed_row(RETRIES, UNRECOVERABLE, attempt_failure_classes={"abandoned": 3}), "infrastructure"),
+        (_failed_row(RETRIES, UNRECOVERABLE, attempt_failure_classes={"abandoned": 2, "infrastructure": 1}), "infrastructure"),
+        (_failed_row(RETRIES, UNRECOVERABLE, attempt_failure_classes={"abandoned": 2, "budget": 1}), "experimental"),
+        # no recorded classes: nothing exonerates the model, the run stays evidence
+        (_failed_row(RETRIES, UNRECOVERABLE), "experimental"),
+        (_failed_row(RETRIES, UNRECOVERABLE, attempt_failure_classes={}), "experimental"),
     ],
 )
 def test_run_failure_classification_is_deterministic(row: dict, expected: str):
@@ -211,7 +220,9 @@ def test_matrix_completion_accepts_experimental_failures_but_not_missing_duplica
 
 def test_aggregate_reports_distributions_over_evidence_runs_and_excludes_infrastructure_rows():
     rows = [_row("D", 4, r, machine_s=float(r)) for r in range(1, 6)]
-    invalid = _row("D", 4, 5, status="FAILED", verdict_reason="UNSUPPORTED", reason_text="not completed (INVALID)", suffix=1)
+    invalid = _row(
+        "D", 4, 5, status="FAILED", verdict_reason="UNSUPPORTED", reason_text="verification not completed (INVALID)", suffix=1
+    )
     rows.append(invalid)
     # the infra row came last for repetition 5, so it is the effective row of that key -> excluded from evidence
     (record,) = benchmark.aggregate(rows)
@@ -321,6 +332,20 @@ def test_crossover_requires_parallel_to_preserve_success_and_improve_the_metric(
 # ----------------------------------------------------------------------------- live smoke resumption
 
 
+_LIVE_SETUP = {
+    "workers": 3,
+    "max_concurrency": 3,
+    "lease_s": 15,
+    "max_wallclock_s": 1800,
+    "max_attempt_runtime_s": 600,
+    "max_tokens": 1_500_000,
+    "max_attempt_tokens": 250_000,
+    "max_cost_usd": 10.0,
+    "max_replans": 1,
+    "max_attempts_per_task": 2,
+}
+
+
 def _live_evidence(**overrides) -> dict:
     base = {
         "schema": 1,
@@ -330,6 +355,8 @@ def _live_evidence(**overrides) -> dict:
         "requested_steps": ["ping", "worker", "planner", "repair"],
         "manual_contract_approval": True,
         "allow_unpriced": False,
+        "model_prices": {"m": [1.0, 2.0]},
+        "setup": dict(_LIVE_SETUP),
         "steps": {},
         "runs": [],
         "complete": False,
@@ -355,10 +382,56 @@ def test_live_smoke_resume_carries_passed_stages_only_from_identical_setup():
         {"manual_contract_approval": False},
         {"allow_unpriced": True},
         {"schema": 2},
+        # a different price table, budget, worker count, concurrency or replan limit is a different experiment
+        {"model_prices": {"m": [1.0, 3.0]}},
+        {"model_prices": {}},
+        {"setup": {**_LIVE_SETUP, "max_tokens": 2_000_000}},
+        {"setup": {**_LIVE_SETUP, "max_cost_usd": 20.0}},
+        {"setup": {**_LIVE_SETUP, "max_wallclock_s": 900}},
+        {"setup": {**_LIVE_SETUP, "workers": 1}},
+        {"setup": {**_LIVE_SETUP, "max_concurrency": 1}},
+        {"setup": {**_LIVE_SETUP, "max_replans": 2}},
+        {"setup": None},
     ):
         current = _live_evidence(started_at="t1")
         _, skip, refusal = live_smoke.merge_resume(_live_evidence(steps={"ping": True}, **change), current)
         assert refusal and skip == [], change
+
+
+def test_live_smoke_evidence_records_the_full_experimental_setup(monkeypatch):
+    """The identity fields the resume compares are the ones the script actually records (prices + every budget)."""
+    monkeypatch.setenv("MAS_MODEL_PRICES", '{"m": [1.0, 2.0]}')
+    args = argparse.Namespace(
+        workers=3,
+        max_concurrency=3,
+        max_wallclock_s=1800,
+        max_attempt_runtime_s=600,
+        max_tokens=1_500_000,
+        max_attempt_tokens=250_000,
+        max_cost_usd=10.0,
+        max_replans=1,
+    )
+    from dataclasses import asdict
+
+    setup = live_smoke._setup(args)
+    assert setup == {"workers": 3, **asdict(live_smoke._budgets(args))}  # every Budgets field, not a hand-picked few
+    assert {"workers", "max_concurrency", "max_tokens", "max_attempt_tokens", "max_cost_usd", "max_wallclock_s"} <= set(setup)
+    assert {"max_attempt_runtime_s", "max_replans", "max_attempts_per_task", "lease_s"} <= set(setup)
+    assert live_smoke._price_snapshot() == {"m": [1.0, 2.0]}
+    identity = {"git", "models", "manual_contract_approval", "allow_unpriced", "model_prices", "setup"}
+    assert set(live_smoke._RESUME_IDENTITY) >= identity
+
+
+def test_distributed_smoke_refuses_running_actors_but_reuses_the_shared_postgres():
+    """The documented setup keeps `postgres` up before `mas doctor`/`mas up`; only another stack's actors block."""
+    assert distributed_smoke.blocking_services(set()) == set()
+    assert distributed_smoke.blocking_services({"postgres"}) == set()
+    assert distributed_smoke.blocking_services({"postgres", "worker"}) == {"worker"}
+    assert distributed_smoke.blocking_services({"orchestrator", "gateway", "worker", "postgres"}) == {
+        "orchestrator",
+        "gateway",
+        "worker",
+    }
 
 
 @pytest.mark.parametrize(

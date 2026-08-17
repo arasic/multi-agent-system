@@ -120,9 +120,11 @@ python scripts/mvp_gate.py                                      # direct live + 
 ```
 
 `live_smoke.py --resume` (with `--output`) skips stages already PASSED in that file when it came from the same commit,
-models, approval mode and pricing rule. `benchmark.py` re-invoked with the same arguments resumes: recorded cells are
-skipped, cells whose last row is `infrastructure`-invalid (verifier crash/timeout, unusable suite, provider outage,
-sandbox/workspace failure, lost client) are rerun; `experimental` failures are kept as evidence.
+models, approval mode, pricing rule and price table, budgets, worker count, concurrency and replan limit. `benchmark.py`
+re-invoked with the same arguments resumes: recorded cells are skipped, cells whose last row is `infrastructure`-invalid
+(verifier crash/timeout, unusable suite, provider outage, sandbox/workspace failure, worker death, lost client) are
+rerun; `experimental` failures (the model, the plan — an unmappable contract included — or the budgets) are kept as
+evidence.
 
 Tests and lint (no API key needed; DB tests skip if Postgres is unreachable). **Run the tier a change can affect, not
 the whole suite every time** (`scripts/test.py`; every worker process gets its own test DB, so `-n 4` is safe):

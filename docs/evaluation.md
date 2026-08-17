@@ -61,7 +61,8 @@ is `python scripts/benchmark.py` (immutable experiment manifest + append-only JS
 generated report); real evidence requires at least five repetitions per cell. Every run is classified deterministically
 (`benchmark.classify_run`): `experimental` failures — the model, the plan or the run's budgets decided the outcome — are
 evidence and stay; `infrastructure` failures — verifier crash/timeout, unusable suite, provider outage, sandbox/workspace
-failure, a client that lost the run — cannot answer the value question, stay in the log for audit, and their cell is rerun
+failure, worker death, a client that lost the run — cannot answer the value question, stay in the log for audit, and
+their cell is rerun
 (the last row per cell counts, and only if every earlier row was infrastructure-invalid). `python scripts/mvp_gate.py`
 audits the *raw* rows: it recomputes completion, regenerates the report and requires the summaries on disk to match, and
 requires the evidence commit to be the clean, currently checked-out one. It rejects incomplete, mixed-revision, dirty,

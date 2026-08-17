@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -76,16 +77,34 @@ def _write_evidence(args: argparse.Namespace) -> None:
     tmp.replace(args.output)
 
 
-# evidence fields that must be identical for an earlier file's passed stages to count towards this invocation
-_RESUME_IDENTITY = ("git", "models", "manual_contract_approval", "allow_unpriced")
+# evidence fields that must be identical for an earlier file's passed stages to count towards this invocation: the
+# commit and tree state, the models, the approval mode, the pricing rule AND the price table, and the whole
+# experimental setup (every budget, worker count, concurrency, repair limit) — a stage passed under other conditions
+# is different evidence
+_RESUME_IDENTITY = ("git", "models", "manual_contract_approval", "allow_unpriced", "model_prices", "setup")
+
+
+def _price_snapshot() -> object:
+    """The price table as configured (parsed when it is JSON, verbatim otherwise) — part of the resume identity."""
+    prices = settings().model_prices.strip()
+    try:
+        return json.loads(prices) if prices else {}
+    except json.JSONDecodeError:
+        return prices
+
+
+def _setup(args: argparse.Namespace) -> dict:
+    """Everything about the experimental setup that decides how a stage runs (identical for a resume to count)."""
+    return {"workers": args.workers, **asdict(_budgets(args))}
 
 
 def merge_resume(previous: dict, current: dict) -> tuple[dict, list[str], str | None]:
     """Carry an earlier evidence file's PASSED stages (and their runs) into `current`.
 
     Returns (merged evidence, stages to skip, refusal reason). Nothing is carried over unless the earlier file was
-    produced by the same commit with a clean/dirty state, the same worker/planner models, the same approval mode and
-    the same pricing rule — otherwise a paid stage from a different setup could be smuggled into this gate."""
+    produced by the same commit with a clean/dirty state, the same worker/planner models, the same approval mode, the
+    same pricing rule and price table, and the same setup (budgets, workers, concurrency, replans) — otherwise a paid
+    stage from a different setup could be smuggled into this gate."""
     if not isinstance(previous, dict) or previous.get("schema") != current.get("schema"):
         return current, [], "earlier evidence has a different schema"
     for key in _RESUME_IDENTITY:
@@ -341,8 +360,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "--resume",
         action="store_true",
-        help="skip stages already PASSED in --output when it was produced by this same commit, models, approval mode "
-        "and pricing rule; their runs are carried forward, everything else is re-run",
+        help="skip stages already PASSED in --output when it was produced by this same commit, models, approval mode, "
+        "pricing rule and price table, budgets, worker count, concurrency and replan limit; their runs are carried "
+        "forward, everything else is re-run",
     )
     ap.add_argument(
         "--allow-unpriced",
@@ -360,6 +380,8 @@ def main(argv: list[str]) -> int:
         "requested_steps": order,
         "manual_contract_approval": bool(args.no_auto_approve),
         "allow_unpriced": bool(args.allow_unpriced),
+        "model_prices": _price_snapshot(),
+        "setup": _setup(args),
         "steps": {},
         "runs": [],
         "complete": False,

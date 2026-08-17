@@ -13,10 +13,11 @@ interrupted experiment remains auditable. Unpriced calls make cost null in the s
 
 Failure classification (`classify_run`): a run that ends PASSED, or FAILED/ABORTED because the model, the plan or the
 experiment's budgets did (`experimental`), is evidence and stays. A run that ends because the machinery did — verifier
-crash/timeout, unusable suite, provider outage, sandbox/workspace failure, a client that could not read the run — is
-`infrastructure`: it cannot answer the MAS value question, it is kept in the append-only log for audit, and its cell is
-rerun on the next invocation. Completion counts only the last row per cell/repetition, and only if every earlier row for
-that key was infrastructure-invalid (a valid row is never rerun; two valid rows for one key are a duplicate).
+crash/timeout, unusable suite, provider outage, sandbox/workspace failure, worker death, a client that could not read
+the run — is `infrastructure`: it cannot answer the MAS value question, it is kept in the append-only log for audit,
+and its cell is rerun on the next invocation. Completion counts only the last row per cell/repetition, and only if
+every earlier row for that key was infrastructure-invalid (a valid row is never rerun; two valid rows for one key are
+a duplicate).
 """
 
 from __future__ import annotations
@@ -83,9 +84,13 @@ def classify_run(row: dict) -> str:
     """`pass` | `experimental` | `infrastructure` — deterministic, from the recorded status/verdict/attempt classes.
 
     Experimental: the model, the plan or the experiment's budgets decided the outcome (verifier FAIL exhausting the repair
-    budget, NO_PROGRESS, token/cost/wall-clock abort, invalid plan, policy denial, an agent that could not do the task).
-    Infrastructure: the run never got a fair chance (verifier crash/timeout/unusable suite, missing planner, a task whose
-    every failed attempt was a workspace/sandbox/provider/agent-crash failure, a client that lost the run).
+    budget, NO_PROGRESS, token/cost/wall-clock abort, invalid or unmappable plan, policy denial, an agent that could not
+    do the task). Infrastructure: the run never got a fair chance (verifier crash/timeout/unusable suite, missing
+    planner, a task whose every failed attempt was a workspace/sandbox/provider/agent-crash failure or a worker death,
+    a client that lost the run).
+
+    `UNSUPPORTED` is not infrastructure by itself: the planner earns it too (a contract that maps to no trusted adapter,
+    ADR-008 §6), which is the model's outcome. Only the verifier's INVALID — "verification not completed" — is.
     """
     status = row.get("status")
     if status == "PASSED":
@@ -97,16 +102,19 @@ def classify_run(row: dict) -> str:
     if status == "ABORTED":
         # budgets are the experiment's parameters; anything else that aborts a run is not the model's doing
         return "experimental" if reason in (None, "BUDGET_EXHAUSTED") else "infrastructure"
-    if reason == "UNSUPPORTED" or any(marker in verdict for marker in _INFRASTRUCTURE_VERDICT_MARKERS):
+    if any(marker in verdict for marker in _INFRASTRUCTURE_VERDICT_MARKERS):
         return "infrastructure"
     if reason == "UNRECOVERABLE_FAILURE":
-        # a task exhausted its attempts: the model's failure unless *every* failed attempt was the machinery's
+        # a task exhausted its attempts: the model's failure unless *every* failed attempt was the machinery's — a
+        # worker death (`abandoned`) or a cancellation is never the model's doing, so attempts that only ever ended
+        # that way exonerate it; a run without recorded classes stays evidence (nothing exonerates the model)
         classes = row.get("attempt_failure_classes") if isinstance(row.get("attempt_failure_classes"), dict) else {}
-        blamed = {k: int(v) for k, v in classes.items() if int(v) > 0 and k not in ("abandoned", "cancelled")}
-        if blamed and set(blamed) <= {"infrastructure"}:
+        counted = {k: int(v) for k, v in classes.items() if int(v) > 0}
+        blamed = {k for k in counted if k not in ("abandoned", "cancelled")}
+        if counted and blamed <= {"infrastructure"}:
             return "infrastructure"
         return "experimental"
-    return "experimental"  # NO_PROGRESS, BUDGET_EXHAUSTED, INVALID_PLAN, POLICY_DENIED
+    return "experimental"  # NO_PROGRESS, BUDGET_EXHAUSTED, INVALID_PLAN, POLICY_DENIED, UNSUPPORTED (planner)
 
 
 def row_key(row: dict) -> tuple:
@@ -553,7 +561,8 @@ def render_analysis(summary: list[dict], manifest: dict, done: dict) -> str:
         "",
         "Failure classification: `experimental` runs (the model, the plan or the run's budgets decided the outcome) are "
         "evidence and are kept; `infrastructure` runs (verifier crash/timeout, unusable suite, provider outage, "
-        "sandbox/workspace failure, lost client) cannot answer the value question and are rerun. Success rate is over "
+        "sandbox/workspace failure, worker death, lost client) cannot answer the value question and are rerun. Success "
+        "rate is over "
         "evidence runs; headline medians use passing runs; distributions use every evidence run in the cell.",
         "",
         "## Headline: A/B/C/D at each N",
