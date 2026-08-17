@@ -262,9 +262,13 @@ class LocalExecutionBackend:
         self.max_output_bytes = max_output_bytes
         self.kill_grace_s = kill_grace_s
         self._home = Path(tempfile.mkdtemp(prefix="mas-local-home-"))
+        # The sanitized HOME intentionally hides the host user site. This test-only backend still needs the same
+        # interpreter environment as its parent (notably pytest), so preserve the already-resolved import path
+        # explicitly. Production command execution uses SandboxExecutionBackend and is unaffected.
+        self._python_path = os.pathsep.join(str(p) for p in sys.path if p)
 
     def _env(self) -> dict[str, str]:
-        return sanitized_env(self._home)
+        return sanitized_env(self._home, {"PYTHONPATH": self._python_path})
 
     def run(self, argv: list[str], *, timeout_s: float, cancel: threading.Event | None = None) -> CommandResult:
         argv = list(argv)

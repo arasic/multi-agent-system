@@ -344,7 +344,14 @@ class AcceptanceVerifier:
                         subprocess.run([self.docker, "rm", "-f", name], capture_output=True, timeout=15, check=False)
                         proc.wait(timeout=15)
                         evidence = self._evidence(request, started, suite_hash, image_ref)
-                        evidence.update({"stdout_bytes": out.seen, "stderr_bytes": err.seen, "output_cap": cap})
+                        evidence.update(
+                            {
+                                "stdout_bytes": out.seen,
+                                "stderr_bytes": err.seen,
+                                "output_cap": cap,
+                                "container_name": name,
+                            }
+                        )
                         return VerificationResult.fail(
                             "acceptance output exceeded limit", status=VerificationStatus.INVALID, evidence=evidence
                         )

@@ -199,8 +199,12 @@ def test_output_flood_is_capped_killed_and_never_reaches_host_disk(tmp_path, ver
     assert result.evidence["stdout_bytes"] > result.evidence["output_cap"] == 256 * 1024
     assert elapsed < 15, elapsed  # killed on overflow, well before the 20 s timeout
     assert list(captures.glob("mas-verify-*")) == []
+    # Inspect only this verifier's random container. Other xdist workers legitimately run their own mas-verify-* now.
     leftover = subprocess.run(
-        ["docker", "ps", "-a", "--filter", "name=mas-verify-", "-q"], capture_output=True, text=True, check=False
+        ["docker", "ps", "-a", "--filter", f"name={result.evidence['container_name']}", "-q"],
+        capture_output=True,
+        text=True,
+        check=False,
     ).stdout.split()
     assert leftover == []
 

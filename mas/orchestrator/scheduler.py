@@ -502,24 +502,44 @@ def _tick(
                 (run_id,),
             ).fetchone()
             if nw is not None:
-                conn.execute(
-                    "UPDATE tasks SET meta = meta || %s WHERE run_id = %s AND key = %s",
-                    (Jsonb({"new_work_handled": run.replans_used + 1}), run_id, nw["key"]),
-                )
                 if planner is not None and run.replans_used < run.budgets.max_replans:
-                    return sm.start_replan(
+                    # Drain already-runnable sibling work before stopping claims. This closes a narrow race where one
+                    # sibling was RUNNING and another still READY: replanning would wait for the first but rule 9
+                    # correctly rejected an amendment that depended on the second. The obsolete integration sink is
+                    # deliberately excluded; once siblings settle it may be READY and the amendment can cancel it.
+                    unsettled = conn.execute(
+                        """
+                        SELECT count(*) AS n FROM tasks
+                        WHERE run_id = %s AND status IN ('READY', 'RUNNING') AND capability <> 'integration'
+                        """,
+                        (run_id,),
+                    ).fetchone()["n"]
+                    if unsettled == 0:
+                        conn.execute(
+                            "UPDATE tasks SET meta = meta || %s WHERE run_id = %s AND key = %s",
+                            (Jsonb({"new_work_handled": run.replans_used + 1}), run_id, nw["key"]),
+                        )
+                        return sm.start_replan(
+                            conn,
+                            run_id,
+                            payload={
+                                "trigger": "new_work_required",
+                                "task": nw["key"],
+                                "detail": nw["detail"],
+                                "cycle": run.replans_used + 1,
+                            },
+                        )
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET meta = meta || %s WHERE run_id = %s AND key = %s",
+                        (Jsonb({"new_work_handled": run.replans_used + 1}), run_id, nw["key"]),
+                    )
+                    emit(
                         conn,
                         run_id,
-                        payload={
-                            "trigger": "new_work_required",
-                            "task": nw["key"],
-                            "detail": nw["detail"],
-                            "cycle": run.replans_used + 1,
-                        },
+                        "task.new_work_deferred",
+                        payload={"key": nw["key"], "reason": "no planner or no replans left"},
                     )
-                emit(
-                    conn, run_id, "task.new_work_deferred", payload={"key": nw["key"], "reason": "no planner or no replans left"}
-                )
 
             integ = _integration_task(conn, run_id)
             if integ is not None and TaskStatus(integ["status"]) is TaskStatus.COMPLETED:

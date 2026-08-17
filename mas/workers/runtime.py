@@ -63,20 +63,25 @@ class _Heartbeat(threading.Thread):
             self.cancel.set()
             return
         try:
-            while not self._stop.wait(interval):
+            # Renew immediately after establishing the dedicated connection. With short leases, waiting one full
+            # interval before the first beat lets connection or OS scheduling latency consume most of the claim's
+            # initial lease before workspace/sandbox setup even starts.
+            while not self._stop.is_set():
                 try:
                     alive = leases.heartbeat(conn, self.attempt_id, self.lease_s)
                 except Exception:
                     log.exception("heartbeat failed")
                     conn.rollback()
-                    continue
-                self.beats += 1
-                if not alive:
-                    # settled by our own worker a moment ago? then this is expected, not a reap/cancel
-                    if self.settled.is_set() or self._stop.wait(0.2) or self.settled.is_set():
+                else:
+                    self.beats += 1
+                    if not alive:
+                        # settled by our own worker a moment ago? then this is expected, not a reap/cancel
+                        if self.settled.is_set() or self._stop.wait(0.2) or self.settled.is_set():
+                            return
+                        log.warning("attempt %s no longer RUNNING (reaped/cancelled) - signalling cancel", self.attempt_id)
+                        self.cancel.set()
                         return
-                    log.warning("attempt %s no longer RUNNING (reaped/cancelled) - signalling cancel", self.attempt_id)
-                    self.cancel.set()
+                if self._stop.wait(interval):
                     return
         finally:
             conn.close()

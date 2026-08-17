@@ -1,6 +1,7 @@
 """Live provider smoke — the M2 gate's one mandatory step that cannot run without a vendor key.
 
-    python scripts/live_smoke.py --worker <provider>:<model> [--planner <provider>:<model>] [--step ping|worker|planner|repair|all]
+    python scripts/live_smoke.py --worker <provider>:<model> [--planner <provider>:<model>]
+        [--step ping|worker|planner|repair|all]
 
 Runs, in order, against the REAL provider (each step is a gate — the next one runs only if the previous passed):
 

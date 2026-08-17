@@ -27,6 +27,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -143,15 +144,38 @@ class GitWorkspace:
                 # exceed that limit under pytest or a deeply nested MAS_DATA_DIR even when the worktree itself fits.
                 _git("config", "core.longpaths", "true", cwd=tmp)
                 if not repo.exists():
-                    try:
-                        os.rename(tmp, repo)  # atomic on the same filesystem; loser gets an error → fine
-                    except OSError:
-                        pass
+                    # Atomic on the same filesystem. A racing loser is harmless, but an unrelated transient Windows
+                    # rename error must not be swallowed (doing so deletes the only initialized repo in `finally`).
+                    rename_error: OSError | None = None
+                    for retry in range(5):
+                        try:
+                            os.rename(tmp, repo)
+                            rename_error = None
+                            break
+                        except OSError as ex:
+                            if repo.exists():  # another initializer won the race with its already-complete temp repo
+                                rename_error = None
+                                break
+                            rename_error = ex
+                            time.sleep(0.02 * (retry + 1))
+                    if rename_error is not None:
+                        msg = f"cannot install initialized bare repository {repo}: {rename_error}"
+                        raise WorkspaceError(msg) from rename_error
             finally:
                 if tmp.exists():
                     shutil.rmtree(tmp, ignore_errors=True)
-        # base commit on main (deterministic sha, so racing creators agree)
-        _git("config", "core.longpaths", "true", cwd=repo, check=False)  # also upgrades repositories created earlier
+        # A racing initializer can observe the destination immediately after rename while Windows is still making it
+        # available as a process working directory. Wait for the repository marker, then configure it from its stable
+        # parent instead of using the just-renamed directory as cwd (CreateProcess may otherwise raise WinError 267).
+        deadline = time.monotonic() + 2.0
+        while not (repo.is_dir() and (repo / "HEAD").is_file()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not (repo.is_dir() and (repo / "HEAD").is_file()):
+            raise WorkspaceError(f"bare repository initialization did not complete: {repo}")
+
+        # Base commit on main (deterministic sha, so racing creators agree). --git-dir lets this also upgrade
+        # repositories created by older releases without depending on the repository itself being a valid cwd.
+        _git("--git-dir", str(repo), "config", "core.longpaths", "true", cwd=repo.parent, check=False)
         head = _git("rev-parse", "-q", "--verify", "refs/heads/main", cwd=repo, check=False)
         if head.returncode != 0:
             if base_ref:
@@ -246,10 +270,8 @@ class GitWorkspace:
         except WorkspaceError:
             log.debug("worktree remove failed; falling back to rmtree", exc_info=True)
         shutil.rmtree(handle.path, ignore_errors=True)
-        try:  # the per-run directory goes when its last worktree does (best effort; a sibling may still be busy)
-            handle.path.parent.rmdir()
-        except OSError:
-            pass
+        # NOT the per-run directory: a sibling attempt of the same run may be creating its worktree right now (removing
+        # the parent underneath `git worktree add` failed 3/170 runs in the stress gate). gc_run removes it at run end.
 
     def gc_run(self, run_id: UUID) -> int:
         """Remove every worktree directory of a run — called by the orchestrator once the run is terminal, so what a
