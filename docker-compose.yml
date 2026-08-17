@@ -64,7 +64,9 @@ services:
       MAS_MODEL_WORKER: ${MAS_MODEL_WORKER:-}
       MAS_MODEL_PRICES: ${MAS_MODEL_PRICES:-}
       MAS_OPENAI_BASE_URL: ${MAS_OPENAI_BASE_URL:-https://api.openai.com/v1}
-    command: ["mas", "worker", "--stub", "--stub-sleep", "${MAS_STUB_SLEEP:-0.5}"]
+      # Command tools: no docker.sock in here — requests go through Postgres to `mas execute --watch` on the host.
+      MAS_EXEC_BACKEND: ${MAS_EXEC_BACKEND:-remote}
+    command: ["mas", "worker", "--agent", "${MAS_WORKER_AGENT:-stub}", "--stub-sleep", "${MAS_STUB_SLEEP:-0.5}"]
     volumes:
       - ${MAS_DATA_DIR:-./.mas}:/data
       - ./acceptance:/app/acceptance:ro

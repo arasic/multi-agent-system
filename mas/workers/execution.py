@@ -57,6 +57,8 @@ class CommandResult:
     timed_out: bool = False
     truncated: bool = False
     cancelled: bool = False
+    abandoned: bool = False  # the execution runner died mid-command; the command was NOT replayed (side effects unknown)
+    error: str | None = None  # the execution machinery itself failed / refused (not the command's own exit status)
 
     def render(self) -> str:
         head = f"exit_code={self.exit_code}"
@@ -64,9 +66,27 @@ class CommandResult:
             head += " TIMED_OUT"
         if self.cancelled:
             head += " CANCELLED"
+        if self.abandoned:
+            head += " ABANDONED"
         if self.truncated:
             head += " OUTPUT_TRUNCATED"
+        if self.error:
+            head += f" ERROR: {self.error}"
         return f"{head} ({self.duration_s:.1f}s)\n{self.output}"
+
+    def as_dict(self, *, with_output: bool = False) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "exit_code": self.exit_code,
+            "duration_s": self.duration_s,
+            "timed_out": self.timed_out,
+            "truncated": self.truncated,
+            "cancelled": self.cancelled,
+            "abandoned": self.abandoned,
+            "error": self.error,
+        }
+        if with_output:
+            d["output"] = self.output
+        return d
 
 
 def kill_tree(proc: subprocess.Popen) -> None:

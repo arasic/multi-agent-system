@@ -78,10 +78,10 @@ def test_slow_call_is_bounded_by_the_deadline_and_recorded_as_unpriced_error():
     with pytest.raises(ProviderUnavailable, match="timed out"):
         m.complete(MSG, timeout_s=120)  # the caller asked for 120 s; the attempt has ~1.6 s → the meter clamps
     assert time.monotonic() - t0 < 5.0
-    assert inner.calls[0]["timeout_s"] is not None and inner.calls[0]["timeout_s"] <= 1.6
+    assert inner.calls[0]["timeout_s"] is not None and inner.calls[0]["timeout_s"] <= 1.6 + 1e-6  # clock granularity
     r = sink.records[0]
     assert r.status == "error" and not r.priced and r.input_tokens == 0 and "timed out" in r.error
-    assert r.meta["timeout_s"] <= 1.6 and m.errors == 1 and m.calls == 1
+    assert r.meta["timeout_s"] <= 1.6 + 1e-6 and m.errors == 1 and m.calls == 1
     # after the timeout the deadline is gone: the next call is refused, not attempted
     with pytest.raises(AttemptDeadlineExceeded):
         m.complete(MSG)

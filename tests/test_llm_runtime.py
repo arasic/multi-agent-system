@@ -129,7 +129,7 @@ def test_llm_agent_builds_the_diamond_end_to_end(conn, tmp_path):
 def test_runtime_owns_the_execution_backend_and_records_its_identity(conn, tmp_path):
     created: list[LocalExecutionBackend] = []
 
-    def factory(worktree, attempt_id):
+    def factory(worktree, claim):
         b = LocalExecutionBackend(worktree, unsafe_ok=True)  # test-only; the CLI never builds this one
         created.append(b)
         return b

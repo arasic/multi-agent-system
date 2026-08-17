@@ -5,6 +5,7 @@ mas run --dag FILE [--workers N ...]     in-process run: orchestrator + N worker
 mas submit --dag FILE [--wait]           create a run for the orchestrator/worker services to execute
 mas orchestrate --watch [--verifier external|acceptance|stub] [--parallel N]   orchestrator service (bounded, concurrent)
 mas verify --watch | --once              verifier service: real sandboxed verdicts for runs left in VERIFYING
+mas execute --watch | --once             execution-runner service: workers' command requests → per-attempt sandboxes
 mas worker [--agent stub|llm] [--model <provider>:<model>] [--exec-backend sandbox|none]   worker service (compose)
 mas models [--ping]                      configured model roles, pricing status; --ping makes one metered test call
 mas status RUN_ID                        summary + metrics (+ pending questions when AWAITING_INPUT)
@@ -425,21 +426,71 @@ def _agent(kind: str, *, stub_sleep: float, provider) -> Any:
     raise SystemExit(f"unknown agent {kind!r}")
 
 
-def _exec_backend_factory(kind: str | None):
-    """MAS_EXEC_BACKEND / --exec-backend: sandbox (default; one hardened container per attempt, needs Docker) | none.
-    Never 'local' — that backend is test-only. Without Docker the sandbox is unavailable → no command tools (fail closed)."""
+def _exec_backend_factory(kind: str | None, *, worker_id: str = "worker"):
+    """MAS_EXEC_BACKEND / --exec-backend:
+    sandbox (default; one hardened container per attempt, needs Docker on this host) |
+    remote  (compose workers: no docker.sock; commands go through Postgres to `mas execute --watch` on a Docker host) |
+    none.   Never 'local' — that backend is test-only. Without Docker the sandbox is unavailable → no command tools."""
     from mas.workers.execution import SandboxExecutionBackend, sandbox_spec_from_settings
 
     kind = (kind or settings().exec_backend).strip().lower()
     if kind in ("none", "off", ""):
         return None
+    if kind == "remote":
+        from mas.workers.exec_remote import RemoteExecutionBackend
+
+        db_url = settings().database_url
+        return lambda worktree, claim: RemoteExecutionBackend(
+            db_url, run_id=claim.run.id, task_id=claim.task.id, attempt_id=claim.attempt.id, worker_id=worker_id
+        )
     if kind != "sandbox":
-        raise SystemExit(f"unknown execution backend {kind!r} (sandbox | none)")
+        raise SystemExit(f"unknown execution backend {kind!r} (sandbox | remote | none)")
     if shutil.which(settings().exec_docker or "docker") is None:
         print("warning: docker not found; command tools disabled for this worker (MAS_EXEC_BACKEND=sandbox)", file=sys.stderr)
         return None
     spec = sandbox_spec_from_settings()
-    return lambda worktree, attempt_id: SandboxExecutionBackend(worktree, attempt_id=attempt_id, spec=spec)
+    return lambda worktree, claim: SandboxExecutionBackend(worktree, attempt_id=claim.attempt.id, spec=spec)
+
+
+def cmd_execute(args: argparse.Namespace) -> int:
+    """Execution-runner service: claims workers' command requests (exec_requests) and runs them in per-attempt sandbox
+    containers on this host. Runs where Docker is — typically the host, next to `mas verify --watch`."""
+    from mas.workers.exec_runner import ExecRunner
+    from mas.workers.execution import sandbox_spec_from_settings
+
+    if shutil.which(settings().exec_docker or "docker") is None:
+        print("docker not found: the execution runner needs Docker on this host", file=sys.stderr)
+        return 2
+    conn = connect()
+    migrate(conn)
+    conn.close()
+    runner = ExecRunner(
+        settings().database_url,
+        worktree_root=Path(settings().worktree_root),
+        spec=sandbox_spec_from_settings(),
+        max_parallel=args.parallel,
+        tick_s=args.tick_s,
+        runner_id=args.id,
+    )
+    if args.once:
+        conn = connect()
+        try:
+            n = runner.run_once(conn)
+        finally:
+            runner.close_all()
+            conn.close()
+        print(f"executed {n} request(s)")
+        return 0
+    print(
+        f"execution runner {runner.runner_id}: worktrees={runner.worktree_root} image={runner.spec.image} "
+        f"parallel={args.parallel} (Ctrl-C to stop)"
+    )
+    stop = threading.Event()
+    try:
+        runner.serve_forever(stop)
+    except KeyboardInterrupt:
+        stop.set()
+    return 0
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
@@ -457,7 +508,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
         pools=pools,
         workspace=ws,
         provider=provider,
-        exec_backend_factory=_exec_backend_factory(args.exec_backend) if kind == "llm" else None,
+        exec_backend_factory=_exec_backend_factory(args.exec_backend, worker_id=wid) if kind == "llm" else None,
     )
     model = f"{provider.name}:{provider.model}" if provider else "none"
     print(f"{wid}: agent={kind} capabilities={caps} pools={pools} model={model} (Ctrl-C to stop)")
@@ -652,6 +703,14 @@ def build_parser() -> argparse.ArgumentParser:
     vf.add_argument("--parallel", type=int, default=2, help="max concurrent verifications (each is a sandbox)")
     vf.add_argument("--stub-verifier", action="store_true", help="explicit test mode only")
     vf.set_defaults(fn=cmd_verify)
+
+    ex = sub.add_parser("execute", help="execution-runner service: run workers' command requests in per-attempt sandboxes")
+    ex.add_argument("--watch", action="store_true")
+    ex.add_argument("--once", action="store_true", help="execute all currently pending requests once and exit")
+    ex.add_argument("--tick-s", type=float, default=0.2)
+    ex.add_argument("--parallel", type=int, default=4, help="max concurrent commands (each in its attempt's sandbox)")
+    ex.add_argument("--id", default=None, help="runner id (default: host-derived)")
+    ex.set_defaults(fn=cmd_execute)
 
     w = sub.add_parser("worker", help="worker service")
     w.add_argument("--stub", action="store_true", help="alias for --agent stub")

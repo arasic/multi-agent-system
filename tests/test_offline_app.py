@@ -93,8 +93,8 @@ def test_offline_trivial_app_built_by_the_llm_loop_passes_the_real_verifier(conn
     spec = SandboxSpec(image=verifier_image, max_life_s=600)
     made: list[SandboxExecutionBackend] = []
 
-    def factory(worktree, attempt_id):
-        b = SandboxExecutionBackend(worktree, attempt_id=attempt_id, spec=spec)
+    def factory(worktree, claim):
+        b = SandboxExecutionBackend(worktree, attempt_id=claim.attempt.id, spec=spec)
         made.append(b)
         return b
 

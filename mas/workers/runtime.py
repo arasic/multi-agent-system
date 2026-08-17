@@ -108,7 +108,7 @@ class Worker:
         pricing: Pricing | None = None,
         attempt_max_calls: int | None = None,
         attempt_max_tokens: int | None = None,
-        exec_backend_factory: Callable[[Path, UUID], Any] | None = None,
+        exec_backend_factory: Callable[[Path, Claim], Any] | None = None,
     ):
         self.worker_id = worker_id
         self.capabilities = list(capabilities)
@@ -126,7 +126,7 @@ class Worker:
         self.attempt_max_calls = attempt_max_calls if attempt_max_calls is not None else settings().attempt_max_calls
         self.attempt_max_tokens = attempt_max_tokens if attempt_max_tokens is not None else settings().attempt_max_tokens
         self._telemetry_lock = threading.Lock()
-        # confined execution for command tools, one backend per attempt: (worktree, attempt_id) -> ExecutionBackend.
+        # confined execution for command tools, one backend per attempt: (worktree, claim) -> ExecutionBackend.
         # The runtime creates it after the worktree exists and closes it in every exit path, so the sandbox never
         # outlives the attempt. None = the agent gets no command tools (stub agents; workers without Docker).
         self.exec_backend_factory = exec_backend_factory
@@ -244,7 +244,7 @@ class Worker:
             else:
                 if handle is not None and self.exec_backend_factory is not None:
                     try:
-                        backend = self.exec_backend_factory(handle.path, claim.attempt.id)
+                        backend = self.exec_backend_factory(handle.path, claim)
                     except Exception:  # no confined execution → no command tools (fail closed), the attempt still runs
                         log.exception("execution backend unavailable for %s; command tools disabled", claim.task.key)
                         backend = None
