@@ -4,10 +4,17 @@ Provider-neutral message and tool shapes — every concrete provider translates 
 
     {"role": "system",    "content": str}                                   # hoisted by providers that take it separately
     {"role": "user",      "content": str}
-    {"role": "assistant", "content": str, "tool_calls": [{"id", "name", "input"}]}   # tool_calls optional
+    {"role": "assistant", "content": str, "tool_calls": [{"id", "name", "input"}],   # tool_calls optional
+                          "native": {"provider": str, "content": [...]}}             # native optional, see below
     {"role": "tool",      "tool_call_id": str, "content": str, "is_error": bool}    # one per tool result
 
     tools = [{"name": str, "description": str, "input_schema": {<JSON schema>}}]
+
+`native` is the assistant turn exactly as the producing provider returned it (its own content blocks — e.g. signed
+thinking blocks that the vendor requires back, unchanged, with the tool results). It is opaque to everything outside
+`mas/providers/`: `Completion.as_message()` carries it, the provider named in it replays it verbatim instead of
+rebuilding the turn from text + tool_calls, every other provider ignores it, and the gateway forwards it across its
+wire so a worker behind the gateway continues a tool round exactly like a direct client.
 
 Nothing outside `mas/providers/` and config may name a model or a vendor (CLAUDE.md). The rest of the system sees
 `ModelProvider.complete(...) -> Completion` and `Usage`.
@@ -95,6 +102,7 @@ class Completion:
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str = "end_turn"  # one of STOP_REASONS
     request_id: str | None = None
+    native: dict[str, Any] | None = None  # {"provider": name, "content": [provider blocks]} — the turn to replay verbatim
 
     @property
     def refused(self) -> bool:
@@ -105,7 +113,20 @@ class Completion:
         m: dict[str, Any] = {"role": "assistant", "content": self.text}
         if self.tool_calls:
             m["tool_calls"] = [t.as_dict() for t in self.tool_calls]
+        if self.native:
+            m["native"] = self.native
         return m
+
+
+def native_content(message: dict[str, Any], provider: str) -> list[dict[str, Any]] | None:
+    """The `native` blocks of an assistant message if they were produced by `provider` (else None)."""
+    native = message.get("native")
+    if not isinstance(native, dict) or native.get("provider") != provider:
+        return None
+    content = native.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    return [dict(b) for b in content if isinstance(b, dict)]
 
 
 class ModelProvider(Protocol):

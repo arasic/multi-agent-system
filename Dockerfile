@@ -11,7 +11,9 @@ RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin mas \
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY mas ./mas
-RUN pip install --no-cache-dir .
+# ".[llm]" = the vendor SDK too: the gateway service (the one process with a vendor key) builds real providers from
+# this same image; workers/orchestrator never hold a key and never import it.
+RUN pip install --no-cache-dir ".[llm]"
 
 COPY benchmarks ./benchmarks
 COPY acceptance ./acceptance

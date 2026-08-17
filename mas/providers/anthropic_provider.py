@@ -12,7 +12,11 @@ Request shape (current models):
   Claude-API-only beta we cannot exercise offline;
 - SDK retries are OFF (`max_retries=0`); retries run in `call_with_retries` so that a call's `timeout_s` budget bounds
   every request and every backoff/Retry-After sleep — nothing can silently outlive the attempt's deadline;
-- `stop_reason == "refusal"` is surfaced as `Completion.stop_reason="refusal"` (empty text), never as an exception.
+- `stop_reason == "refusal"` is surfaced as `Completion.stop_reason="refusal"` (empty text), never as an exception;
+- thinking continuation: with adaptive thinking the API returns signed `thinking` / `redacted_thinking` blocks ahead of
+  every `tool_use` and requires them back **unchanged** in that assistant turn when the tool results arrive (else the
+  next call is a 400). `message_to_completion` therefore keeps the turn's blocks as `Completion.native` and
+  `to_anthropic_messages` replays them verbatim; only turns without such blocks are rebuilt from text + tool_calls.
 
 Usage returned is *unpriced* (`priced=False`); the MeteredProvider prices it from `MAS_MODEL_PRICES`.
 """
@@ -32,6 +36,7 @@ from mas.providers.base import (
     ToolCall,
     Usage,
     call_with_retries,
+    native_content,
 )
 
 log = logging.getLogger(__name__)
@@ -39,6 +44,14 @@ log = logging.getLogger(__name__)
 STREAM_THRESHOLD_TOKENS = 16_000  # above this the SDK needs streaming to avoid HTTP timeouts
 DEFAULT_MODEL = "claude-opus-5"
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
+NATIVE_PROVIDER = "anthropic"  # tag on Completion.native / message["native"]: only this provider replays those blocks
+# response block types replayed verbatim, and the fields the Messages API accepts back for each of them
+_REPLAY_FIELDS = {
+    "thinking": ("thinking", "signature"),
+    "redacted_thinking": ("data",),
+    "text": ("text",),
+    "tool_use": ("id", "name", "input"),
+}
 
 
 class AnthropicProvider:
@@ -152,7 +165,10 @@ def to_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
 
 def to_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
     """Provider-neutral messages → (system, Anthropic messages). Consecutive tool results are folded into ONE user
-    message (all results of a parallel tool round must travel together)."""
+    message (all results of a parallel tool round must travel together). An assistant turn this provider produced
+    (`native`) is replayed block for block — thinking blocks included, unchanged — so a tool round continues; a turn
+    without usable native blocks is rebuilt from text + tool_calls, and an empty one is dropped (the API rejects empty
+    text; consecutive same-role turns are merged server-side)."""
     system_parts: list[str] = []
     out: list[dict[str, Any]] = []
     for m in messages:
@@ -163,10 +179,15 @@ def to_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str | None, l
         elif role == "user":
             out.append({"role": "user", "content": str(m.get("content", ""))})
         elif role == "assistant":
+            replay = _replayable(native_content(m, NATIVE_PROVIDER))
+            if replay:
+                out.append({"role": "assistant", "content": replay})
+                continue
             calls = m.get("tool_calls") or []
             text = str(m.get("content", "") or "")
             if not calls:
-                out.append({"role": "assistant", "content": text})
+                if text.strip():
+                    out.append({"role": "assistant", "content": text})
             else:
                 blocks: list[dict[str, Any]] = []
                 if text.strip():
@@ -194,15 +215,49 @@ def to_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str | None, l
     return system, out
 
 
+def _replay_block(block: Any) -> dict[str, Any] | None:
+    """A response content block → the input block the API accepts back unchanged (None: not a replayable type)."""
+    btype = getattr(block, "type", None)
+    fields = _REPLAY_FIELDS.get(btype)
+    if fields is None:
+        return None
+    out: dict[str, Any] = {"type": btype}
+    for name in fields:
+        value = getattr(block, name, None)
+        if value is None:
+            continue
+        out[name] = dict(value) if name == "input" else value
+    if btype == "text" and not str(out.get("text", "")).strip():
+        return None  # the API rejects empty text blocks
+    if btype == "tool_use" and not out.get("id"):
+        return None
+    return out
+
+
+def _replayable(blocks: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Native blocks worth replaying: at least one text or tool_use block (a thinking-only turn — e.g. cut off by
+    max_tokens before any output — is rebuilt/dropped instead; nothing downstream depends on it)."""
+    if not blocks:
+        return None
+    if not any(b.get("type") in ("text", "tool_use") for b in blocks):
+        return None
+    return blocks
+
+
 def message_to_completion(msg: Any) -> Completion:
     text_parts: list[str] = []
     calls: list[ToolCall] = []
+    replay: list[dict[str, Any]] = []
     for block in getattr(msg, "content", []) or []:
         btype = getattr(block, "type", None)
         if btype == "text":
             text_parts.append(getattr(block, "text", "") or "")
         elif btype == "tool_use":
             calls.append(ToolCall(id=str(block.id), name=str(block.name), input=dict(block.input or {})))
+        rb = _replay_block(block)
+        if rb is not None:
+            replay.append(rb)
+    native = {"provider": NATIVE_PROVIDER, "content": replay} if replay else None
     u = getattr(msg, "usage", None)
     usage = Usage(
         model=str(getattr(msg, "model", "") or ""),
@@ -220,6 +275,7 @@ def message_to_completion(msg: Any) -> Completion:
         tool_calls=calls,
         stop_reason=stop,
         request_id=getattr(msg, "_request_id", None),
+        native=native,
     )
 
 

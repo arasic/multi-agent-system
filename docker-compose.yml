@@ -71,6 +71,13 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       MAS_OPENAI_BASE_URL: ${MAS_UPSTREAM_OPENAI_BASE_URL:-https://api.openai.com/v1}
+      # Request shape of the real upstream = the same settings the direct (in-process) path reads, so live and
+      # distributed evidence are produced under one configuration (defaults mirror mas/config.py).
+      MAS_ANTHROPIC_THINKING: ${MAS_ANTHROPIC_THINKING:-1}
+      MAS_ANTHROPIC_EFFORT: ${MAS_ANTHROPIC_EFFORT:-}
+      MAS_ANTHROPIC_FALLBACKS: ${MAS_ANTHROPIC_FALLBACKS:-}
+      MAS_PROVIDER_TIMEOUT_S: ${MAS_PROVIDER_TIMEOUT_S:-600}
+      MAS_PROVIDER_MAX_RETRIES: ${MAS_PROVIDER_MAX_RETRIES:-2}
     command: ["mas", "gateway"]
     networks: [backend, frontend]
     read_only: true

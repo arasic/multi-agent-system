@@ -7,6 +7,11 @@ backend network is the intended production path). No SDK dependency; the transpo
 Config: `MAS_OPENAI_BASE_URL` (default https://api.openai.com/v1), `OPENAI_API_KEY` / `MAS_OPENAI_API_KEY`,
 `MAS_OPENAI_MAX_TOKENS_FIELD` (`max_completion_tokens` default; older servers want `max_tokens`).
 Usage returned is unpriced; the MeteredProvider prices it from `MAS_MODEL_PRICES`. Only this module names the vendor.
+
+One extension on the wire, both directions: an assistant message may carry `mas_native` — the neutral shape's `native`
+(the upstream provider's own content blocks, e.g. signed thinking blocks the vendor needs back with tool results). The
+mas gateway emits it in responses and restores it from requests, so a worker behind the gateway continues a tool round
+exactly like a direct client. A foreign server never emits it, so a client of a foreign server never sends it.
 """
 
 from __future__ import annotations
@@ -31,6 +36,8 @@ from mas.providers.base import (
 )
 
 log = logging.getLogger(__name__)
+
+NATIVE_FIELD = "mas_native"  # wire name of the neutral shape's `native` on assistant messages (see module docstring)
 
 # transport(url, body_bytes, headers, timeout_s) -> (status, headers, body_bytes)
 Transport = Callable[[str, bytes, dict[str, str], float], tuple[int, dict[str, str], bytes]]
@@ -169,6 +176,8 @@ def to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     }
                     for c in calls
                 ]
+            if isinstance(m.get("native"), dict):
+                entry[NATIVE_FIELD] = m["native"]
             out.append(entry)
         elif role == "tool":
             content = str(m.get("content", ""))
@@ -220,8 +229,15 @@ def response_to_completion(data: dict[str, Any], *, request_id: str | None = Non
         cache_read_tokens=int(details.get("cached_tokens") or 0),
         priced=False,
     )
+    native = msg.get(NATIVE_FIELD)
     return Completion(
-        text=str(text), usage=usage, raw=data, tool_calls=calls, stop_reason=stop, request_id=request_id or data.get("id")
+        text=str(text),
+        usage=usage,
+        raw=data,
+        tool_calls=calls,
+        stop_reason=stop,
+        request_id=request_id or data.get("id"),
+        native=native if isinstance(native, dict) else None,
     )
 
 
@@ -280,6 +296,8 @@ def from_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
                 calls.append({"id": str(tc.get("id") or ""), "name": str(fn.get("name") or ""), "input": args})
             if calls:
                 entry["tool_calls"] = calls
+            if isinstance(m.get(NATIVE_FIELD), dict):
+                entry["native"] = m[NATIVE_FIELD]
             out.append(entry)
         elif role == "tool":
             is_error = text.startswith("ERROR: ")
@@ -320,6 +338,8 @@ def to_openai_response(comp: Completion, *, model: str, response_id: str) -> dic
             {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": json.dumps(tc.input)}}
             for tc in comp.tool_calls
         ]
+    if comp.native:
+        msg[NATIVE_FIELD] = comp.native
     finish = {"end_turn": "stop", "tool_use": "tool_calls", "max_tokens": "length", "refusal": "content_filter"}.get(
         comp.stop_reason, "stop"
     )

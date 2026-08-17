@@ -9,7 +9,9 @@
 
 Workers keep `--network` internal-only and use the ordinary `openai:` provider with `MAS_OPENAI_BASE_URL` pointing here;
 their own meter records usage and prices from the response's real upstream model id. The gateway does not persist
-anything (no key, no prompts): it translates one wire shape, applies bounds, forwards, and counts.
+anything (no key, no prompts): it translates one wire shape, applies bounds, forwards, and counts. The upstream's native
+assistant blocks (`Completion.native`, e.g. signed thinking blocks) ride along as `mas_native` on the wire in both
+directions, so a worker behind the gateway continues a tool round exactly like a direct client (openai_compat.py).
 Stdlib only (`http.server`), no streaming (`stream: true` → 400). This is a narrow egress control, not an auth system:
 the bearer token stops accidental use, the network layout stops the rest.
 """
