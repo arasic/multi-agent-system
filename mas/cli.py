@@ -316,8 +316,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             f"max_concurrency={max_concurrency}, pool={pool})"
         )
         # bounded repair (13-lite) after a verifier FAIL needs a planner for the amendment; --planner fake|llm opts in
-        planner = SingleAgentRepairPlanner() if config in {"A", "B"} else (
-            _planner(args.planner, spec=args.planner_model) if args.planner else None
+        planner = (
+            SingleAgentRepairPlanner()
+            if config in {"A", "B"}
+            else (_planner(args.planner, spec=args.planner_model) if args.planner else None)
         )
     if args.chaos_kill_after is not None and dag is None:
         raise SystemExit("--chaos-kill-after needs --dag")
@@ -479,9 +481,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     conn = connect()
     migrate(conn)
     if dag is None:
-        run = runs_mod.create_run(
-            conn, goal=args.goal, budgets=budgets, benchmark=args.benchmark, config=config, pool=args.pool
-        )
+        run = runs_mod.create_run(conn, goal=args.goal, budgets=budgets, benchmark=args.benchmark, config=config, pool=args.pool)
         print(f"submitted run {run.id} (goal, to be planned) status={run.status.value} pool={args.pool}")
     else:
         run = runs_mod.create_run_from_dag(

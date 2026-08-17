@@ -62,7 +62,7 @@ Legend: ✅ enforced and tested today · 🟡 designed, not built yet (roadmap s
 | D3 | **Starting with MAS instead of climbing the ladder** (discuss.md: deterministic → workflow → single agent → agent+verifier → parallel → MAS) | Complexity before evidence | Built in that order: deterministic substrate first, LLM last; single-agent configs A/B are first-class | ✅ |
 | D4 | **More agents for their own sake** (discuss.md rates it 2/10) | Cost without benefit | The value question is measured (A/B/C/D, N-sweep); MAS must *earn* each agent | 🟡 M3 |
 | D5 | **Parallelising coupled work** (Anthropic: interdependent tasks are poor fits) | Merge pain eats the speedup | Benchmark design separates the coupled smoke test from the width benchmark; integration is an explicit task | 🟡 M3 |
-| D6 | **Unfair baseline** — MAS+verifier vs naive single agent | Measures the verifier, not the architecture | Baseline = single agent + same tools + same verifier + same budgets, inside the same runtime | 🟡 step 14 |
+| D6 | **Unfair baseline** — MAS+verifier vs naive single agent | Measures the verifier, not the architecture | Baseline = single agent + same tools + same verifier + same budgets, inside the same runtime | ✅ step 14 |
 | D7 | **Design drift between iterations** (our own discussion lost conflict handling, moved verification) | Decisions evaporate | Frozen docs + ADR process; drift is named and resolved, not absorbed | ✅ (docs/adr) |
 | D8 | **Product/architecture confusion** — MAS vs SOC vs "autonomous organisation" (discuss.md) | Building three things at once | MVP = MAS runtime + fair comparison; SOC = experiment #2 | ✅ |
 | D9 | **Unverified claims presented as facts** (model names, TPS, prices in discuss.md) | Architecture built on numbers nobody checked | `docs/models.md` is dated, marked unverified, non-load-bearing; `ModelProvider` abstraction | ✅ |
@@ -92,4 +92,4 @@ Legend: ✅ enforced and tested today · 🟡 designed, not built yet (roadmap s
 3. ~~**A8/A2 — validator rule 4**~~ → done (policy half); tool implementations bound to the allow-list at step 10.
 4. ~~**C2/C3 — real acceptance-suite verifier and read-only mount**~~ → done (7A–C; sandbox + trusted adapters).
 5. ~~**B8 — forced-disagreement demo**~~ → done (A7: `benchmarks/forced_disagreement`, `tests/test_conflicts.py`).
-6. **D4–D6 — fair comparison:** executable A/B/C/D harness and width suites are done; real ≥5-run matrix/write-up remains.
+6. **D4–D5 — measured value:** executable A/B/C/D harness and width suites are done; real ≥5-run matrix/write-up remains. **D6 baseline fairness is complete** in the shared runtime.

@@ -124,8 +124,7 @@ def evaluate(live_path: Path, distributed_path: Path, benchmark_dir: Path) -> li
             "same_revision",
             bool(live_git.get("commit"))
             and live_git.get("commit") == distributed_git.get("commit") == manifest.get("git_commit"),
-            f"live={live_git.get('commit')} distributed={distributed_git.get('commit')} "
-            f"matrix={manifest.get('git_commit')}",
+            f"live={live_git.get('commit')} distributed={distributed_git.get('commit')} matrix={manifest.get('git_commit')}",
         ),
     ]
     return checks

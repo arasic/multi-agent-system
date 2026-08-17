@@ -69,6 +69,7 @@ Setup (Windows: `.venv/Scripts/…`; POSIX: `.venv/bin/…`):
 python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"     # add ",llm" for the Anthropic SDK (real providers)
 docker compose up -d postgres            # Postgres 16 on localhost:5432 (mas/mas/mas)
 .venv/Scripts/mas migrate
+.venv/Scripts/mas doctor                 # local preflight; add --require-live before provider-backed gates
 ```
 
 Local (in-process orchestrator + N stub worker threads — dev/demo):
@@ -84,6 +85,7 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 .venv/Scripts/mas run --goal "Build a URL shortener..." --planner fake --agent llm --model fake:builder   # step 11 gate offline: contract → approve → DAG → workers → verifier
 .venv/Scripts/mas approve <run_id> [--contract edited.json]     # freeze the proposed acceptance contract (ADR-007); the planner then produces the DAG
 .venv/Scripts/mas artifacts <run_id>                             # git_commit shas, <sha>:path documents, verification
+.venv/Scripts/mas result <run_id> --output ./verified-result     # export the exact accepted commit plus evidence sidecar
 .venv/Scripts/mas run --dag ... --agent llm --model fake:demo    # LLM worker loop (fake provider: no key; real: anthropic:<model> / openai:<model>)
 .venv/Scripts/mas models                                         # configured model roles + pricing status (MAS_MODEL_*, MAS_MODEL_PRICES)
 .venv/Scripts/mas models --ping --spec fake:demo                 # one metered test call (use anthropic:<model> / openai:<model> with a key)
@@ -98,15 +100,23 @@ git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's who
 Distributed (real separate processes):
 
 ```
-docker compose build
-MAS_WORKER_AGENT=llm docker compose up -d --scale worker=3 postgres orchestrator gateway worker   # LLM workers → gateway (fake:builder by default; set MAS_GATEWAY_UPSTREAM=anthropic:<model> + ANTHROPIC_API_KEY for a real model)
-.venv/Scripts/mas verify --watch                                 # verifier service on the host: real sandboxed verdicts
-.venv/Scripts/mas execute --watch                                # execution-runner service on the host: compose workers' command tools (sandboxes)
+.venv/Scripts/mas up --offline --build --workers 3               # supervised key-less stack + trusted host services
+.venv/Scripts/mas up --build --workers 3                         # real provider; requires `mas doctor --require-live`
 .venv/Scripts/mas submit --dag benchmarks/url_shortener/dag.json --wait   # -> PASSED offline (fake:builder) through the whole service path
-.venv/Scripts/mas submit --dag benchmarks/url_shortener/dag.json --wait   # → PASSED offline (fake:builder) through the whole service path
-.venv/Scripts/mas submit --dag benchmarks/url_shortener/dag.json --wait
+.venv/Scripts/mas result <run_id> --output ./verified-result
 docker kill multi-agent-system-worker-2                          # A5 demo: reaper recovers the task
 .venv/Scripts/mas verify --once                                  # verify whatever is VERIFYING right now, then exit
+.venv/Scripts/mas down                                           # stop the Compose services started by `mas up`
+python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-smoke.json
+```
+
+Frozen MVP evidence (run on one clean commit with a real provider and exact `MAS_MODEL_PRICES`):
+
+```
+python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m> --step all --no-auto-approve --output mvp-evidence/live-smoke.json
+python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-smoke.json
+python scripts/benchmark.py --cheap-model <p:m> --strong-model <p:m> --planner-model <p:m> --worker-model <p:m> --repeats 5 --output benchmark-results
+python scripts/mvp_gate.py                                      # direct live + distributed + priced 100-run matrix
 ```
 
 Tests and lint (no API key needed; DB tests skip if Postgres is unreachable). **Run the tier a change can affect, not
