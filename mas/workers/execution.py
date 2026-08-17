@@ -320,6 +320,11 @@ def sandbox_spec_from_settings(cfg: Any = None) -> SandboxSpec:
     )
 
 
+def _container_gone(output: str) -> bool:
+    o = output.lower()
+    return "no such container" in o or "is not running" in o or "container" in o and "not found" in o
+
+
 class SandboxExecutionBackend:
     """One hardened container per attempt. Started lazily on the first command, removed at close()."""
 
@@ -456,6 +461,14 @@ class SandboxExecutionBackend:
         self.commands += 1
         if res.exit_code == 137 and not res.timed_out:
             res.timed_out = True  # `timeout -s KILL` reports 137 when it killed the command
+        if res.exit_code not in (None, 0) and _container_gone(res.output):
+            # the sandbox died underneath us (killed / evicted / max_life_s reached): typed error, and the next command
+            # gets a fresh container for the same worktree — never a silent "No such container" forever
+            with self._lock:
+                self._started = False
+            res.error = "sandbox container is gone (killed or expired); it will be recreated for the next command"
+            res.output = ""
+            return res
         if res.cancelled or res.truncated or (res.timed_out and res.exit_code != 137):
             # the client was killed host-side; the process inside may still be running → end everything in the container
             self._kill_all()
