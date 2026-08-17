@@ -222,7 +222,9 @@ def test_verifier_alone_decides_pass(conn):
     v = StubVerifier(passed=False, report={"failed": ["GET /x → 500"]})
     out = execute(conn, diamond(), workers=3, stub_sleep=0.05, verifier=v)
     assert out.run.status is RunStatus.FAILED
-    assert out.run.verdict == "FAIL:verification failed"
+    # no planner here → the run may not repair; the verdict says so (13-lite) with a reason code
+    assert out.run.verdict.startswith("FAIL:verification failed") and "planner" in out.run.verdict
+    assert out.run.verdict_reason == "UNRECOVERABLE_FAILURE"
     assert v.calls == 1
     integ = next(t for t in sm.tasks_for_run(conn, out.run.id) if t.key == "T5")
     assert integ.status is TaskStatus.COMPLETED  # agents "succeeded"; the verifier still said no

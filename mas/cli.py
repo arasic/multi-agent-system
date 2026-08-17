@@ -72,6 +72,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_attempt_runtime_s=args.max_attempt_runtime_s,
         max_tokens=args.max_tokens,
         max_attempt_tokens=args.max_attempt_tokens,
+        max_replans=args.max_replans,
     )
     caps = set(settings().worker_capabilities)
     conn = connect()
@@ -117,6 +118,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(
             f"run {run.id}  ({len(dag.tasks)} tasks, {args.workers} workers, max_concurrency={args.max_concurrency}, pool={pool})"
         )
+        # bounded repair (13-lite) after a verifier FAIL needs a planner for the amendment; --planner fake|llm opts in
+        planner = _planner(args.planner, spec=args.planner_model) if args.planner else None
     if args.chaos_kill_after is not None and dag is None:
         raise SystemExit("--chaos-kill-after needs --dag")
 
@@ -162,7 +165,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         threading.Thread(target=_chaos, daemon=True).start()
 
-    verifier = StubVerifier(passed=not args.verifier_fail) if args.stub_verifier or args.verifier_fail else _acceptance_verifier()
+    if args.stub_verifier or args.verifier_fail or args.verifier_fail_times:
+        verifier = StubVerifier(passed=not args.verifier_fail, fail_times=args.verifier_fail_times)
+    else:
+        verifier = _acceptance_verifier()
     timeout = args.timeout if args.timeout is not None else args.max_wallclock_s + 60
     t0 = time.monotonic()
     try:
@@ -175,7 +181,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             t.join(timeout=5)
     elapsed = time.monotonic() - t0
     m = metrics.compute(conn, run.id)
-    print(f"\n{final.status.value}  verdict={final.verdict}  in {elapsed:.2f}s")
+    reason = f"  reason={final.verdict_reason}" if final.verdict_reason else ""
+    print(f"\n{final.status.value}  verdict={final.verdict}{reason}  in {elapsed:.2f}s")
     _print_metrics(m)
     for w in workers:
         s = w.stats
@@ -218,7 +225,8 @@ def _print_metrics(m: metrics.RunMetrics) -> None:
         f"  attempts={m.attempts} {m.attempts_by_status}  retries={m.retries} abandoned={m.abandoned} timeouts={m.timeouts}\n"
         f"  wall_clock={m.wall_clock_s}s  sum_attempt={m.sum_attempt_s}s  "
         f"max_concurrent={m.max_concurrent_attempts}  parallelism_eff={m.parallelism_efficiency}\n"
-        f"  total={m.total_s}s  machine={m.machine_s}s  human_wait={m.human_wait_s}s  questions={m.questions}\n"
+        f"  total={m.total_s}s  machine={m.machine_s}s  human_wait={m.human_wait_s}s  questions={m.questions}"
+        f"  replans={m.replans_used}\n"
         f"  tokens in/out={m.input_tokens}/{m.output_tokens} cost=${m.cost_usd}  events={m.events}"
     )
     for k, v in m.per_task.items():
@@ -251,6 +259,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         max_attempt_runtime_s=args.max_attempt_runtime_s,
         max_tokens=args.max_tokens,
         max_attempt_tokens=args.max_attempt_tokens,
+        max_replans=args.max_replans,
     )
     conn = connect()
     migrate(conn)
@@ -289,7 +298,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             return 3
         time.sleep(0.5)
     m = metrics.compute(conn, run.id)
-    print(f"{cur.status.value}  verdict={cur.verdict}")
+    print(f"{cur.status.value}  verdict={cur.verdict}" + (f"  reason={cur.verdict_reason}" if cur.verdict_reason else ""))
     _print_metrics(m)
     conn.close()
     return 0 if cur.status.value == "PASSED" else 1
@@ -318,7 +327,8 @@ def cmd_orchestrate(args: argparse.Namespace) -> int:
         final = scheduler.run_until_terminal(
             conn, UUID(args.run), verifier=verifier, tick_s=args.tick_s, planner=planner, capabilities=caps
         )
-        print(f"{final.status.value} verdict={final.verdict}")
+        rs = f" reason={final.verdict_reason}" if final.verdict_reason else ""
+        print(f"{final.status.value} verdict={final.verdict}{rs}")
         return 0 if final.status.value == "PASSED" else 1
     pools = _pools(args.pool)
     ws = _workspace(None)
@@ -689,7 +699,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             d["open"] = report
         print(json.dumps(d, indent=2, default=str))
     else:
-        print(f"{m.status}  verdict={m.verdict}")
+        print(f"{m.status}  verdict={m.verdict}" + (f"  reason={m.verdict_reason}" if m.verdict_reason else ""))
         _print_metrics(m)
         if report:
             if m.status == "AWAITING_INPUT":
@@ -770,6 +780,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--lease-s", type=int, default=5)
     r.add_argument("--max-wallclock-s", type=int, default=300, help="run budget; the run ABORTS with a verdict when exceeded")
     r.add_argument("--max-attempt-runtime-s", type=int, default=120)
+    r.add_argument(
+        "--max-replans", type=int, default=1, help="bounded repair cycles after a verifier FAIL (13-lite; the only repair budget)"
+    )
     r.add_argument("--max-tokens", type=int, default=2_000_000, help="run token budget")
     r.add_argument(
         "--max-attempt-tokens",
@@ -785,6 +798,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--exec-backend", default=None, help="sandbox (default, needs Docker) | none — command tools for llm agents")
     r.add_argument("--chaos-kill-after", type=float, default=None, help="kill a busy worker after N seconds (A5 demo)")
     r.add_argument("--verifier-fail", action="store_true", help="stub verifier returns FAIL")
+    r.add_argument(
+        "--verifier-fail-times",
+        type=int,
+        default=0,
+        help="stub verifier FAILs this many times, then passes (bounded-repair demo: FAIL -> repair -> PASS)",
+    )
     r.add_argument(
         "--stub-verifier",
         action="store_true",
@@ -827,6 +846,7 @@ def build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--lease-s", type=int, default=15)
     sb.add_argument("--max-wallclock-s", type=int, default=600)
     sb.add_argument("--max-attempt-runtime-s", type=int, default=120)
+    sb.add_argument("--max-replans", type=int, default=1)
     sb.add_argument("--max-tokens", type=int, default=2_000_000)
     sb.add_argument("--max-attempt-tokens", type=int, default=200_000)
     sb.add_argument("--wait", action="store_true", help="block until the run is terminal, then print status")

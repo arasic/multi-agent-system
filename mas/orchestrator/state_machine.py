@@ -30,6 +30,7 @@ from mas.models.enums import (
     AttemptStatus,
     RunStatus,
     TaskStatus,
+    VerdictReason,
 )
 from mas.models.types import Artifact, Attempt, Run, Task
 
@@ -145,6 +146,7 @@ def transition_run(
     to: RunStatus,
     *,
     verdict: str | None = None,
+    reason: VerdictReason | None = None,
     payload: dict[str, Any] | None = None,
 ) -> Run:
     row = conn.execute("SELECT * FROM runs WHERE id = %s FOR NO KEY UPDATE", (run_id,)).fetchone()
@@ -158,13 +160,19 @@ def transition_run(
         UPDATE runs SET
             status = %s,
             verdict = COALESCE(%s, verdict),
+            verdict_reason = CASE WHEN %s IN ('FAILED','ABORTED') THEN %s ELSE verdict_reason END,
             started_at = CASE WHEN %s = 'RUNNING' AND started_at IS NULL THEN now() ELSE started_at END,
             finished_at = CASE WHEN %s IN ('PASSED','FAILED','ABORTED') THEN now() ELSE finished_at END
         WHERE id = %s
         """,
-        (to.value, verdict, to.value, to.value, run_id),
+        (to.value, verdict, to.value, reason.value if reason else None, to.value, to.value, run_id),
     )
-    emit(conn, run_id, f"run.{to.value.lower()}", payload={"from": cur.value, "verdict": verdict, **(payload or {})})
+    emit(
+        conn,
+        run_id,
+        f"run.{to.value.lower()}",
+        payload={"from": cur.value, "verdict": verdict, "reason": reason.value if reason else None, **(payload or {})},
+    )
     return Run.from_row(conn.execute("SELECT * FROM runs WHERE id = %s", (run_id,)).fetchone())  # type: ignore[arg-type]
 
 
@@ -390,18 +398,26 @@ def _cancel_live_work(conn: Conn, run_id: UUID, reason: str) -> None:
         transition_task(conn, r["id"], TaskStatus.CANCELLED, payload={"reason": reason})
 
 
-def abort_run(conn: Conn, run_id: UUID, reason: str) -> Run:
+def abort_run(conn: Conn, run_id: UUID, reason: str, *, code: VerdictReason = VerdictReason.BUDGET_EXHAUSTED) -> Run:
     """Budget/deadline/operator abort: run → ABORTED, live attempts → CANCELLED, open tasks → CANCELLED."""
-    run = transition_run(conn, run_id, RunStatus.ABORTED, verdict=f"ABORTED:{reason}", payload={"reason": reason})
+    run = transition_run(conn, run_id, RunStatus.ABORTED, verdict=f"ABORTED:{reason}", reason=code, payload={"detail": reason})
     _cancel_live_work(conn, run_id, f"run aborted: {reason}")
     return run
 
 
-def fail_run(conn: Conn, run_id: UUID, reason: str) -> Run:
-    """Definite failure with a reason: run → FAILED, live attempts → CANCELLED, open tasks → CANCELLED."""
-    run = transition_run(conn, run_id, RunStatus.FAILED, verdict=f"FAIL:{reason}", payload={"reason": reason})
+def fail_run(conn: Conn, run_id: UUID, reason: str, *, code: VerdictReason) -> Run:
+    """Definite failure with a reason code (ADR-008 §6) and text: run → FAILED, live attempts → CANCELLED, open tasks →
+    CANCELLED. The code is one of the six terminal reasons; the text says what happened."""
+    run = transition_run(conn, run_id, RunStatus.FAILED, verdict=f"FAIL:{reason}", reason=code, payload={"detail": reason})
     _cancel_live_work(conn, run_id, f"run failed: {reason}")
     return run
+
+
+def start_replan(conn: Conn, run_id: UUID, *, payload: dict[str, Any] | None = None) -> Run:
+    """Bounded repair (step 13-lite): VERIFYING/RUNNING → REPLANNING and one more replan used. The caller has already
+    decided the run may repair (replans_used < max_replans, no repeated progress fingerprint) — this only records it."""
+    conn.execute("UPDATE runs SET replans_used = replans_used + 1 WHERE id = %s", (run_id,))
+    return transition_run(conn, run_id, RunStatus.REPLANNING, payload=payload)
 
 
 def pass_run(conn: Conn, run_id: UUID) -> Run:

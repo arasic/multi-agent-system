@@ -26,6 +26,7 @@ These restate the invariants as coding constraints. Violating one is a bug even 
 - **Artifacts are immutable.** No `UPDATE` on artifact content/ref. Only `status` and `superseded_by` change, via the artifact module.
 - **The verifier is not a task and not callable by agents.** `acceptance/` is mounted read-only into every worker. The verdict comes only from `mas/verifier/`.
 - **The planner proposes; the driver decides.** `Planner.plan()` returns exactly one typed outcome (DAG | questions | contract proposal); `runs.plan_run` validates and records it, returns rejections as data within `max_plan_attempts`, and fails the run with a verdict after that. The planner never writes acceptance suites, freezes contracts (`mas approve` + `mas/planner/contracts.py` do), changes budgets, sets run state, or selects the execution mode (task-shape metadata is advisory).
+- **Repair is bounded and progress is measured, never declared.** After a verifier FAIL the orchestrator records a deterministic progress fingerprint (`mas/orchestrator/progress.py`) and decides: repeat → `NO_PROGRESS`; `max_replans` spent → `BUDGET_EXHAUSTED`/`NO_PROGRESS`; else one more amendment. `max_replans` is the only repair budget (never add another). Amendments add new tasks on COMPLETED work only (validator rule 9); recorded tasks are never altered. Every non-passing run carries one `verdict_reason` code (ADR-008 §6), set only by `state_machine.fail_run/abort_run`.
 - **Every state change emits an event.** If it isn't in `events`, it didn't happen.
 - **Budgets are enforced in the orchestrator, not requested from agents.** Every run must terminate with a verdict inside its budget.
 - **Workers only write inside their own worktree.** No shared checkout, no writes to `main`, no network side effects other than the model API.
@@ -87,6 +88,7 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 .venv/Scripts/mas models --ping --spec fake:demo                 # one metered test call (use anthropic:<model> / openai:<model> with a key)
 git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's whole history (one branch per attempt)
 .venv/Scripts/mas run --dag ... --workspace none                 # no filesystem (fastest; opaque stub refs)
+.venv/Scripts/mas run --dag ... --verifier-fail-times 1 --planner fake --max-replans 1   # 13-lite demo: FAIL -> amendment -> PASS (replans=1); --verifier-fail -> NO_PROGRESS
 .venv/Scripts/mas contract acceptance/url_shortener_contract/contract.json   # validate an ADR-007 contract; prints suite digest
 ```
 

@@ -24,7 +24,7 @@ All ten must hold, each demonstrated by a repeatable test or scripted demo:
 | A5 | Worker death recovers automatically | Kill a worker mid-attempt → `ABANDONED` → task re-claimed → run completes |
 | A6 | Artifacts stay consistent | Immutability enforced; retries don't inherit partial outputs; supersession chain intact |
 | A7 | Conflicts are representable and resolved visibly | Forced-disagreement demo: two competing candidate artifacts → `decision` artifact → loser `superseded` |
-| A8 | Bounded re-plan works | Induced integration/verifier failure → amendment → validator → completes; `max_replans` respected |
+| A8 | Bounded re-plan works | Induced integration/verifier failure → amendment → validator → completes; `max_replans` respected. **Status (13-lite, offline):** stub verifier FAIL → amendment (rule 9) → PASS with `replans_used = 1`; repeated fingerprint → `NO_PROGRESS`; budget spent → `BUDGET_EXHAUSTED`/`NO_PROGRESS` (`tests/test_repair.py`) |
 | A9 | External verifier alone controls PASS | Agents' own tests irrelevant to verdict; `acceptance/` read-only; verifier is not a task |
 | A10 | Every run terminates inside budget, fully auditable | Budget-starvation tests reach `ABORTED`; `mas replay <run_id>` reconstructs the run from `events` |
 

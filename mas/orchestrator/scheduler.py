@@ -29,9 +29,11 @@ from mas.models.enums import (
     ArtifactStatus,
     RunStatus,
     TaskStatus,
+    VerdictReason,
 )
 from mas.models.types import Run
 from mas.orchestrator import budgets as budget_rules
+from mas.orchestrator import progress
 from mas.orchestrator import state_machine as sm
 from mas.orchestrator.leases import reap_expired
 from mas.planner.planner import Planner
@@ -83,8 +85,10 @@ def _block_unreachable(conn: Conn, run_id: UUID) -> list[str]:
 
 
 def _integration_task(conn: Conn, run_id: UUID) -> dict[str, Any] | None:
+    """The run's *current* integration sink: the newest one — an amendment (bounded repair) adds a new sink and the old
+    one becomes COMPLETED history whose outputs are never accepted."""
     return conn.execute(
-        "SELECT * FROM tasks WHERE run_id = %s AND capability = %s ORDER BY created_at LIMIT 1",
+        "SELECT * FROM tasks WHERE run_id = %s AND capability = %s ORDER BY created_at DESC, key DESC LIMIT 1",
         (run_id, INTEGRATION_CAPABILITY),
     ).fetchone()
 
@@ -182,6 +186,7 @@ def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None 
                 evidence={"run_id": str(run_id), "error": f"verifier crashed: {e!r}"},
             )
         result_passed, report = result.passed, dict(result.report)
+        request = _verification_request(conn, run, workspace)
         with conn.transaction():
             locked = sm.lock_run(conn, run_id)  # lock order: run first, then artifact rows / inserts
             if locked.status is not RunStatus.VERIFYING:
@@ -217,10 +222,71 @@ def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None 
                         if a.type == "git_commit":
                             _promote_integration_ref(run_id, a.ref, workspace)
                 return sm.pass_run(conn, run_id)
-            # TODO(step 13): if replans remain and a replanner is configured → REPLANNING with the report
-            return sm.fail_run(conn, run_id, "verification failed")
+            # bounded repair (step 13-lite, ADR-008 §7): a deterministic decision from the progress fingerprint and
+            # max_replans — never from the planner. REPLANNING is then driven by the orchestrator's next tick.
+            return _after_fail(conn, locked, report, request, workspace)
     finally:
         _verify_unlock(conn, run_id)
+
+
+def _integration_hash(run: Run, request: VerificationRequest, workspace: Any | None) -> str | None:
+    """The diff identity of what was verified: the integration commit's tree hash when a git workspace is available
+    (a repair that changed nothing repeats it), else the opaque ref."""
+    sha = request.commit_sha
+    if not sha:
+        return None
+    if workspace is None:
+        try:
+            from mas.workers.workspace import workspace_from_settings
+
+            workspace = workspace_from_settings()
+        except Exception:  # no workspace configured here (e.g. --workspace none): the ref is the identity
+            workspace = None
+    tree = getattr(workspace, "tree_sha", None)
+    if callable(tree):
+        try:
+            t = tree(run.id, sha)
+            if t:
+                return f"tree:{t}"
+        except Exception:
+            log.debug("tree hash unavailable for %s", sha, exc_info=True)
+    return f"ref:{sha}"
+
+
+def _after_fail(conn: Conn, run: Run, report: dict[str, Any], request: VerificationRequest, workspace: Any | None) -> Run:
+    """Caller holds the run lock (VERIFYING). Record the failure fingerprint, then decide: repair or terminal verdict."""
+    fp = progress.failure_fingerprint(
+        report,
+        integration_hash=_integration_hash(run, request, workspace),
+        accepted=[(a.type, a.ref) for a in store.accepted_for_run(conn, run.id)],
+    )
+    prev = [
+        dict(e["payload"])
+        for e in conn.execute(
+            "SELECT payload FROM events WHERE run_id = %s AND type = 'verify.fingerprint' ORDER BY id", (run.id,)
+        ).fetchall()
+    ]
+    decision = progress.decide_after_fail(fp, previous=prev, replans_used=run.replans_used, max_replans=run.budgets.max_replans)
+    emit(
+        conn,
+        run.id,
+        "verify.fingerprint",
+        payload={
+            **fp.as_dict(),
+            "value": fp.value,
+            "cycle": len(prev),
+            "decision": decision.action,
+            "reason": decision.reason.value if decision.reason else None,
+            "detail": decision.detail,
+            **decision.payload,
+        },
+    )
+    if decision.action == "replan":
+        return sm.start_replan(
+            conn, run.id, payload={"cycle": len(prev) + 1, "failing_checks": list(fp.failing_checks), "detail": decision.detail}
+        )
+    assert decision.reason is not None
+    return sm.fail_run(conn, run.id, f"verification failed: {decision.detail}", code=decision.reason)
 
 
 def tick(
@@ -238,10 +304,10 @@ def tick(
     verifier = verifier or MissingVerifier()
     reap_expired(conn, run_id)
 
-    # planning happens outside the run-row lock: the planner may take a while (LLM at step 11)
+    # planning happens outside the run-row lock: the planner may take a while (LLM at step 11); REPLANNING = amendment
     if planner is not None:
         cur = sm.get_run(conn, run_id)
-        if cur.status in {RunStatus.CREATED, RunStatus.PLANNING}:
+        if cur.status in {RunStatus.CREATED, RunStatus.PLANNING, RunStatus.REPLANNING}:
             from mas.orchestrator import runs as runs_mod  # local import: runs imports this module's siblings
 
             budget_reason = budget_rules.violation(cur)
@@ -274,8 +340,13 @@ def tick(
                 "SELECT key FROM tasks WHERE run_id = %s AND status = 'FAILED' ORDER BY updated_at LIMIT 1", (run_id,)
             ).fetchone()
             if failed is not None:
-                # TODO(step 13): if replans remain and a replanner is configured → REPLANNING
-                return sm.fail_run(conn, run_id, f"task {failed['key']} failed (retries exhausted)")
+                # step 13 (full): task-FAILED is a re-plan trigger; 13-lite repairs verifier failures only
+                return sm.fail_run(
+                    conn,
+                    run_id,
+                    f"task {failed['key']} failed (retries exhausted)",
+                    code=VerdictReason.UNRECOVERABLE_FAILURE,
+                )
 
             integ = _integration_task(conn, run_id)
             if integ is not None and TaskStatus(integ["status"]) is TaskStatus.COMPLETED:
@@ -287,11 +358,24 @@ def tick(
                     (run_id, [s.value for s in TASK_TERMINAL]),
                 ).fetchone()["n"]  # type: ignore[index]
                 if open_n == 0:
-                    return sm.fail_run(conn, run_id, "no runnable tasks left and integration not completed")
+                    return sm.fail_run(
+                        conn,
+                        run_id,
+                        "no runnable tasks left and integration not completed",
+                        code=VerdictReason.UNRECOVERABLE_FAILURE,
+                    )
         elif run.status is RunStatus.VERIFYING:
             # found already VERIFYING (we or another orchestrator started it and did not finish): retry the stage
             do_verify = True
-        # REPLANNING: step 13.
+        elif run.status is RunStatus.REPLANNING and planner is None:
+            # the verifier stage decided the run may repair, but nobody here can plan an amendment: say so now (a
+            # verdict), instead of leaving the run to its wall-clock
+            return sm.fail_run(
+                conn,
+                run_id,
+                "verification failed; repair needs a planner and none is configured (--planner)",
+                code=VerdictReason.UNRECOVERABLE_FAILURE,
+            )
 
     if do_verify:
         if isinstance(verifier, DeferredVerification):

@@ -31,7 +31,7 @@ from mas.providers.telemetry import CallBudget, MeteredProvider, Sink
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION = "llm-planner/v2"
+PROMPT_VERSION = "llm-planner/v3"
 
 
 @dataclass(frozen=True)
@@ -86,6 +86,13 @@ that rejected your previous output. Reply with ONE JSON object and nothing else.
    0..1, "critical_path_ratio": 0..1, "overlapping_outputs": ["paths several tasks would touch"], "coupling_risk":
    "low|medium|high", "integration_risk": "low|medium|high", "suggested_mode": "single_agent|sequential_workflow|
    parallel_centralized_mas", "rationale": "..."}. Prefer independent tasks that do not touch the same files.
+
+4. Repair (only when the brief has a "# Repair (amendment)" section): the integrated result FAILED the frozen
+   acceptance checks and the run has repair budget left. Reply with kind=dag containing ONLY NEW tasks — an amendment.
+   New tasks may depend on existing COMPLETED task ids (typically the last integration task, so the fix builds on the
+   integrated code); never reuse or alter an existing task id; end in a NEW task with capability "integration". Address
+   the failing checks named in the failure report; do not repeat an earlier amendment (their hashes are listed) — an
+   amendment that repeats, or a repair that changes nothing observable, ends the run as NO_PROGRESS.
 
 Be concrete and honest. Never claim capabilities or tools that are not listed. If you proceed without asking, record
 what you assumed in "assumptions"."""
@@ -221,6 +228,22 @@ class LLMPlanner:
                 f"An external acceptance suite exists for benchmark {req.benchmark!r}; a DAG (kind=dag) is expected.",
                 "",
             ]
+        if req.amendment:
+            lines += [
+                "# Repair (amendment)",
+                "",
+                f"Repair cycle {req.replan}/{req.remaining.get('replans', 0) + req.replan}: the integrated result FAILED "
+                "verification. Reply with kind=dag holding ONLY new tasks (an amendment) that fix it, building on existing "
+                "COMPLETED tasks, ending in a new integration task.",
+                "",
+                "## Existing tasks (key, capability, status, depends_on, outputs)",
+                "",
+            ]
+            for t in req.existing_tasks:
+                lines.append(json.dumps(t, sort_keys=True))
+            lines += ["", "## Failure report", "", json.dumps(req.failure_report or {}, sort_keys=True)[:6000], ""]
+            if req.previous_amendments:
+                lines += ["## Amendments already tried (hashes; do not repeat)", "", *req.previous_amendments, ""]
         if req.validation_errors:
             lines += [
                 f"# Your previous output was REJECTED (attempt {req.plan_attempt - 1}). Fix exactly these:",

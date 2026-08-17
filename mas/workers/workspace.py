@@ -249,6 +249,12 @@ class GitWorkspace:
     def show(self, run_id: UUID, ref: str) -> str:
         return _git("show", ref, cwd=self.repo_path(run_id)).stdout
 
+    def tree_sha(self, run_id: UUID, sha: str) -> str | None:
+        """The tree hash behind a commit — what was actually verified (progress fingerprint, step 13-lite): a repair that
+        produced an identical tree repeats it even though the commit id differs."""
+        r = _git("rev-parse", "-q", "--verify", f"{sha}^{{tree}}", cwd=self.repo_path(run_id), check=False)
+        return r.stdout.strip() or None
+
     def files_at(self, run_id: UUID, sha: str) -> list[str]:
         out = _git("ls-tree", "-r", "--name-only", sha, cwd=self.repo_path(run_id)).stdout
         return [ln for ln in out.splitlines() if ln]

@@ -20,7 +20,10 @@ Rules (numbering follows architecture.md):
                   per-attempt allocation (tokens) or the per-attempt runtime cap (seconds) is infeasible → rejected.
        cost     — no price model here (model names never reach the validator); the run's cost budget is enforced at
                   run time; a plan is rejected only when the cost budget is already exhausted.
-  9  amendment rules                         – roadmap step 13
+  9  amendment rules (step 13-lite)         ✔ when `existing` is provided (a re-plan): a new task id may not collide with
+       any existing task (COMPLETED work is never removed or altered — nor is any other recorded task); an amendment may
+       depend on / read from existing tasks only if they are COMPLETED; exactly one *new* integration sink (the old one
+       is history); `max_replans` and repeated-amendment detection are the driver's (`runs.plan_run`).
   shape  ADR-008 task-shape metadata is advisory but must be well-formed (never selects the execution mode)  ✔
 Extra: duplicate ids, unsafe ids, empty DAG, blank capability.
 """
@@ -75,6 +78,15 @@ class Remaining:
     cost_usd: float | None = None
     open_tasks: int = 0  # existing non-terminal tasks (re-plan): they still need funding alongside the new ones
     observed_attempt_s: float | None = None  # mean duration of this run's settled attempts, None until there are any
+
+
+@dataclass(frozen=True)
+class ExistingTask:
+    """A task already recorded for the run (re-plan). Amendments may build on it only if it is COMPLETED."""
+
+    key: str
+    status: str
+    depends_on: tuple[str, ...] = ()
 
 
 ESTIMATE_KEYS = {"tokens", "seconds"}
@@ -259,10 +271,14 @@ def validate(
     auto_integration: bool = True,
     tool_registry: ToolRegistry | None = None,
     remaining: Remaining | None = None,
+    existing: list[ExistingTask] | tuple[ExistingTask, ...] | None = None,
 ) -> ValidationResult:
+    """`existing` marks an *amendment* (re-plan): `dag` holds only new tasks, which may depend on existing COMPLETED
+    tasks; rule 9 protects everything already recorded; the amendment gets its own integration sink."""
     budgets = budgets or Budgets()
     errors: list[ValidationError] = []
     tasks = [TaskSpec.from_dict(t.to_dict()) for t in dag.tasks]  # defensive copy
+    prior = {e.key: e for e in (existing or ())}
     result = DagSpec(
         tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions), shape=dict(dag.shape)
     )
@@ -283,13 +299,23 @@ def validate(
         if not SAFE_TASK_ID.match(i) or ".." in i:
             errors.append(ValidationError("id", f"unsafe task id {i!r} (allowed: [A-Za-z0-9][A-Za-z0-9_.-]{{0,63}}, no '..')", i))
     idset = set(ids)
+    # 9 — an amendment never removes or alters recorded tasks (COMPLETED work above all): ids are new, and it may only
+    # build on COMPLETED tasks
+    for i in ids:
+        if i in prior:
+            errors.append(ValidationError("9", f"amendment may not alter existing task {i!r} ({prior[i].status})", i))
+    known = idset | set(prior)
 
     for t in tasks:
         if not t.capability.strip():
             errors.append(ValidationError("capability", "blank capability", t.id))
         for d in t.depends_on:
-            if d not in idset:
+            if d not in known:
                 errors.append(ValidationError("2", f"depends_on references unknown task {d!r}", t.id))
+            elif d in prior and d not in idset and prior[d].status != "COMPLETED":
+                errors.append(
+                    ValidationError("9", f"amendment may only build on COMPLETED tasks; {d!r} is {prior[d].status}", t.id)
+                )
         if not t.output_contract or not t.output_contract.get("artifacts"):
             errors.append(ValidationError("5", "task lacks an output_contract with artifacts", t.id))
         # 7 — per-task retry override may not exceed the run's retry budget (or be < 1)
@@ -310,7 +336,7 @@ def validate(
         acyclic = False
         errors.append(ValidationError("1", f"DAG has a cycle: {e.args[1] if len(e.args) > 1 else ''}"))
 
-    # 6 — exactly one integration sink
+    # 6 — exactly one integration sink (among the *new* tasks: on an amendment the old sink is COMPLETED history)
     auto_added: list[str] = []
     integ = [t for t in tasks if t.capability == INTEGRATION_CAPABILITY]
     if len(integ) > 1:
@@ -319,9 +345,14 @@ def validate(
         if auto_integration:
             depended = {d for t in tasks for d in t.depends_on}
             sinks = [t.id for t in tasks if t.id not in depended]
+            auto_id = AUTO_INTEGRATION_ID
+            n = 1
+            while auto_id in known:  # amendments get a fresh sink id; recorded tasks are never reused
+                n += 1
+                auto_id = f"{AUTO_INTEGRATION_ID}_{n}"
             tasks.append(
                 TaskSpec(
-                    id=AUTO_INTEGRATION_ID,
+                    id=auto_id,
                     capability=INTEGRATION_CAPABILITY,
                     goal="Merge accepted candidate artifacts into the integration branch.",
                     depends_on=sinks,
@@ -329,8 +360,9 @@ def validate(
                     meta={"created_by": "system"},
                 )
             )
-            auto_added.append(AUTO_INTEGRATION_ID)
-            idset.add(AUTO_INTEGRATION_ID)
+            auto_added.append(auto_id)
+            idset.add(auto_id)
+            known.add(auto_id)
         else:
             errors.append(ValidationError("6", "DAG has no integration task"))
     else:
@@ -372,8 +404,9 @@ def validate(
             elif tool not in allowed:
                 errors.append(ValidationError("4", f"tool {tool!r} not allowed for capability {t.capability!r}", t.id))
 
-    # 10 — context scoping: artifacts_from may only name tasks this task (transitively) depends on
-    deps_of = {t.id: list(t.depends_on) for t in tasks}
+    # 10 — context scoping: artifacts_from may only name tasks this task (transitively) depends on (existing edges count)
+    deps_of = {k: list(e.depends_on) for k, e in prior.items()}
+    deps_of.update({t.id: list(t.depends_on) for t in tasks})
 
     def ancestors(tid: str) -> set[str]:
         seen: set[str] = set()
@@ -392,10 +425,13 @@ def validate(
             continue
         anc = ancestors(t.id)
         for k in wanted:
-            if str(k) not in idset:
+            if str(k) not in known:
                 errors.append(ValidationError("10", f"context_spec.artifacts_from names unknown task {k!r}", t.id))
             elif str(k) not in anc:
                 errors.append(ValidationError("10", f"context_spec.artifacts_from names {k!r}, which is not a dependency", t.id))
+            elif str(k) in prior and prior[str(k)].status != "COMPLETED":
+                st = prior[str(k)].status
+                errors.append(ValidationError("9", f"amendment may only read from COMPLETED tasks; {k!r} is {st}", t.id))
 
     # 7 — task count
     total = existing_task_count + len(tasks)

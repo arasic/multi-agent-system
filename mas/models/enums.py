@@ -24,6 +24,18 @@ class RunStatus(StrEnum):
         return self in RUN_TERMINAL
 
 
+class VerdictReason(StrEnum):
+    """Why a run did not pass (ADR-008 §6): reason codes on the verdict, deliberately not run states.
+    NO_PROGRESS is deterministic (progress fingerprint / repeated amendment / no reduction within max_replans)."""
+
+    BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+    NO_PROGRESS = "NO_PROGRESS"
+    UNSUPPORTED = "UNSUPPORTED"
+    POLICY_DENIED = "POLICY_DENIED"
+    INVALID_PLAN = "INVALID_PLAN"
+    UNRECOVERABLE_FAILURE = "UNRECOVERABLE_FAILURE"
+
+
 class TaskStatus(StrEnum):
     PENDING = "PENDING"
     READY = "READY"

@@ -191,6 +191,43 @@ def planner_script(messages: list[dict[str, Any]], tools: list[dict[str, Any]] |
     the brief says the goal has no contract yet, else returns the canned URL-shortener DAG (with advisory shape metadata).
     Proves the whole gate — goal → contract → approval → DAG → workers → verifier — without a key; never intelligence."""
     brief = messages[-1]["content"] if messages else ""
+    if "# Repair (amendment)" in brief:
+        # bounded repair (13-lite): a canned amendment — one repair task on top of the last integration, plus a new
+        # integration sink. The cycle number keeps the goal distinct so the amendment hash does not repeat by accident.
+        cycle = 1
+        for line in brief.splitlines():
+            if line.startswith("Repair cycle "):
+                try:
+                    cycle = int(line.split()[2].split("/")[0])
+                except (IndexError, ValueError):
+                    cycle = 1
+        last_integ = "T6"
+        for line in brief.splitlines():
+            if '"capability": "integration"' in line and '"key": "' in line:
+                last_integ = line.split('"key": "', 1)[1].split('"', 1)[0]
+        return json.dumps(
+            {
+                "kind": "dag",
+                "assumptions": [f"repair cycle {cycle}: the failing checks point at the integrated app, not the design"],
+                "tasks": [
+                    {
+                        "id": f"R{cycle}",
+                        "capability": "implementation",
+                        "goal": f"Repair cycle {cycle}: fix the failing acceptance checks in the integrated app",
+                        "depends_on": [last_integ],
+                        "output_contract": {"artifacts": ["git_commit"]},
+                        "context_spec": {"artifacts_from": [last_integ]},
+                    },
+                    {
+                        "id": f"R{cycle}_integrate",
+                        "capability": "integration",
+                        "goal": f"Repair cycle {cycle}: integrate the fix",
+                        "depends_on": [f"R{cycle}"],
+                        "output_contract": {"artifacts": ["git_commit"]},
+                    },
+                ],
+            }
+        )
     if "REJECTED" in brief and "produce the DAG" in brief:
         pass  # a contract was already frozen; fall through to the DAG
     elif "NO acceptance contract yet" in brief:

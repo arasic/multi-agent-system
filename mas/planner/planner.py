@@ -29,6 +29,14 @@ class PlanRequest:
     contract: dict[str, Any] | None = None  # the frozen contract (definition of done), once approved
     deadline_s: float | None = None  # remaining run wall-clock, seconds
     tool_registry: dict[str, tuple[str, ...]] = field(default_factory=dict)  # capability → tool families it may use
+    # --- bounded repair (step 13-lite): the run is REPLANNING after a verifier FAIL. The planner must return a DAG of
+    # *new* tasks only (an amendment): it may depend on existing COMPLETED task ids, must end in a new integration
+    # sink, may never touch recorded tasks (validator rule 9) and should not repeat an earlier amendment.
+    amendment: bool = False
+    replan: int = 0  # 1-based repair cycle number
+    existing_tasks: tuple[dict[str, Any], ...] = ()  # key, capability, goal, status, depends_on, outputs
+    failure_report: dict[str, Any] | None = None  # bounded verification report of the failure being repaired
+    previous_amendments: tuple[str, ...] = ()  # amendment hashes already tried (repeating one is no progress)
 
 
 class Planner(Protocol):
@@ -38,14 +46,24 @@ class Planner(Protocol):
 
 
 class StubPlanner:
-    """Scripted planner: asks the given question batches first (one per call), then returns the DAG."""
+    """Scripted planner: asks the given question batches first (one per call), then returns the DAG. On a re-plan
+    (`req.amendment`) it returns the next scripted amendment per call (the last one repeats when the script is
+    exhausted) — so rejections-as-data and repeated amendments can both be exercised."""
 
     name = "stub"
 
-    def __init__(self, dag: DagSpec, questions: list[list[str]] | None = None, contract: ContractProposal | None = None):
+    def __init__(
+        self,
+        dag: DagSpec,
+        questions: list[list[str]] | None = None,
+        contract: ContractProposal | None = None,
+        amendments: list[DagSpec] | None = None,
+    ):
         self.dag = dag
         self.questions = [list(q) for q in (questions or [])]
         self.contract = contract  # proposed when the run has no frozen contract yet (ad-hoc goal)
+        self.amendments = list(amendments or [])
+        self.amendment_calls = 0
         self.requests: list[PlanRequest] = []
 
     def plan(self, req: PlanRequest) -> DagSpec | Questions | ContractProposal:
@@ -57,4 +75,9 @@ class StubPlanner:
             )
         if req.needs_contract and self.contract is not None:
             return self.contract
+        if req.amendment:
+            self.amendment_calls += 1
+            if not self.amendments:
+                return self.dag  # a planner that ignores the amendment protocol: rule 9 rejects it as data
+            return self.amendments[min(self.amendment_calls, len(self.amendments)) - 1]  # scripted per call; last repeats
         return self.dag

@@ -47,6 +47,7 @@ class Run:
     tasks_created: int = 0
     questions_asked: int = 0
     verdict: str | None = None
+    verdict_reason: str | None = None  # VerdictReason code for non-passing terminal runs (ADR-008 §6)
     created_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -82,6 +83,7 @@ class Run:
             tasks_created=r["tasks_created"],
             questions_asked=r.get("questions_asked", 0),
             verdict=r.get("verdict"),
+            verdict_reason=r.get("verdict_reason"),
             created_at=r.get("created_at"),
             started_at=r.get("started_at"),
             finished_at=r.get("finished_at"),

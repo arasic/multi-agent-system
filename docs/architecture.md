@@ -109,6 +109,8 @@ runs
   questions_asked       int         default 0
   -- outcome
   verdict               text        -- PASS | FAIL:<reason> | ABORTED:<reason>
+  verdict_reason        text        -- ADR-008 §6 reason code for non-passing terminal runs (NULL on PASS):
+                                    -- BUDGET_EXHAUSTED | NO_PROGRESS | UNSUPPORTED | POLICY_DENIED | INVALID_PLAN | UNRECOVERABLE_FAILURE
   created_at, started_at, finished_at timestamptz
 
 tasks
@@ -220,10 +222,11 @@ any non-terminal ──► ABORTED   (budget/deadline exceeded, or operator abor
 - `AWAITING_INPUT → PLANNING | REPLANNING`: `answer` artifact + `plan.answered`; the planner is re-invoked with the full Q&A history.
 - `PLANNING → RUNNING`: validator accepted a DAG; tasks inserted.
 - `RUNNING → VERIFYING`: the integration task is `COMPLETED`.
-- `RUNNING → REPLANNING`: any task reaches `FAILED` (retries exhausted) or a worker reports `new_work_required`, and replans remain. If no replans remain → `FAILED`.
+- `RUNNING → REPLANNING`: any task reaches `FAILED` (retries exhausted) or a worker reports `new_work_required`, and replans remain. If no replans remain → `FAILED`. *(Full step 13; in 13-lite a task `FAILED` ends the run `UNRECOVERABLE_FAILURE` and `new_work_required` is recorded only.)*
 - `VERIFYING → PASSED`: verifier PASS; integration artifact → `accepted`.
-- `VERIFYING → REPLANNING | FAILED`: verifier FAIL.
-- Terminal: `PASSED`, `FAILED`, `ABORTED`. A run **always** reaches a terminal state within budget.
+- `VERIFYING → REPLANNING | FAILED`: verifier FAIL → **`verify.fingerprint`** event, then the deterministic repair decision (§8c): REPLANNING (`replans_used += 1`, `sm.start_replan`) or FAILED with a reason code. The verifier stage decides without a planner, so the verifier *service* can take this transition; the orchestrator's next tick drives the amendment.
+- `REPLANNING → RUNNING`: validator accepted an amendment (rule 9); new tasks inserted; the newest integration task is the run's sink. `REPLANNING → FAILED`: no planner configured (`UNRECOVERABLE_FAILURE`), plan attempts exhausted, or a repeated amendment (`NO_PROGRESS`).
+- Terminal: `PASSED`, `FAILED`, `ABORTED`. A run **always** reaches a terminal state within budget, and a non-passing one carries exactly one `verdict_reason` code (ADR-008 §6) besides the human-readable verdict text.
 
 ### 4.2 Task
 
@@ -376,7 +379,7 @@ Per-attempt limits: `max_attempt_runtime_s`, `max_attempt_tokens` (both run budg
 7. task count exceeds `max_tasks` (cumulative across re-plans), or a task's `max_attempts` override lies outside `[1, max_attempts_per_task]` (no bypassing the retry budget)
 10. `context_spec.artifacts_from` names a task that is not a (transitive) dependency — a task may not read what it does not depend on
 8. **budget allocation** — the plan must fit what the run has left, measured by the driver (`runs.remaining_budget`), never by planner estimates: (a) *tokens:* every open task (this plan's tasks incl. the auto-appended integration sink, plus existing non-terminal tasks on a re-plan) must be fundable for one attempt at the run's per-attempt allocation — `open_tasks × max_attempt_tokens ≤ remaining tokens`. This is the allocation the meter actually hands out, so the run can honor it; the rejection names how many tasks would fit. (b) *wall-clock:* there is no per-attempt time allocation (the runtime cap is a timeout), so time is checked from what is *known*: this run's observed mean attempt duration (present on re-plans) and the planner's optional per-task `estimate.seconds`, which may only tighten — weighted critical path ≤ remaining wall-clock, total work / `max_concurrency` ≤ remaining wall-clock, remaining wall-clock > 0. (c) *estimates:* an optional `estimate: {"tokens", "seconds"}` per task is validated; an estimate above `max_attempt_tokens` / `max_attempt_runtime_s` means the task cannot finish within one attempt → rejected ("split it"). (d) *cost:* no price model in the validator (model names never reach it); `max_cost_usd` is enforced at run time; only an already-exhausted cost budget rejects at plan time. Rejections carry the arithmetic so the planner can shrink the plan; hand-written DAG files (`mas run --dag`) get the same check at install.
-9. an amendment would exceed `max_replans`, or removes/alters a task that is `COMPLETED`
+9. an amendment would exceed `max_replans` (the driver never asks for one then), or removes/alters a task that is `COMPLETED` — implemented as: no new id may collide with *any* recorded task; dependencies / `artifacts_from` may name existing tasks only if `COMPLETED`; a fresh integration sink id; a repeated amendment (same hash) is rejected as no progress (§8c)
 
 Rejection → planner retried with the validation errors, up to `max_plan_attempts`; then run `FAILED`.
 
@@ -386,9 +389,20 @@ Rejection → planner retried with the validation errors, up to `max_plan_attemp
 - a task reaches `FAILED` (retries exhausted)
 - a worker report includes `new_work_required`
 
-**Amendment semantics:** add tasks; re-open a `FAILED` task with a new goal (as a new task); cancel `PENDING/READY` tasks. Never touch `COMPLETED` tasks or their artifacts. `max_replans = 2` in MVP.
+**Amendment semantics:** add tasks; re-open a `FAILED` task with a new goal (as a new task); cancel `PENDING/READY` tasks. Never touch `COMPLETED` tasks or their artifacts. `max_replans = 2` in MVP (`Budgets` default; the CLI's one-cycle demonstration uses `--max-replans 1`). **`max_replans` is the only repair budget** — there is no separate repair counter.
 
 Re-planning is what makes the DAG *dynamic*; without it this is a static DAG executor with LLM-written nodes.
+
+### 8c. Bounded repair as built (step 13-lite, 2026-08-17)
+
+The verifier-FAIL trigger is implemented end to end (the other two triggers are full step 13):
+
+1. **Failure fingerprint** (`mas/orchestrator/progress.py`, computed by the orchestrator in the verifier stage from system-owned facts only, recorded as a `verify.fingerprint` event with all components): failing acceptance check ids · normalized failure classes (verification status; each failing check's status and detail with hex ids / uuids / paths / durations / numbers folded, so the same *kind* of failure compares equal and a different failure of the same check does not) · integration hash — the verified commit's **tree** hash when a git workspace is available (the diff, not the commit id: a repair that changed nothing observable repeats it), else the opaque ref · a hash of the run's accepted artifacts. Amendments carry their own **amendment hash** (structure + goals with new task ids normalized) on the `plan` artifact.
+2. **Decision** (`progress.decide_after_fail`, deterministic, never a model): fingerprint repeats an earlier cycle's → `FAILED NO_PROGRESS`; `replans_used ≥ max_replans` → `FAILED BUDGET_EXHAUSTED`, or `NO_PROGRESS` when at least one repair ran and the number of failed criteria never went below the first failure's; otherwise → `REPLANNING`. Same failing check ids alone never end the run — a repair can improve the implementation while the same check still fails; only an unchanged fingerprint or an unreduced count within the configured window does.
+3. **Amendment protocol** (`runs.plan_run` on a REPLANNING run): the planner receives the recorded tasks with outputs, the bounded failure report, the amendment hashes already tried, and remaining budgets, and must return `kind=dag` with **new tasks only** that may depend on existing COMPLETED tasks (typically the last integration task, so the fix builds on the integrated code) and end in a new integration sink. The validator applies rules 1–8, 10 to the amendment plus **rule 9**: no id may collide with a recorded task (COMPLETED work is never removed or altered), dependencies and `artifacts_from` may name existing tasks only if COMPLETED, an auto-appended sink gets a fresh id; the driver additionally rejects an amendment whose hash repeats an earlier one. Rejections go back as data within `max_plan_attempts`; exhaustion is a verdict (`NO_PROGRESS` when the last rejections were repeats, `INVALID_PLAN` otherwise). The newest integration task is the run's sink for verification and acceptance; the old sink's outputs stay candidates forever.
+4. **Verdict reason codes** (ADR-008 §6, `runs.verdict_reason`, migration 0007, set only by `state_machine.fail_run/abort_run`): budget aborts → `BUDGET_EXHAUSTED`; invalid plans/amendments and planner output failures → `INVALID_PLAN` (only-policy rejections → `POLICY_DENIED`; unmappable acceptance criteria → `UNSUPPORTED`); task retries exhausted, no runnable work, verification failed without a planner to repair → `UNRECOVERABLE_FAILURE`; the repair decisions above → `NO_PROGRESS` / `BUDGET_EXHAUSTED`. `mas status`/`mas run` print `reason=`.
+
+Offline demonstration: `mas run --dag benchmarks/url_shortener/dag.json --verifier-fail-times 1 --planner fake --max-replans 1` → FAIL → amendment (`R1`, `R1_integrate`) → PASS with `replans=1`; `--verifier-fail` instead → `NO_PROGRESS`. Tests: `tests/test_repair.py` (FAIL→repair→PASS, repeated tree-hash fingerprint → NO_PROGRESS, exhaustion with/without reduction, `max_replans=0`, repeated amendment through the driver, rule 9 protections, reason codes).
 
 ---
 
