@@ -1,21 +1,21 @@
-"""Live provider smoke — the M2 gate's one mandatory step that cannot run without a vendor key.
+"""Live provider smoke - the M2 gate's one mandatory step that cannot run without a vendor key.
 
     python scripts/live_smoke.py --worker <provider>:<model> [--planner <provider>:<model>]
         [--step ping|worker|planner|repair|all]
 
-Runs, in order, against the REAL provider (each step is a gate — the next one runs only if the previous passed):
+Runs, in order, against the REAL provider (each step is a gate - the next one runs only if the previous passed):
 
   1. ping     one metered call through `mas models --ping --spec <worker>` (telemetry row, priced or flagged unpriced)
   2. worker   the URL-shortener benchmark with LLM workers (`--agent llm`), sandboxed command tools and the real
               acceptance verifier: hand-written DAG, real code written by the model, PASS required
-  3. planner  goal → LLM planner proposes the acceptance contract → the operator approves it (this script prints the
+  3. planner  goal -> LLM planner proposes the acceptance contract -> the operator approves it (this script prints the
               proposal and approves it for you unless --no-auto-approve, in which case it waits for `mas approve` from
-              another terminal — the human decision stays a human decision) → planner produces the DAG → LLM workers →
-              real verifier → PASS required. Bounded repair is on (--max-replans 1).
-  4. repair   induced verifier failure → live repair → PASS: the hand-written DAG again, but the FIRST verification is
+              another terminal - the human decision stays a human decision) -> planner produces the DAG -> LLM workers ->
+              real verifier -> PASS required. Bounded repair is on (--max-replans 1).
+  4. repair   induced verifier failure -> live repair -> PASS: the hand-written DAG again, but the FIRST verification is
               replaced by an induced FAIL naming one real check id (the real verifier ran; its PASS is withheld once);
               the LLM planner must propose an amendment, LLM workers execute it, the second verification is the real
-              one → PASS with replans_used == 1. (The failure is induced; the amendment and the re-verification are not.)
+              one -> PASS with replans_used == 1. (The failure is induced; the amendment and the re-verification are not.)
 
 Model specs come ONLY from --worker/--planner or MAS_MODEL_WORKER/MAS_MODEL_PLANNER (model names never live in code
 outside mas/providers/ and config). Prices come from MAS_MODEL_PRICES; unpriced usage is flagged, never hidden.
@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +61,21 @@ GOAL = (
 )
 
 
+def _git_state() -> dict[str, object]:
+    rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=False)
+    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=False)
+    return {"commit": rev.stdout.strip() if rev.returncode == 0 else "unknown", "dirty": bool(dirty.stdout.strip())}
+
+
+def _write_evidence(args: argparse.Namespace) -> None:
+    if args.output is None:
+        return
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    tmp = args.output.with_suffix(args.output.suffix + ".tmp")
+    tmp.write_text(json.dumps(args.evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(args.output)
+
+
 def _hr(title: str) -> None:
     print("\n" + "=" * 100 + f"\n{title}\n" + "=" * 100, flush=True)
 
@@ -75,7 +91,11 @@ def _preflight(args: argparse.Namespace) -> list[str]:
     if args.step in ("planner", "repair", "all") and not args.planner:
         problems.append("no planner model: --planner <provider>:<model> or MAS_MODEL_PLANNER (or --step worker)")
     if not settings().model_prices:
-        print("WARNING: MAS_MODEL_PRICES is empty — usage will be recorded but flagged unpriced (the cost budget cannot bite)")
+        message = "MAS_MODEL_PRICES is empty - cost is unknown and the cost budget cannot be enforced"
+        if args.allow_unpriced:
+            print(f"WARNING: {message}")
+        else:
+            problems.append(message + " (or explicitly use --allow-unpriced for a non-completion rehearsal)")
     d = subprocess.run(["docker", "info"], capture_output=True, timeout=30, check=False)
     if d.returncode != 0:
         problems.append("Docker daemon unreachable (sandboxed command tools and the real verifier need it)")
@@ -114,7 +134,7 @@ def _budgets(args: argparse.Namespace) -> Budgets:
 
 class InducedFirstFail:
     """Wraps the real verifier: runs it every time, but withholds the first verdict and returns FAIL with one real check
-    id marked failed — a deterministic, visible induction of the repair path (evaluation §5.3 / A8, live)."""
+    id marked failed - a deterministic, visible induction of the repair path (evaluation section 5.3 / A8, live)."""
 
     name = "induced-first-fail"
 
@@ -142,7 +162,7 @@ class InducedFirstFail:
         )
 
 
-def _execute(conn, run_id, *, args: argparse.Namespace, planner, verifier=None) -> RunStatus:
+def _execute(conn, run_id, *, args: argparse.Namespace, planner, evidence_step: str, verifier=None) -> tuple[RunStatus, bool]:
     """Workers (in-process threads, LLM agent, sandboxed command tools) + orchestrator loop with the real verifier."""
     caps = set(settings().worker_capabilities)
     provider = cli._worker_provider(args.worker)
@@ -188,7 +208,22 @@ def _execute(conn, run_id, *, args: argparse.Namespace, planner, verifier=None) 
         s = w.stats
         print(f"  {w.worker_id}: claimed={s.claimed} completed={s.completed} failed={s.failed} stale={s.stale}")
     print(f"  mas status {run_id} | mas replay {run_id} | mas artifacts {run_id}")
-    return final.status
+    priced = m.unpriced_calls == 0
+    args.evidence["runs"].append(
+        {
+            "step": evidence_step,
+            "run_id": str(run_id),
+            "status": final.status.value,
+            "verdict": final.verdict,
+            "verdict_reason": final.verdict_reason,
+            "priced": priced,
+            "metrics": m.as_dict(),
+        }
+    )
+    _write_evidence(args)
+    if not priced and not args.allow_unpriced:
+        print("completion gate failed: this run contains unpriced model calls", file=sys.stderr)
+    return final.status, priced or args.allow_unpriced
 
 
 def step_worker(args: argparse.Namespace) -> bool:
@@ -199,7 +234,8 @@ def step_worker(args: argparse.Namespace) -> bool:
         conn, dag, budgets=_budgets(args), capabilities=set(settings().worker_capabilities), pool=f"live:{os.getpid()}"
     )
     print(f"run {run.id}  ({len(dag.tasks)} tasks)")
-    return _execute(conn, run.id, args=args, planner=None) is RunStatus.PASSED
+    status, priced = _execute(conn, run.id, args=args, planner=None, evidence_step="worker")
+    return status is RunStatus.PASSED and priced
 
 
 def step_planner(args: argparse.Namespace) -> bool:
@@ -230,7 +266,8 @@ def step_planner(args: argparse.Namespace) -> bool:
             while runs_mod.sm.get_run(conn, run.id).status is RunStatus.AWAITING_INPUT:
                 time.sleep(2)
     # the orchestrator loop plans further rounds (DAG, any repair amendments) and executes
-    return _execute(conn, run.id, args=args, planner=planner) is RunStatus.PASSED
+    status, priced = _execute(conn, run.id, args=args, planner=planner, evidence_step="planner")
+    return status is RunStatus.PASSED and priced
 
 
 def step_repair(args: argparse.Namespace) -> bool:
@@ -247,9 +284,9 @@ def step_repair(args: argparse.Namespace) -> bool:
     print(f"run {run.id}  ({len(dag.tasks)} tasks; the first verification will be an induced FAIL)")
     planner = cli._planner("llm", spec=args.planner)
     verifier = InducedFirstFail(cli._acceptance_verifier())
-    status = _execute(conn, run.id, args=args, planner=planner, verifier=verifier)
+    status, priced = _execute(conn, run.id, args=args, planner=planner, evidence_step="repair", verifier=verifier)
     final = runs_mod.sm.get_run(conn, run.id)
-    ok = status is RunStatus.PASSED and final.replans_used == 1 and verifier.calls == 2
+    ok = status is RunStatus.PASSED and priced and final.replans_used == 1 and verifier.calls == 2
     verdict = "PASS" if ok else "FAIL"
     print(f"repair check: status={status.value} replans_used={final.replans_used} verifications={verifier.calls} -> {verdict}")
     return ok
@@ -271,12 +308,34 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "--no-auto-approve", action="store_true", help="wait for `mas approve` instead of approving the proposal here"
     )
+    ap.add_argument("--output", type=Path, help="write resumable machine-readable gate evidence to this JSON file")
+    ap.add_argument(
+        "--allow-unpriced",
+        action="store_true",
+        help="allow a rehearsal with unknown cost; evidence will not qualify as the priced MVP gate",
+    )
     ap.add_argument("--dry-run", action="store_true", help="preflight only")
     args = ap.parse_args(argv)
+    order = ["ping", "worker", "planner", "repair"] if args.step == "all" else [args.step]
+    args.evidence = {
+        "schema": 1,
+        "started_at": datetime.now(UTC).isoformat(),
+        "git": _git_state(),
+        "models": {"worker": args.worker, "planner": args.planner},
+        "requested_steps": order,
+        "manual_contract_approval": bool(args.no_auto_approve),
+        "allow_unpriced": bool(args.allow_unpriced),
+        "steps": {},
+        "runs": [],
+        "complete": False,
+    }
 
     problems = _preflight(args)
     if problems:
         print("\npreflight failed:\n  - " + "\n  - ".join(problems))
+        args.evidence["preflight_errors"] = problems
+        args.evidence["finished_at"] = datetime.now(UTC).isoformat()
+        _write_evidence(args)
         return 2
     print(f"worker={args.worker} planner={args.planner or '(not needed)'} step={args.step}")
     print(
@@ -284,19 +343,27 @@ def main(argv: list[str]) -> int:
         f"wallclock={args.max_wallclock_s}s"
     )
     if args.dry_run:
+        args.evidence["preflight_only"] = True
+        args.evidence["finished_at"] = datetime.now(UTC).isoformat()
+        _write_evidence(args)
         return 0
     results: dict[str, bool] = {}
-    order = ["ping", "worker", "planner", "repair"] if args.step == "all" else [args.step]
     for step in order:
         ok = {"ping": step_ping, "worker": step_worker, "planner": step_planner, "repair": step_repair}[step](args)
         results[step] = ok
+        args.evidence["steps"][step] = ok
+        _write_evidence(args)
         print(f"\n--> {step}: {'PASS' if ok else 'FAIL'}")
         if not ok:
             break
     _hr("live smoke summary")
     for k, v in results.items():
         print(f"  {k:8s} {'PASS' if v else 'FAIL'}")
-    return 0 if results and all(results.values()) and len(results) == len(order) else 1
+    complete = bool(results) and all(results.values()) and len(results) == len(order)
+    args.evidence["complete"] = complete
+    args.evidence["finished_at"] = datetime.now(UTC).isoformat()
+    _write_evidence(args)
+    return 0 if complete else 1
 
 
 if __name__ == "__main__":

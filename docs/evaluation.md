@@ -24,7 +24,7 @@ All ten must hold, each demonstrated by a repeatable test or scripted demo:
 | A5 | Worker death recovers automatically | Kill a worker mid-attempt → `ABANDONED` → task re-claimed → run completes |
 | A6 | Artifacts stay consistent | Immutability enforced; retries don't inherit partial outputs; supersession chain intact |
 | A7 | Conflicts are representable and resolved visibly | Forced-disagreement demo: two competing candidate artifacts → `decision` artifact → loser `superseded`. **Status (2026-08-17):** ✅ `benchmarks/forced_disagreement/dag.json` — ARCH_A/ARCH_B both produce `document:design.md`; IMPL must decide; winner accepted, loser `superseded_by` winner, decision artifact with rationale, `artifact.decided` event; silent choice fails the attempt; forged winners rejected (`tests/test_conflicts.py`, stub and git worktrees; LLM `finish.decisions` unit-tested) |
-| A8 | Bounded re-plan works | Induced integration/verifier failure → amendment → validator → completes; `max_replans` respected. **Status (13-lite, offline):** stub verifier FAIL → amendment (rule 9) → PASS with `replans_used = 1`; repeated fingerprint → `NO_PROGRESS`; budget spent → `BUDGET_EXHAUSTED`/`NO_PROGRESS` (`tests/test_repair.py`) |
+| A8 | Bounded re-plan works | Induced integration/verifier failure → amendment → validator → completes; `max_replans` respected. **Status:** verifier FAIL, task-FAILED and `new_work_required` triggers are implemented; offline FAIL → amendment (rule 9) → PASS with `replans_used = 1`; repeated fingerprint → `NO_PROGRESS`; budget spent → `BUDGET_EXHAUSTED`/`NO_PROGRESS` (`tests/test_repair.py`) |
 | A9 | External verifier alone controls PASS | Agents' own tests irrelevant to verdict; `acceptance/` read-only; verifier is not a task |
 | A10 | Every run terminates inside budget, fully auditable | Budget-starvation tests reach `ABORTED`; `mas replay <run_id>` reconstructs the run from `events` |
 
@@ -57,7 +57,9 @@ Run at **N = 1, 2, 4, 8, 16**. This is where the value question is answered: whe
 Fixtures for stub workers exist for both benchmarks so the pipeline is testable without an LLM. The width family is
 generated deterministically by `mas.evaluation.width_dag(N)` and verified by immutable `acceptance/adapters_<N>` suites;
 `tests/test_benchmark.py` permanently gates N=4 through real Git worktrees and the Docker verifier. The full experiment
-is `python scripts/benchmark.py` (JSONL + CSV/JSON + SVG); real evidence requires at least five repetitions per cell.
+is `python scripts/benchmark.py` (immutable experiment manifest + resumable JSONL + CSV/JSON + SVG + completion record);
+real evidence requires at least five repetitions per cell. `python scripts/mvp_gate.py` rejects incomplete, mixed-revision,
+dirty or unpriced evidence and does not require MAS to win—the measured result is the point of M3.
 
 ---
 

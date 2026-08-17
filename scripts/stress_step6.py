@@ -1,4 +1,4 @@
-"""Step-6 stability gate (docs/roadmap.md). Not a unit test — a focused stress run with hard pass criteria.
+"""Step-6 stability gate (docs/roadmap.md). Not a unit test - a focused stress run with hard pass criteria.
 
 Scenarios (defaults; override with flags):
   --diamonds 100    git-workspace diamond runs, lease_s=1, 3 in-process workers each

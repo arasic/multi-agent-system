@@ -1,10 +1,10 @@
-"""Test tiers — run only what a change can affect, and run it in parallel.
+"""Test tiers - run only what a change can affect, and run it in parallel.
 
     python scripts/test.py unit            no Postgres, no Docker (validator, providers, tools, agent loop)   ~15 s
     python scripts/test.py core            + Postgres, stub workers, everything LLM-free that needs no Docker ~1 min
     python scripts/test.py full            + Docker (sandboxes, verifier image, service mode)               ~2 min (-n 4)
     python scripts/test.py gate            scripts/stress_step6.py: 100 diamonds / 50 chaos / 20 parallel   ~13 min
-    python scripts/test.py area <name>...  the files for an area (see AREAS) — e.g. `area repair planner`
+    python scripts/test.py area <name>...  the files for an area (see AREAS) - e.g. `area repair planner`
     python scripts/test.py list            print the tiers and areas
 
 Every worker process gets its own `mas_test_<pid>` database (tests/conftest.py), so `-n 4` is safe (MAS_TEST_WORKERS
@@ -45,7 +45,7 @@ AREAS: dict[str, list[str]] = {
     "verifier": ["test_acceptance.py", "test_adapters.py", "test_orchestrate_service.py"],
     "contracts": ["test_planner_llm.py", "test_adapters.py"],
     "cli": ["test_cli.py", "test_questions.py", "test_evaluation.py"],
-    "evaluation": ["test_evaluation.py", "test_cli.py"],
+    "evaluation": ["test_evaluation.py", "test_cli.py", "test_mvp_gate.py"],
     "conflicts": ["test_conflicts.py", "test_llm_agent.py"],
     "service": ["test_orchestrate_service.py", "test_gateway.py", "test_exec_runner.py"],
 }

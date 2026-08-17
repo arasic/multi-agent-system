@@ -23,6 +23,7 @@ Thumbs.db
 .vscode/
 acceptance/adhoc-*/
 benchmark-results/
+mvp-evidence/
 
 # local pytest --basetemp trees
 .t/
