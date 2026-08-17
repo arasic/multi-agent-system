@@ -12,10 +12,11 @@ Rules (numbering follows architecture.md):
        tokens   — every open task (this plan's + existing non-terminal ones) must be fundable for one attempt at the
                   run's per-attempt allocation `max_attempt_tokens`: open × allocation ≤ remaining tokens. System-owned:
                   the meter hands exactly this allocation to attempts; planner estimates play no part.
-       time     — no per-attempt time allocation exists (the runtime cap is a timeout), so time is checked from what
-                  is *known*: this run's shortest successful attempt so far (a lower bound, never the mean) and the
-                  planner's own per-task estimates, which may only tighten: weighted critical path ≤ remaining
-                  wall-clock and total work / max_concurrency ≤ remaining wall-clock; remaining wall-clock must be > 0.
+       time     — no per-attempt time allocation exists (the runtime cap is a timeout). Hard: remaining wall-clock > 0
+                  and the planner's own per-task estimates (weighted critical path ≤ remaining, total / max_concurrency
+                  ≤ remaining — estimates may only tighten). Advisory: this run's shortest successful attempt so far
+                  as a per-task floor produces a *warning* (recorded, shown to the planner), never a rejection — even a
+                  true lower bound of past attempts is not a bound on a future repair.
        estimate — optional `estimate: {"tokens": int, "seconds": number}` per task is validated; an estimate above the
                   per-attempt allocation (tokens) or the per-attempt runtime cap (seconds) is infeasible → rejected.
        cost     — no price model here (model names never reach the validator); the run's cost budget is enforced at
@@ -62,6 +63,7 @@ class ValidationResult:
     dag: DagSpec
     errors: list[ValidationError] = field(default_factory=list)
     auto_added: list[str] = field(default_factory=list)
+    warnings: list[ValidationError] = field(default_factory=list)  # advisory (rule 8: observed history); never reject
 
     @property
     def ok(self) -> bool:
@@ -166,9 +168,14 @@ def critical_path_s(tasks: list[TaskSpec], weight: dict[str, float]) -> tuple[fl
     return best[end], list(reversed(path))
 
 
-def validate_budget(tasks: list[TaskSpec], budgets: Budgets, remaining: Remaining, *, acyclic: bool) -> list[ValidationError]:
-    """Rule 8 - deterministic budget allocation (see module docstring). No planner estimate can loosen this check."""
+def validate_budget(
+    tasks: list[TaskSpec], budgets: Budgets, remaining: Remaining, *, acyclic: bool, warnings: list[ValidationError] | None = None
+) -> list[ValidationError]:
+    """Rule 8 - deterministic budget allocation (see module docstring). No planner estimate can loosen this check.
+    Observed-history time bounds go to `warnings` (advisory), never to the returned errors."""
     errs: list[ValidationError] = []
+    if warnings is None:
+        warnings = []
     for t in tasks:
         errs.extend(validate_estimate(t, budgets))
     # tokens: one attempt at the run's per-attempt allocation for every open task
@@ -187,32 +194,41 @@ def validate_budget(tasks: list[TaskSpec], budgets: Budgets, remaining: Remainin
     # cost: no price model here; reject only when the run's cost budget is already gone
     if remaining.cost_usd is not None and remaining.cost_usd <= 0:
         errs.append(ValidationError("8", f"cost budget exhausted ({remaining.cost_usd:.4f} USD remain)"))
-    # time: known lower bounds only - observed attempt duration in this run, planner estimates (tighten only)
+    # time: hard only for what is certain — no wall-clock left, or the planner's OWN estimates (tighten only)
     if remaining.wallclock_s is not None:
         if remaining.wallclock_s <= 0:
             errs.append(ValidationError("8", "no wall-clock left"))
         elif acyclic:
+            est = {t.id: estimated_seconds(t) for t in tasks}
+            errs.extend(_time_bounds(tasks, budgets, remaining.wallclock_s, est, "planner estimates"))
+            # advisory: the run's own history as a per-task floor. A warning, never a rejection.
             floor = float(remaining.observed_attempt_s or 0.0)
-            weight = {t.id: max(floor, estimated_seconds(t)) for t in tasks}
-            total = sum(weight.values())
-            path_s, path = critical_path_s(tasks, weight)
-            basis = f"shortest observed attempt {floor:.1f}s" if floor else "planner estimates"
-            if path_s > remaining.wallclock_s:
-                errs.append(
-                    ValidationError(
-                        "8",
-                        f"critical path {path} needs at least {path_s:.0f}s ({basis}) but {remaining.wallclock_s:.0f}s remain",
-                    )
-                )
-            elif total / max(1, budgets.max_concurrency) > remaining.wallclock_s:
-                errs.append(
-                    ValidationError(
-                        "8",
-                        f"{len(tasks)} tasks need at least {total:.0f}s of work ({basis}) over max_concurrency "
-                        f"{budgets.max_concurrency} but {remaining.wallclock_s:.0f}s remain",
-                    )
-                )
+            if floor > 0:
+                hist = {t.id: max(floor, est[t.id]) for t in tasks}
+                for w in _time_bounds(tasks, budgets, remaining.wallclock_s, hist, f"shortest observed attempt {floor:.1f}s"):
+                    warnings.append(ValidationError("8-advisory", w.message))
     return errs
+
+
+def _time_bounds(
+    tasks: list[TaskSpec], budgets: Budgets, wallclock_s: float, weight: dict[str, float], basis: str
+) -> list[ValidationError]:
+    out: list[ValidationError] = []
+    total = sum(weight.values())
+    path_s, path = critical_path_s(tasks, weight)
+    if path_s > wallclock_s:
+        out.append(
+            ValidationError("8", f"critical path {path} needs at least {path_s:.0f}s ({basis}) but {wallclock_s:.0f}s remain")
+        )
+    elif total / max(1, budgets.max_concurrency) > wallclock_s:
+        out.append(
+            ValidationError(
+                "8",
+                f"{len(tasks)} tasks need at least {total:.0f}s of work ({basis}) over max_concurrency "
+                f"{budgets.max_concurrency} but {wallclock_s:.0f}s remain",
+            )
+        )
+    return out
 
 
 SHAPE_MODES = ("single_agent", "sequential_workflow", "parallel_centralized_mas")
@@ -439,8 +455,9 @@ def validate(
         errors.append(ValidationError("7", f"task count {total} exceeds max_tasks {budgets.max_tasks}"))
 
     # 8 — budget allocation (after auto-integration: the synthesized sink needs funding too)
+    warnings: list[ValidationError] = []
     if remaining is not None:
-        errors.extend(validate_budget(tasks, budgets, remaining, acyclic=acyclic))
+        errors.extend(validate_budget(tasks, budgets, remaining, acyclic=acyclic, warnings=warnings))
     else:
         for t in tasks:
             errors.extend(validate_estimate(t, budgets))
@@ -449,4 +466,5 @@ def validate(
         DagSpec(tasks=tasks, goal=dag.goal, benchmark=dag.benchmark, assumptions=list(dag.assumptions), shape=dict(dag.shape)),
         errors,
         auto_added,
+        warnings,
     )

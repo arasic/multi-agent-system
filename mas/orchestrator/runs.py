@@ -138,6 +138,12 @@ def remaining_budget(conn: Conn, run: Run) -> Remaining:
     )
 
 
+def _shortest_attempt_s(conn: Conn, run: Run) -> float | None:
+    if run.status is not RunStatus.REPLANNING:
+        return None
+    return remaining_budget(conn, run).observed_attempt_s
+
+
 def _observed(row: dict[str, Any]) -> float | None:
     """A *lower bound* on how long a task takes here: the shortest successful attempt so far (a slow history — one
     long timeout — must not reject a plan that can complete faster); only if nothing succeeded yet, the shortest
@@ -187,6 +193,7 @@ def install_dag(
             "plan.validated" if result.ok else "plan.rejected",
             payload={
                 "errors": [str(e) for e in result.errors],
+                "warnings": [str(w) for w in result.warnings],
                 "auto_added": result.auto_added,
                 "task_count": len(result.dag.tasks),
                 "created_by": created_by,
@@ -493,6 +500,7 @@ def _plan_request(conn: Conn, run: Run, capabilities: set[str], *, plan_attempt:
             "max_attempt_runtime_s": run.budgets.max_attempt_runtime_s,
             "wallclock_s": int(remaining_s) if remaining_s is not None else None,
             "replans": run.budgets.max_replans - run.replans_used,
+            "shortest_attempt_s": _shortest_attempt_s(conn, run),  # advisory history for the planner's own estimates
         },
         plan_attempt=plan_attempt,
         validation_errors=errors,

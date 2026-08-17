@@ -184,7 +184,7 @@ def test_rule8_tokens_one_attempt_per_open_task_at_the_run_allocation():
     assert validate(d, budgets=b).ok
 
 
-def test_rule8_time_uses_observed_attempts_and_estimates_which_only_tighten():
+def test_rule8_time_history_is_advisory_and_estimates_only_tighten():
     from mas.planner.validator import Remaining, critical_path_s
 
     d = diamond()  # chain T1 -> {T2,T3,T4} -> T5: critical path 3 tasks, 5 tasks total
@@ -192,24 +192,25 @@ def test_rule8_time_uses_observed_attempts_and_estimates_which_only_tighten():
     # nothing known yet: only "some wall-clock left" is required
     assert validate(d, budgets=b, remaining=Remaining(wallclock_s=1.0)).ok
     assert "no wall-clock left" in str(validate(d, budgets=b, remaining=Remaining(wallclock_s=0)).errors[0])
-    # this run's shortest observed attempt floors every task: 3-task critical path x 10s = 30s
-    assert validate(d, budgets=b, remaining=Remaining(wallclock_s=30, observed_attempt_s=10)).ok
+    # this run's history (shortest successful attempt 10s) is ADVISORY: 3-task chain x 10s = 30s > 29s -> a warning,
+    # never a rejection - a past lower bound is not a bound on a future repair
     r = validate(d, budgets=b, remaining=Remaining(wallclock_s=29, observed_attempt_s=10))
-    assert rules(r) == {"8"} and "critical path ['T1', 'T2', 'T5']" in str(r.errors[0])
-    assert "shortest observed" in str(r.errors[0])
-    # throughput bound: 5 tasks x 10s / concurrency 1 = 50s > 45s (the chain alone, 30s, would fit)
+    assert r.ok and len(r.warnings) == 1 and r.warnings[0].rule == "8-advisory"
+    assert "critical path ['T1', 'T2', 'T5']" in r.warnings[0].message and "shortest observed" in r.warnings[0].message
+    assert validate(d, budgets=b, remaining=Remaining(wallclock_s=30, observed_attempt_s=10)).warnings == []
     r = validate(
         d, budgets=Budgets(max_attempt_tokens=1, max_concurrency=1), remaining=Remaining(wallclock_s=45, observed_attempt_s=10)
     )
-    assert rules(r) == {"8"} and "over max_concurrency 1" in str(r.errors[0])
-    # planner estimates can only make it stricter: an optimistic 1s estimate does not beat the observed 10s
-    d.by_id()["T2"].estimate = {"seconds": 1}
-    assert "8" in rules(validate(d, budgets=b, remaining=Remaining(wallclock_s=29, observed_attempt_s=10)))
-    # ...a pessimistic one bites even with no history
+    assert r.ok and "over max_concurrency 1" in r.warnings[0].message  # throughput: 50s of work / 1 > 45s (advisory)
+    # the planner's OWN estimates are hard (it may only tighten): a pessimistic 30s estimate on T2 bites
     d.by_id()["T2"].estimate = {"seconds": 30}
     r = validate(d, budgets=b, remaining=Remaining(wallclock_s=29))
-    assert "8" in rules(r) and "planner estimates" in str(r.errors[0])
+    assert rules(r) == {"8"} and "planner estimates" in str(r.errors[0])
     assert critical_path_s(d.tasks, {"T2": 30.0}) == (30.0, ["T1", "T2", "T5"])
+    # an optimistic estimate cannot silence the advisory floor either
+    d.by_id()["T2"].estimate = {"seconds": 1}
+    r = validate(d, budgets=b, remaining=Remaining(wallclock_s=29, observed_attempt_s=10))
+    assert r.ok and r.warnings
 
 
 def test_rule8_estimates_are_validated_and_must_fit_one_attempt():

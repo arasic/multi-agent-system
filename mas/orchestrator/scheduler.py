@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -94,6 +95,7 @@ def _integration_task(conn: Conn, run_id: UUID) -> dict[str, Any] | None:
 
 
 VERIFY_LOCK_NS = 0x4D415356  # 'MASV': advisory-lock namespace for the verifier stage
+MAX_VERIFY_RETRIES = 1  # verifier ERROR/TIMEOUT (infrastructure) is re-run this many times before a terminal verdict
 
 
 def _promote_integration_ref(run_id: UUID, sha: str, workspace: Any | None) -> None:
@@ -226,7 +228,17 @@ def _verify(conn: Conn, run_id: UUID, verifier: Verifier, workspace: Any | None 
                 # Not the code's failure: the suite did not run to a verdict on the checks (TIMEOUT: the trusted runner
                 # itself did not finish — per-check timeouts are check FAILs; ERROR: verifier/sandbox crashed; INVALID:
                 # the suite as frozen/configured could not be executed or validated). Never a repair trigger — an
-                # amendment cannot fix infrastructure — and never a fingerprint: a coded terminal verdict instead.
+                # amendment cannot fix infrastructure — and never a fingerprint. ERROR/TIMEOUT get ONE bounded retry of
+                # the verification itself (transient infrastructure: the run stays VERIFYING, the next tick re-runs
+                # it, still inside the run's wall-clock); a second one, or INVALID, is a coded terminal verdict.
+                if result.status in (VerificationStatus.ERROR, VerificationStatus.TIMEOUT) and n < MAX_VERIFY_RETRIES:
+                    emit(
+                        conn,
+                        run_id,
+                        "verify.retry",
+                        payload={"status": result.status.value, "reason": (result.reason or "")[:400], "attempt": n + 1},
+                    )
+                    return locked  # still VERIFYING: re-verified on the next tick
                 if result.status is VerificationStatus.INVALID and getattr(verifier, "name", "") != "missing":
                     code = VerdictReason.UNSUPPORTED
                 else:
@@ -302,6 +314,49 @@ def _after_fail(conn: Conn, run: Run, report: dict[str, Any], request: Verificat
         )
     assert decision.reason is not None
     return sm.fail_run(conn, run.id, f"verification failed: {decision.detail}", code=decision.reason)
+
+
+def reconcile_workspaces(conn: Conn, workspace: Any | None, *, grace_s: float = 300.0) -> int:
+    """Periodic safety net for a long-running service: every run directory under the worktree root whose run is
+    terminal (or unknown to this database) for longer than `grace_s` is garbage-collected — what a crash between
+    "run ended" and "gc ran" left behind. Live runs are never touched. Returns how many run directories were removed."""
+    try:
+        if workspace is None:
+            from mas.workers.workspace import workspace_from_settings
+
+            workspace = workspace_from_settings()
+        root = getattr(workspace, "worktree_root", None)
+        gc = getattr(workspace, "gc_run", None)
+        if root is None or not callable(gc) or not Path(root).exists():
+            return 0
+        removed = 0
+        for d in sorted(Path(root).iterdir()):
+            if not d.is_dir():
+                continue
+            try:
+                rid = UUID(d.name)
+            except ValueError:
+                continue  # not one of ours
+            row = conn.execute(
+                "SELECT status, extract(epoch from (now() - coalesce(finished_at, created_at))) AS age FROM runs WHERE id = %s",
+                (rid,),
+            ).fetchone()
+            if row is not None and RunStatus(row["status"]) in {RunStatus.PASSED, RunStatus.FAILED, RunStatus.ABORTED}:
+                if float(row["age"] or 0.0) < grace_s:
+                    continue
+            elif row is not None:
+                continue  # live run: its workers own that directory
+            else:  # unknown run (another database, or dropped): only if the directory itself is old enough
+                age = time.time() - d.stat().st_mtime
+                if age < grace_s:
+                    continue
+            n = gc(rid)
+            removed += 1
+            log.info("reconcile: removed worktree dir of %s run %s (%d attempt dirs)", "terminal" if row else "unknown", rid, n)
+        return removed
+    except Exception:  # never let housekeeping affect runs
+        log.warning("workspace reconciliation failed", exc_info=True)
+        return 0
 
 
 def gc_workspace(run_id: UUID, workspace: Any | None) -> None:
@@ -564,16 +619,26 @@ def _service_loop(
     tick_s: float,
     stop: threading.Event | None,
     max_parallel: int,
+    housekeeping=None,
+    housekeeping_s: float = 300.0,
 ) -> None:
     """Bounded executor: at most `max_parallel` runs in flight, one DB connection per job, never the same run in two
     local threads (in-flight set) and never the same run in two processes (job takes a per-run advisory lock).
-    A slow job (e.g. a 3-minute acceptance run) never blocks other runs — they proceed on the other executor slots."""
+    A slow job (e.g. a 3-minute acceptance run) never blocks other runs — they proceed on the other executor slots.
+    `housekeeping(conn)` (optional) runs on the scan connection every `housekeeping_s` seconds."""
     stop = stop or threading.Event()
     in_flight: dict[UUID, Future] = {}
     scan = connect(database_url)
+    last_housekeeping = time.monotonic()
     try:
         with ThreadPoolExecutor(max_workers=max_parallel, thread_name_prefix=name) as ex:
             while not stop.is_set():
+                if housekeeping is not None and time.monotonic() - last_housekeeping >= housekeeping_s:
+                    last_housekeeping = time.monotonic()
+                    try:
+                        housekeeping(scan)
+                    except Exception:
+                        log.exception("%s: housekeeping failed", name)
                 for rid, fut in list(in_flight.items()):
                     if fut.done():
                         in_flight.pop(rid)
@@ -622,6 +687,7 @@ def orchestrate_forever(
         tick_s=tick_s,
         stop=stop,
         max_parallel=max_parallel,
+        housekeeping=lambda c: reconcile_workspaces(c, workspace),
     )
 
 

@@ -219,8 +219,8 @@ def test_missing_verifier_is_unrecoverable_not_unsupported(conn):
 
 
 def test_slow_history_does_not_falsely_reject_a_replan(conn):
-    """One 30 s attempt (a timeout) and one 1 s success in this run: the per-task time rule 8 uses is the shortest
-    *success* (1 s) — the mean (15.5 s) would have rejected a 3-task chain with 20 s left."""
+    """One 30 s attempt (a timeout) and one 1 s success in this run: the per-task history rule 8 reports is the shortest
+    *success* (1 s), and it is advisory - a warning on the plan.validated event, never a rejection."""
     run = runs_mod.create_run_from_dag(conn, diamond(), budgets=default_budgets(max_wallclock_s=600), capabilities=set(CAPS))
     with conn.transaction():
         t1 = conn.execute("SELECT id FROM tasks WHERE run_id = %s AND key = 'T1'", (run.id,)).fetchone()["id"]
@@ -237,7 +237,10 @@ def test_slow_history_does_not_falsely_reject_a_replan(conn):
         budgets=default_budgets(),
         remaining=Remaining(wallclock_s=20, observed_attempt_s=rem.observed_attempt_s, tokens=10**9),
     )
-    assert r.ok, r.errors
+    assert r.ok and r.warnings == [], (r.errors, r.warnings)
+    # and even a history that would not fit is only advisory (never rejects a repair)
+    r = validate(diamond(), budgets=default_budgets(), remaining=Remaining(wallclock_s=2, observed_attempt_s=30.0, tokens=10**9))
+    assert r.ok and r.warnings and r.warnings[0].rule == "8-advisory"
     # with only failed attempts on record, the shortest settled attempt is the bound (still not the mean)
     with conn.transaction():
         conn.execute("UPDATE attempts SET status = 'FAILED' WHERE task_id = %s AND attempt_number = 2", (t1,))
@@ -270,3 +273,66 @@ def test_terminal_run_leaves_no_worktrees_even_after_a_worker_death(conn, tmp_pa
     assert not run_dir.exists(), sorted(p.name for p in run_dir.iterdir()) if run_dir.exists() else None
     assert (tmp_path / "repos" / f"{run.id}.git" / "HEAD").exists()  # history stays
     assert gws.gc_run(run.id) == 0  # idempotent
+
+
+# ----------------------------------------------------------------------------- verifier ERROR: one bounded retry
+
+
+def test_verifier_error_is_retried_once_then_terminal(conn):
+    """A transient infrastructure ERROR re-runs the verification once (verify.retry; run stays VERIFYING); a second
+    ERROR is a coded terminal verdict. A first ERROR followed by PASS passes - no repair, no fingerprint, no amendment."""
+    err = VerificationResult.fail("sandbox unavailable", status=VerificationStatus.ERROR)
+    ok = VerificationResult.pass_()
+    for script, expect in (([err, ok], RunStatus.PASSED), ([err, err], RunStatus.FAILED)):
+        run = runs_mod.create_run_from_dag(conn, diamond(), budgets=default_budgets(), capabilities=set(CAPS))
+        stop = threading.Event()
+        agent = StubAgent({"sleep_s": 0.02})
+        ws = [Worker(f"w{i}", list(CAPS), agent, database_url=DB_URL, poll_s=0.05, run_id=run.id) for i in range(2)]
+        ts = [run_worker_thread(w, stop) for w in ws]
+        v = StubVerifier(script=script)
+        try:
+            final = scheduler.run_until_terminal(conn, run.id, verifier=v, tick_s=0.1, timeout_s=60)
+        finally:
+            stop.set()
+            wait_all(ts, 10)
+        types = [e.type for e in for_run(conn, run.id)]
+        assert final.status is expect and types.count("verify.retry") == 1 and v.calls == 2
+        assert "verify.fingerprint" not in types and "run.replanning" not in types
+        if expect is RunStatus.FAILED:
+            assert final.verdict_reason == VerdictReason.UNRECOVERABLE_FAILURE.value and "(ERROR)" in final.verdict
+
+
+# ----------------------------------------------------------------------------- reconciliation sweep
+
+
+@pytest.mark.skipif(not git_available(), reason="git not on PATH")
+def test_reconcile_workspaces_removes_only_old_terminal_or_unknown_run_dirs(conn, tmp_path: Path):
+    import os
+    import time
+    import uuid
+
+    gws = GitWorkspace(tmp_path / "repos", tmp_path / "worktrees")
+    root = tmp_path / "worktrees"
+    # a terminal run whose directory outlived it (a crash between "run ended" and gc), an unknown run's directory,
+    # a live run's directory, and a directory that is not ours
+    done = runs_mod.create_run_from_dag(conn, diamond(), budgets=default_budgets(), capabilities=set(CAPS))
+    with conn.transaction():
+        sm.abort_run(conn, done.id, "test")
+        conn.execute("UPDATE runs SET finished_at = now() - interval '1 hour' WHERE id = %s", (done.id,))
+    live = runs_mod.create_run_from_dag(conn, diamond(), budgets=default_budgets(), capabilities=set(CAPS))
+    unknown_id = str(uuid.uuid4())
+    for name in (str(done.id), unknown_id, str(live.id), "not-a-run"):
+        (root / name / "task-1").mkdir(parents=True)
+    old = time.time() - 3600
+    os.utime(root / unknown_id, (old, old))
+    removed = scheduler.reconcile_workspaces(conn, gws, grace_s=300)
+    assert removed == 2
+    assert not (root / str(done.id)).exists() and not (root / unknown_id).exists()
+    assert (root / str(live.id) / "task-1").exists() and (root / "not-a-run" / "task-1").exists()
+    # a recently finished run is left alone until the grace period passes
+    recent = runs_mod.create_run_from_dag(conn, diamond(), budgets=default_budgets(), capabilities=set(CAPS))
+    with conn.transaction():
+        sm.abort_run(conn, recent.id, "test")
+    (root / str(recent.id) / "task-1").mkdir(parents=True)
+    assert scheduler.reconcile_workspaces(conn, gws, grace_s=300) == 0
+    assert scheduler.reconcile_workspaces(conn, gws, grace_s=0) == 1 and not (root / str(recent.id)).exists()
