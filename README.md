@@ -155,7 +155,7 @@ docker compose up -d postgres
 .venv/Scripts/mas run --dag benchmarks/url_shortener/dag.json --workers 3 --stub-verifier
 .venv/Scripts/mas replay <run_id>
 docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
-.venv/Scripts/python -m pytest -q                                   # 137 tests, no API key; uses its own temp DB
+.venv/Scripts/python -m pytest -q                                   # full key-less suite; uses its own temp DB
 ```
 
 Runs are tagged with a **pool**: `mas run` uses a private `local:<pid>` pool, the compose services serve `default`, so they never take each other's work even on the same database. Tests are isolated too — each pytest process creates and drops its own `mas_test_<pid>` database, so concurrent test runs can't collide.
@@ -167,13 +167,14 @@ docker build -f acceptance/Dockerfile.verifier -t mas-verifier:latest .
 docker compose build orchestrator && docker compose up -d --scale worker=3 orchestrator worker
 .venv/Scripts/mas verify --watch             # host-side verifier service (has Docker) — real sandboxed verdicts
 .venv/Scripts/mas execute --watch            # host-side execution runner (has Docker) — command tools for compose LLM workers
+MAS_WORKER_AGENT=llm docker compose up -d --scale worker=3 postgres orchestrator gateway worker   # LLM workers via the gateway (offline: fake:builder)
 .venv/Scripts/mas submit --dag benchmarks/url_shortener/dag.json --wait
 docker kill multi-agent-system-worker-2      # the reaper reassigns its task; the run still passes
 ```
 
 ## Status
 
-**M1 substrate — mostly done (2026-08-16).** Schema, state machines, deterministic orchestrator on hand-written DAGs, leases/heartbeat/reaper/retry, Compose workers as real processes, immutable artifacts (DB-enforced), fail-closed verifier stage, clarifying questions + assumptions (ADR-006), tool allow-lists, metrics, replay — all LLM-free and covered by 87 tests.
+**M1 substrate — complete (2026-08-16).** Schema, state machines, deterministic orchestrator on hand-written DAGs, leases/heartbeat/reaper/retry, Compose workers as real processes, immutable artifacts (DB-enforced), fail-closed verifier stage, clarifying questions + assumptions (ADR-006), tool allow-lists, metrics and replay are all complete and covered by the key-less suite.
 
 **Step 6 done (2026-08-16):** one bare git repo per run + one worktree per attempt, inputs assembled by merge, conflicts surfaced (never averaged away), the runtime commits and mints `git_commit` / `<sha>:path` artifacts, integration = the merge commit, `run/<run>/integration` promoted on PASS, `context_spec` enforced (rule 10), worker containers non-root / read-only / no egress / no caps. `mas artifacts <run_id>` shows what a run produced. Stabilized after review (heartbeat through settlement, atomic report, one lock order `run → task → attempt`) and gated by `scripts/stress_step6.py` (170 runs, 0 deadlocks). 80 tests.
 
@@ -183,7 +184,18 @@ docker kill multi-agent-system-worker-2      # the reaper reassigns its task; th
 
 **Step 7C done:** the orchestrator service ticks runs concurrently (bounded executor, per-run advisory locks, one connection per tick — a slow verification never blocks other runs) and defers verification (`--verifier external`) to a **verifier service** (`mas verify --watch`) that has sandbox access; service-mode runs now get real verdicts. Demonstrated fire-and-forget: submit through the services, kill a worker, kill the verifier mid-verification, restart → `PASS`.
 
-**M1 substrate is complete.** **M2 step 9 done:** concrete `ModelProvider`s (`anthropic`, `openai`-compatible, `fake`) chosen by `MAS_MODEL_<ROLE>="<provider>:<model>"`, prices from `MAS_MODEL_PRICES`, and **per-call telemetry**: every model call is timed, priced and written to `model_calls` as it finishes (evidence that survives a dying worker), attempts settle from the meter, and a per-attempt call/token budget (capped by the run's remaining tokens) makes runaway agent loops impossible. `mas models --ping` is the provider smoke test; `mas status` shows per-model calls and flags unpriced usage. **Step 10 (in progress):** tool layer with an in-process path jail and an **execution boundary** — command tools run only inside a per-attempt hardened container (or not at all); attempt deadlines and cancellation are enforced across model calls including provider retries; and the **bounded LLM worker loop** (`--agent llm`) with typed endings, data envelopes for untrusted content and a per-attempt execution-trace artifact — proven offline with a scripted provider building the diamond DAG through git worktrees. The **execution-runner service** (`mas execute --watch`) lets docker-less compose workers run command tools: ids-only requests through Postgres, a trusted host-side runner validates, derives the worktree, and runs each command in the attempt's sandbox (typed ABANDONED on runner death, never replayed). Open before the service-mode gate: model connectivity for compose workers (in-cluster gateway), the live single-worker smoke, the death-recovery gate. Then the LLM planner (11), one bounded repair cycle; then the fair benchmark (M3). The hardened Compose orchestrator intentionally has no Docker socket; use a host orchestrator for real verification until a separate verifier service/runner API exists. See [docs/roadmap.md](docs/roadmap.md).
+**M1 substrate is complete.** **M2 step 9 done:** concrete `ModelProvider`s (`anthropic`, `openai`-compatible, `fake`) chosen by `MAS_MODEL_<ROLE>="<provider>:<model>"`, prices from `MAS_MODEL_PRICES`, and **per-call telemetry**: every model call is timed, priced and written to `model_calls` as it finishes (evidence that survives a dying worker), attempts settle from the meter, and a per-attempt call/token budget (capped by the run's remaining tokens) makes runaway agent loops impossible. `mas models --ping` is the provider smoke test; `mas status` shows per-model calls and flags unpriced usage. **Step 10 (in progress):** tool layer with an in-process path jail and an **execution boundary** — command tools run only inside a per-attempt hardened container (or not at all); attempt deadlines and cancellation are enforced across model calls including provider retries; and the **bounded LLM worker loop** (`--agent llm`) with typed endings, data envelopes for untrusted content and a per-attempt execution-trace artifact — proven offline with a scripted provider building the diamond DAG through git worktrees. The **execution-runner service** (`mas execute --watch`) lets docker-less compose workers run command tools: ids-only requests through Postgres, a trusted host-side runner validates, derives the worktree, and runs each command in the attempt's sandbox (typed ABANDONED on runner death, never replayed). Open before the service-mode gate: model connectivity for compose workers (in-cluster gateway), the live single-worker smoke, and the death-recovery gate. Then the LLM planner (11), one bounded repair cycle; then the fair benchmark (M3). The hardened Compose services intentionally have no Docker socket; run `mas execute --watch` and `mas verify --watch` in the trusted host-side services that own sandbox execution and verification. See [docs/roadmap.md](docs/roadmap.md).
+
+## Post-MVP direction
+
+The MVP keeps execution modes explicit so the fair A/B/C/D experiment can establish when parallel MAS actually helps. After that evidence exists, the planned progression is:
+
+1. versioned workflow templates for repeated task families, while retaining dynamic DAG generation for unfamiliar work;
+2. a deterministic, inspectable selector among single-agent, sequential-workflow and parallel-centralized-MAS modes;
+3. application profiles that bundle acceptance adapters, tool policies, sandbox images and workflow templates for API, CLI, web UI, database-backed and eventually multi-service systems;
+4. adaptive effort and no-progress termination only after replay and shadow evaluation against the fixed-mode corpus.
+
+The selector will never replace the validator, budgets, policy engine or external verifier. Full rationale and gates: [ADR-008](docs/adr/008-adaptive-execution-modes.md), [roadmap](docs/roadmap.md) and [evaluation plan](docs/evaluation.md#8-post-mvp-adaptive-mode-evaluation).
 
 ## Later
 

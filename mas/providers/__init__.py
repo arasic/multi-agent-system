@@ -95,6 +95,9 @@ def from_spec(spec: str, *, cfg: Settings | None = None, **overrides: Any) -> Mo
 
         kw: dict[str, Any] = {"model": model or "fake-1"}
         kw.update(overrides)
+        script = getattr(FakeProvider, "SCRIPTS", {}).get(model)  # fake:builder → the offline demo double
+        if script is not None and "script" not in kw:
+            return FakeProvider(script, **kw)
         return FakeProvider(**kw)
     if provider == "anthropic":
         from mas.providers.anthropic_provider import DEFAULT_MODEL, AnthropicProvider

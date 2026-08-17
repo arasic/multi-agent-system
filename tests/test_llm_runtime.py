@@ -144,3 +144,53 @@ def test_runtime_owns_the_execution_backend_and_records_its_identity(conn, tmp_p
     impl = [r["meta"] for r in rows if r["meta"]["counts"]["tool_calls"] == 3]  # implementation tasks: write, run_python, finish
     assert len(impl) == 3 and all([t["name"] for t in tr["tool_calls"]] == ["write_file", "run_python", "finish"] for tr in impl)
     assert json.dumps(rows[0]["meta"])  # trace is plain JSON in artifact meta
+
+
+@pytest.mark.docker
+def test_fake_builder_builds_the_url_shortener_benchmark_with_sandbox_and_real_verifier(conn, tmp_path, verifier_image):
+    """The offline demo double (`fake:builder`) through the real pipeline: benchmark DAG, LLM loop, per-attempt sandbox
+    for run_python, runtime commits + integration merge, real acceptance verifier on the url_shortener suite → PASS."""
+    from mas import providers
+    from mas.planner.dag import DagSpec
+    from mas.verifier.acceptance import AcceptanceVerifier, SandboxLimits
+    from mas.workers.execution import SandboxExecutionBackend, SandboxSpec
+
+    root = Path(__file__).resolve().parents[1]
+    dag = DagSpec.from_file(root / "benchmarks" / "url_shortener" / "dag.json")
+    gws = GitWorkspace(tmp_path / "repos", tmp_path / "worktrees")
+    run = runs_mod.create_run_from_dag(
+        conn, dag, budgets=default_budgets(max_wallclock_s=600, max_attempt_runtime_s=300), capabilities=set(CAPS)
+    )
+    provider = providers.from_spec("fake:builder")
+    spec = SandboxSpec(image=verifier_image, max_life_s=600)
+    stop = threading.Event()
+    ws = [
+        Worker(
+            f"b{i}",
+            list(CAPS),
+            LLMAgent(),
+            database_url=DB_URL,
+            poll_s=0.05,
+            run_id=run.id,
+            workspace=gws,
+            provider=provider,
+            exec_backend_factory=lambda wt, claim: SandboxExecutionBackend(wt, attempt_id=claim.attempt.id, spec=spec),
+        )
+        for i in range(3)
+    ]
+    threads = [run_worker_thread(w, stop) for w in ws]
+    verifier = AcceptanceVerifier(root / "acceptance", image=verifier_image, limits=SandboxLimits(timeout_s=300))
+    try:
+        final = scheduler.run_until_terminal(conn, run.id, verifier=verifier, tick_s=0.1, timeout_s=500, workspace=gws)
+    finally:
+        stop.set()
+        wait_all(threads, 10)
+    assert final.status is RunStatus.PASSED, (
+        final.verdict,
+        [(a.status, a.failure_reason) for a in sm.attempts_for_run(conn, run.id)],
+    )
+    m = metrics.compute(conn, run.id)
+    assert m.tasks == 6 and m.attempts >= 6 and m.model_calls >= 6 and m.max_concurrent_attempts >= 2
+    traces = conn.execute("SELECT meta FROM artifacts WHERE run_id = %s AND type = 'log'", (run.id,)).fetchall()
+    impl = [t["meta"] for t in traces if any(c["name"] == "run_python" for c in t["meta"]["tool_calls"])]
+    assert len(impl) == 3 and all(str(t["sandbox"]["image_id"]).startswith("sha256:") for t in impl)

@@ -90,10 +90,12 @@ git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's who
 Distributed (real separate processes):
 
 ```
-docker compose build orchestrator
-docker compose up -d --scale worker=3 orchestrator worker        # orchestrator runs --verifier external (no Docker inside)
+docker compose build
+MAS_WORKER_AGENT=llm docker compose up -d --scale worker=3 postgres orchestrator gateway worker   # LLM workers → gateway (fake:builder by default; set MAS_GATEWAY_UPSTREAM=anthropic:<model> + ANTHROPIC_API_KEY for a real model)
 .venv/Scripts/mas verify --watch                                 # verifier service on the host: real sandboxed verdicts
 .venv/Scripts/mas execute --watch                                # execution-runner service on the host: compose workers' command tools (sandboxes)
+.venv/Scripts/mas submit --dag benchmarks/url_shortener/dag.json --wait   # -> PASSED offline (fake:builder) through the whole service path
+.venv/Scripts/mas submit --dag benchmarks/url_shortener/dag.json --wait   # → PASSED offline (fake:builder) through the whole service path
 .venv/Scripts/mas submit --dag benchmarks/url_shortener/dag.json --wait
 docker kill multi-agent-system-worker-2                          # A5 demo: reaper recovers the task
 .venv/Scripts/mas verify --once                                  # verify whatever is VERIFYING right now, then exit

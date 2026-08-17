@@ -8,6 +8,7 @@ mas verify --watch | --once              verifier service: real sandboxed verdic
 mas execute --watch | --once             execution-runner service: workers' command requests → per-attempt sandboxes
 mas worker [--agent stub|llm] [--model <provider>:<model>] [--exec-backend sandbox|none]   worker service (compose)
 mas models [--ping]                      configured model roles, pricing status; --ping makes one metered test call
+mas gateway [--upstream P:M]             model gateway: the one process holding a vendor key (compose: workers → gateway)
 mas status RUN_ID                        summary + metrics (+ pending questions when AWAITING_INPUT)
 mas answer RUN_ID "text"                 answer the planner's clarifying questions (ADR-006)
 mas artifacts RUN_ID                     list artifacts (git_commit shas, sha:path documents, decisions, verification)
@@ -561,6 +562,39 @@ def cmd_models(args: argparse.Namespace) -> int:
     return rc
 
 
+def cmd_gateway(args: argparse.Namespace) -> int:
+    """Model gateway: the one process that holds a vendor key. Listens on the backend network; workers use the openai:
+    provider pointed at it. Upstream = MAS_GATEWAY_UPSTREAM (<provider>:<model>), allow-list = MAS_GATEWAY_MODELS."""
+    from mas import providers
+    from mas.providers.gateway import ModelGateway
+
+    cfg = settings()
+    spec = args.upstream or cfg.gateway_upstream
+    if not spec:
+        print("gateway: set MAS_GATEWAY_UPSTREAM=<provider>:<model> (or --upstream)", file=sys.stderr)
+        return 2
+    host, _, port = (args.listen or cfg.gateway_listen).rpartition(":")
+    upstream = providers.from_spec(spec, cfg=cfg)
+    gw = ModelGateway(
+        upstream,
+        allowed_models=[m for m in (args.models or cfg.gateway_models).split(",") if m.strip()],
+        token=args.token or cfg.gateway_token or None,
+        max_body_bytes=cfg.gateway_max_body,
+        timeout_s=cfg.provider_timeout_s,
+        listen=(host or "0.0.0.0", int(port or 8080)),
+    )
+    print(
+        f"gateway: listening on {gw.address[0]}:{gw.address[1]} upstream={upstream.name}:{upstream.model} "
+        f"models={sorted(gw.allowed_models)} auth={'token' if gw.token else 'none'} (Ctrl-C to stop)"
+    )
+    stop = threading.Event()
+    try:
+        gw.serve_forever(stop)
+    except KeyboardInterrupt:
+        stop.set()
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     with connect() as conn:
         m = metrics.compute(conn, UUID(args.run_id))
@@ -729,6 +763,13 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--pool", default=None, help="comma-separated pools to serve; '*' = all (default: $MAS_POOL or 'default')")
     w.add_argument("--workspace", default=None, choices=["git", "none"])
     w.set_defaults(fn=cmd_worker)
+
+    gw = sub.add_parser("gateway", help="model gateway: the one process with a vendor key; workers use openai:<name> at its URL")
+    gw.add_argument("--upstream", default=None, help="<provider>:<model> (default: $MAS_GATEWAY_UPSTREAM)")
+    gw.add_argument("--models", default=None, help="comma-separated names clients may request (default: the upstream model)")
+    gw.add_argument("--token", default=None, help="bearer token clients must present (default: $MAS_GATEWAY_TOKEN)")
+    gw.add_argument("--listen", default=None, help="host:port (default: $MAS_GATEWAY_LISTEN or 0.0.0.0:8080)")
+    gw.set_defaults(fn=cmd_gateway)
 
     md = sub.add_parser("models", help="configured model roles + pricing status; --ping makes one metered test call")
     md.add_argument("--ping", action="store_true", help="make one small metered call per configured role (or --spec)")

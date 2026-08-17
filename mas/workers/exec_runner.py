@@ -186,10 +186,10 @@ class ExecRunner:
         if row is None:
             return CommandResult(exit_code=None, output="", duration_s=0.0, error="unknown attempt")
         if kind == "close":
-            self._close_session(attempt_id)
-            return CommandResult(exit_code=0, output="session closed", duration_s=time.monotonic() - t0)
+            self._close_session(attempt_id, conn=conn)
+            return CommandResult(exit_code=0, output="", duration_s=time.monotonic() - t0)
         if row["a_status"] != "RUNNING":
-            self._close_session(attempt_id)
+            self._close_session(attempt_id, conn=conn)
             return CommandResult(exit_code=None, output="", duration_s=0.0, error=f"attempt is {row['a_status']}, not RUNNING")
         if row["task_id"] != req["task_id"] or row["run_id"] != req["run_id"]:
             return CommandResult(exit_code=None, output="", duration_s=0.0, error="request ids do not match the attempt")
@@ -307,7 +307,7 @@ class ExecRunner:
         except Exception:
             log.debug("exec runner: session record failed", exc_info=True)
 
-    def _close_session(self, attempt_id: UUID) -> None:
+    def _close_session(self, attempt_id: UUID, conn: Conn | None = None) -> None:
         with self._lock:
             s = self.sessions.pop(attempt_id, None)
         if s is not None:
@@ -316,6 +316,11 @@ class ExecRunner:
             except Exception:
                 log.warning("exec runner: closing sandbox for %s failed", attempt_id, exc_info=True)
             self.stats["closed_sessions"] += 1
+        if conn is not None:
+            try:
+                conn.execute("DELETE FROM exec_sessions WHERE attempt_id = %s AND runner_id = %s", (attempt_id, self.runner_id))
+            except Exception:
+                log.debug("exec runner: session row delete failed", exc_info=True)
 
     def gc_sessions(self, conn: Conn) -> None:
         """Close sandboxes whose attempt is no longer RUNNING, and sessions we no longer own (lease taken over)."""
@@ -334,8 +339,7 @@ class ExecRunner:
         known = {r["id"] for r in rows}
         for r in rows:
             if r["status"] != "RUNNING" or r["owner"] != self.runner_id:
-                self._close_session(r["id"])
-                conn.execute("DELETE FROM exec_sessions WHERE attempt_id = %s AND runner_id = %s", (r["id"], self.runner_id))
+                self._close_session(r["id"], conn=conn)
         for aid in ids:
             if aid not in known:  # attempt row gone (run deleted)
                 self._close_session(aid)

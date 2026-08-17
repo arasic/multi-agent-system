@@ -264,11 +264,16 @@ class LLMAgent:
         lim = self.limits
         req = required_artifacts(ctx.task)
         contract = ", ".join(f"{t}:{n}" if n else t for t, n in req) or "(none declared)"
+        run_goal = str(getattr(ctx.run, "goal", "") or "").strip()
         lines = [
             f"# Task {ctx.task.key} (capability: {ctx.task.capability}, attempt {ctx.attempt.attempt_number})",
             "",
             data_envelope("task goal", str(ctx.task.goal or "").strip(), nonce=True),
             "",
+        ]
+        if run_goal:
+            lines += [data_envelope("overall run goal (context only; your task is the one above)", run_goal, nonce=True), ""]
+        lines += [
             f"Output contract — artifacts this task must produce: {contract}",
             "- `git_commit` is produced by the runtime from whatever you leave in the worktree; do not list it in `finish`.",
             "- `document:<name>` means a file named <name>; list it in `finish` as "

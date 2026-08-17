@@ -249,3 +249,90 @@ def _retry_after(headers: dict[str, str]) -> float | None:
 
 
 __all__ = ["OpenAICompatibleProvider", "ProviderError", "to_openai_messages", "to_openai_tool", "response_to_completion"]
+
+
+# ----------------------------------------------------------------------------- server side of the same wire (gateway)
+
+
+def from_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """OpenAI Chat Completions messages → provider-neutral messages (the inverse of to_openai_messages)."""
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if isinstance(content, list):  # content parts → text
+            content = "".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+        text = "" if content is None else str(content)
+        if role in ("system", "user", "developer"):
+            out.append({"role": "system" if role == "developer" else role, "content": text})
+        elif role == "assistant":
+            entry: dict[str, Any] = {"role": "assistant", "content": text}
+            calls = []
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                args_raw = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else dict(args_raw)
+                    if not isinstance(args, dict):
+                        args = {"_value": args}
+                except json.JSONDecodeError:
+                    args = {"_raw_arguments": args_raw}
+                calls.append({"id": str(tc.get("id") or ""), "name": str(fn.get("name") or ""), "input": args})
+            if calls:
+                entry["tool_calls"] = calls
+            out.append(entry)
+        elif role == "tool":
+            is_error = text.startswith("ERROR: ")
+            out.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(m.get("tool_call_id") or ""),
+                    "content": text[len("ERROR: ") :] if is_error else text,
+                    "is_error": is_error,
+                }
+            )
+        else:
+            raise ValueError(f"unknown message role {role!r}")
+    return out
+
+
+def from_openai_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for t in tools or []:
+        fn = t.get("function") if t.get("type") == "function" else t
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        out.append(
+            {
+                "name": str(fn["name"]),
+                "description": str(fn.get("description", "")),
+                "input_schema": dict(fn.get("parameters") or {"type": "object", "properties": {}}),
+            }
+        )
+    return out
+
+
+def to_openai_response(comp: Completion, *, model: str, response_id: str) -> dict[str, Any]:
+    """Completion → OpenAI Chat Completions response JSON (what a client of the gateway receives)."""
+    msg: dict[str, Any] = {"role": "assistant", "content": comp.text if (comp.text or not comp.tool_calls) else None}
+    if comp.tool_calls:
+        msg["tool_calls"] = [
+            {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": json.dumps(tc.input)}}
+            for tc in comp.tool_calls
+        ]
+    finish = {"end_turn": "stop", "tool_use": "tool_calls", "max_tokens": "length", "refusal": "content_filter"}.get(
+        comp.stop_reason, "stop"
+    )
+    u = comp.usage
+    return {
+        "id": response_id,
+        "object": "chat.completion",
+        "model": u.model or model,
+        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+        "usage": {
+            "prompt_tokens": u.input_tokens,
+            "completion_tokens": u.output_tokens,
+            "total_tokens": u.input_tokens + u.output_tokens,
+            "prompt_tokens_details": {"cached_tokens": u.cache_read_tokens},
+        },
+    }

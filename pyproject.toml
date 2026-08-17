@@ -32,6 +32,7 @@ include = ["mas*"]
 
 [tool.setuptools.package-data]
 "mas.db" = ["migrations/*.sql"]
+"mas.providers" = ["fake_assets/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

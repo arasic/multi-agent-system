@@ -432,7 +432,7 @@ An agent acts on the world only through `mas/workers/tools.py`, constructed per 
 
 **Roles** (three, no dynamic routing): **planner** → strong model; **worker** → fast/cheap model; **reviewer/re-planner** → strong (preferably a different family). `mas models` shows the configured roles and pricing status; `mas models --ping [--spec …]` makes one small metered call — the smallest end-to-end proof that a provider works.
 
-**Deployment note.** The hardened Compose workers have **no egress** (§13), so a real provider cannot be reached from inside them by design. Options, in order of preference: a narrow **model gateway** on the backend network (allow-listed models, keys held only there — the `openai` provider's `base_url` points at it), or workers on the host for development. Keys are never baked into images or task metadata.
+**Deployment — the model gateway (`mas gateway`, `mas/providers/gateway.py`).** The hardened Compose workers have **no egress** (§13). The one process with a vendor key is the **gateway** service, attached to both the internal `backend` network (workers reach it) and the egress network (it reaches the vendor): it speaks the OpenAI Chat Completions wire (workers use the ordinary `openai:` provider with `MAS_OPENAI_BASE_URL=http://gateway:8080/v1`), requires a bearer token, allow-lists the model names clients may ask for, bounds body size / `max_tokens` / time, translates to the provider-neutral shape and forwards to one upstream `ModelProvider` (`MAS_GATEWAY_UPSTREAM=<provider>:<model>`, e.g. `anthropic:<model>`, or `fake:builder` for the offline demo). It persists nothing; the worker's own meter records and prices usage from the response's real upstream model id. No streaming. Keys are never baked into images, YAML or task metadata (`ANTHROPIC_API_KEY` reaches only the gateway container, from the operator's shell).
 
 ---
 
@@ -454,10 +454,48 @@ An agent acts on the world only through `mas/workers/tools.py`, constructed per 
 - **`/data` is a host bind mount** (`${MAS_DATA_DIR:-./.mas}`) holding `repos/` (bare repo per run) and `worktrees/` — mounted by workers and the orchestrator, and readable by the host-side verifier service (which needs the exact integration commits and promotes `run/<run>/integration`). One host by design; a multi-host deployment would push/fetch or containerise the verifier with an API-driven (volume / `docker cp`) transfer instead of bind mounts.
 - **Networks:** `backend` is `internal: true` — workers and orchestrator have **no egress**; Postgres also joins `frontend` so the host reaches the published port.
 - **Worker/orchestrator containers:** `USER mas` (uid 1000), `read_only: true` rootfs, `tmpfs /tmp`, `cap_drop: [ALL]`, `no-new-privileges`, `./acceptance:/app/acceptance:ro`. Verified: cannot write `/app`, cannot reach the internet, can reach Postgres and `/data`.
-- Later (step 10): the LLM worker needs a model-API egress — give *that* service a proxy/allow-list, not the network; agent tools stay sandboxed to the worktree.
+- Service-mode model connectivity is still an M2 step-10 gate. The preferred deployment is a narrow configured gateway with allow-listed models and keys held there, rather than general worker egress; host-side development may call a configured provider directly. Agent command tools stay in the networkless execution sandbox in either case.
 
 ---
 
 ## 14. Explicitly not in MVP
 
-Claims/evidence tables, reviewer panels, dynamic model routing, long-term memory, vector DB, swarm messaging, agent spawning, prompt evolution, self-modification, RL, autonomous deployment, Kafka, Kubernetes, any security-domain code.
+Claims/evidence tables, reviewer panels, automatic execution-mode selection, workflow/profile libraries, generic plan-staleness repair, dynamic model routing, long-term memory, vector DB, swarm messaging, agent spawning, prompt evolution, self-modification, RL, autonomous deployment, Kafka, Kubernetes, any security-domain code.
+
+---
+
+## 15. Post-MVP direction: controlled adaptive execution
+
+This section is **non-normative for M0–M3**. [ADR-008](adr/008-adaptive-execution-modes.md) governs the future work and preserves the existing deterministic substrate.
+
+```text
+goal + approved acceptance contract + budgets
+                    │
+                    ▼
+          support and risk classification
+                    │
+                    ▼
+       validated task-shape description
+        width · coupling · critical path
+          output overlap · uncertainty
+                    │
+                    ▼
+        deterministic mode policy
+          ├─ single agent
+          ├─ sequential workflow
+          └─ parallel centralized MAS
+                    │
+                    ▼
+   existing validator → orchestrator → verifier
+```
+
+The progression is deliberately evidence-gated:
+
+1. **M3 first:** run explicit A/B/C/D configurations. Planner-produced task-shape fields are recorded but cannot select the mode.
+2. **Workflow templates:** add versioned phase/role/output-contract templates and deterministic phase-exit checks for repeated task families. A template constrains a plan; it is not one fixed DAG for every request. The planner may fill slots or generate a dynamic DAG when no supported template fits. Intermediate checks can block or repair a phase but cannot declare final success.
+3. **Deterministic selector:** choose among the three execution modes using inspectable thresholds and reason codes. The choice is stored before execution and evaluated against the fixed-mode corpus.
+4. **Application profiles:** expand acceptance adapters, tool policies, sandbox images and workflow templates one profile at a time (API, CLI, web UI, API+database, full stack, then multi-service). “Any app” means an extensible set of explicitly supported profiles, not unbounded autonomy.
+
+The selector never bypasses policy, budgets, DAG validation, external verification or required human approval. Agents may recommend termination, but deterministic code emits terminal reason codes such as `BUDGET_EXHAUSTED`, `NO_PROGRESS`, `UNSUPPORTED`, `POLICY_DENIED`, `INVALID_PLAN` and `UNRECOVERABLE_FAILURE`. `NO_PROGRESS` is based on deterministic evidence fingerprints across bounded repair cycles, not an LLM's opinion. New database run states are added only if implementation proves reason codes insufficient.
+
+Claims/evidence graphs and generic plan-staleness detection remain deferred until a domain or benchmark demonstrates that they are necessary.

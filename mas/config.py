@@ -50,6 +50,12 @@ class Settings:
     openai_base_url: str = field(default_factory=lambda: _env("MAS_OPENAI_BASE_URL", "https://api.openai.com/v1"))
     openai_api_key: str = field(default_factory=lambda: _env("MAS_OPENAI_API_KEY", _env("OPENAI_API_KEY", "")))
     openai_max_tokens_field: str = field(default_factory=lambda: _env("MAS_OPENAI_MAX_TOKENS_FIELD", "max_completion_tokens"))
+    # Model gateway (`mas gateway`): the one backend-network process with a vendor key; workers use openai:<name> at its URL
+    gateway_upstream: str = field(default_factory=lambda: _env("MAS_GATEWAY_UPSTREAM", ""))  # "<provider>:<model>"
+    gateway_models: str = field(default_factory=lambda: _env("MAS_GATEWAY_MODELS", ""))  # comma allow-list of names
+    gateway_token: str = field(default_factory=lambda: _env("MAS_GATEWAY_TOKEN", ""))
+    gateway_listen: str = field(default_factory=lambda: _env("MAS_GATEWAY_LISTEN", "0.0.0.0:8080"))
+    gateway_max_body: int = field(default_factory=lambda: int(_env("MAS_GATEWAY_MAX_BODY", "2000000")))
     # Per-attempt call budget enforced by the metered provider (bounded loops, antipatterns E1); the run's remaining
     # token budget caps it further.
     attempt_max_calls: int = field(default_factory=lambda: int(_env("MAS_ATTEMPT_MAX_CALLS", "40")))

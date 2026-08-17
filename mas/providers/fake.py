@@ -119,3 +119,65 @@ class FakeProvider:
         if len(text) > cap_chars:
             text, stop = text[:cap_chars], "max_tokens"
         return Completion(text=text, usage=self._usage(messages, text, tcs), raw=item, tool_calls=tcs, stop_reason=stop)
+
+
+# ----------------------------------------------------------------------------- fake:builder (offline demo double)
+
+
+def _asset(name: str) -> str:
+    from importlib import resources
+
+    return resources.files("mas.providers").joinpath("fake_assets", "url_shortener", name).read_text(encoding="utf-8")
+
+
+def builder_script(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Deterministic scripted 'model' for the LLM worker loop (`fake:builder`): reads the brief and does the task —
+    documents for `document:<name>` contracts; for implementation/testing tasks the canned URL-shortener app + tests
+    when the run goal names it (else a placeholder file); runs pytest when it can; integration → finish. Proves the
+    plumbing end to end without a key, never the intelligence."""
+    brief = messages[1]["content"] if len(messages) > 1 else ""
+    first_line = brief.split("\n", 1)[0]
+    key = first_line.split("# Task ")[1].split(" ")[0] if "# Task " in first_line else "T"
+    tool_names = {t["name"] for t in (tools or [])}
+    done = [m for m in messages if m["role"] == "tool"]
+    url_shortener = "url shortener" in brief.lower() or "url-shortener" in brief.lower()
+
+    def call(name: str, **args: Any) -> dict[str, Any]:
+        return {"tool_calls": [{"id": f"{name}-{len(done)}", "name": name, "input": args}]}
+
+    def finish(**extra: Any) -> dict[str, Any]:
+        return {"tool_calls": [{"id": "finish", "name": "finish", "input": {"success": True, "summary": f"{key} done", **extra}}]}
+
+    # the contract line decides: "document:<name>" entries → write those documents; git_commit → build files
+    contract_line = ""
+    for line in brief.split("\n"):
+        if line.startswith("Output contract"):
+            contract_line = line.split(":", 1)[1] if ":" in line else ""
+            break
+    names = [tok.split(":", 1)[1].strip("`.,;") for tok in contract_line.replace(",", " ").split() if tok.startswith("document:")]
+    if names:
+        if len(done) < len(names):
+            n = names[len(done)]
+            return call("write_file", path=f"docs/{n}", content=f"# {n}\n\n{key}: {first_line}\n")
+        return finish(artifacts=[{"type": "document", "path": f"docs/{n}", "name": n} for n in names])
+    if "capability: integration" in first_line or "git_commit" not in contract_line:
+        return finish()
+    testing = "capability: testing" in first_line
+    # implementation / testing with a git_commit contract
+    steps: list[tuple[str, dict[str, Any]]] = []
+    if url_shortener:
+        if testing:
+            steps.append(("write_file", {"path": "test_app.py", "content": _asset("test_app.py")}))
+        else:
+            steps.append(("write_file", {"path": "app.py", "content": _asset("app.py")}))
+    else:
+        steps.append(("write_file", {"path": f"src/{key}.txt", "content": f"{key}\n"}))
+    if "run_python" in tool_names:
+        steps.append(("run_python", {"code": f"print('checked {key}')"}))
+    if len(done) < len(steps):
+        name, args = steps[len(done)]
+        return call(name, **args)
+    return finish()
+
+
+FakeProvider.SCRIPTS = {"builder": builder_script}  # type: ignore[attr-defined]
