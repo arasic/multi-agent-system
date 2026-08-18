@@ -122,9 +122,17 @@ def _spend(args: argparse.Namespace) -> dict:
     """What this smoke has been billed so far, from the metered telemetry of the stages on record (ADR-010).
 
     Carried-forward stages count: their calls were paid for, even if in an earlier invocation. A stage with unpriced
-    calls makes the total a floor, so it is reported separately rather than folded in as zero. The ping's single call
-    has no run and is not in the ledger — `mas models --ping` prints its own cost."""
+    calls makes the total a floor, so it is reported separately rather than folded in as zero. The ping has no run, so
+    it is recorded under `ping` rather than in `runs` — but its one call is billed and counted here like any other."""
     billed, unpriced, by_step = 0.0, 0, {}
+    ping = args.evidence.get("ping")
+    if isinstance(ping, dict) and ping.get("calls"):
+        if ping.get("priced"):
+            billed += float(ping.get("cost_usd") or 0.0)
+            by_step["ping"] = round(float(ping.get("cost_usd") or 0.0), 8)
+        else:
+            unpriced += len(ping["calls"])
+            by_step["ping"] = None
     for record in args.evidence.get("runs", []):
         m = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
         cost, unknown = m.get("call_cost_usd"), int(m.get("unpriced_calls") or 0)
@@ -148,8 +156,11 @@ def _admit(args: argparse.Namespace, step: str) -> str | None:
         f"[spend] billed ${billed:.4f} of ${cap:.4f} ceiling; {step} <= ${args.max_cost_usd:.4f} per run"
         + (f"; {spend['unpriced_calls']} unpriced call(s) so far" if spend["unpriced_calls"] else "")
     )
-    if step == "ping":  # one metered call, bounded by nothing else; never worth refusing
-        return None
+    if step == "ping":
+        # the ping's cost cannot be bounded in USD before it runs (one call of --ping-max-tokens at an unknown price),
+        # so it is admitted while any ceiling remains and *billed* afterwards like everything else; the next stage then
+        # meets the ordinary rule. The ceiling is never bypassed, only crossed by at most one small call.
+        return None if billed < cap else f"the ${cap:.4f} smoke ceiling is already spent (billed ${billed:.4f})"
     if billed + args.max_cost_usd > cap:
         return (
             f"the ${cap:.4f} smoke ceiling does not cover another ${args.max_cost_usd:.4f} run (billed ${billed:.4f}); "
@@ -176,6 +187,11 @@ def merge_resume(previous: dict, current: dict) -> tuple[dict, list[str], str | 
     merged = dict(current)
     merged["steps"] = {s: True for s in skip}
     merged["runs"] = [r for r in prev_runs if isinstance(r, dict) and r.get("step") in skip]
+    # the ping was paid for once; it is carried with its stage so the ledger neither loses it nor bills it twice
+    if "ping" in skip and isinstance(previous.get("ping"), dict):
+        merged["ping"] = previous["ping"]
+    else:
+        merged.pop("ping", None)
     merged["resumed_from"] = {"started_at": previous.get("started_at"), "steps": skip}
     return merged, skip, None
 
@@ -227,9 +243,29 @@ def _preflight(args: argparse.Namespace) -> list[str]:
 
 
 def step_ping(args: argparse.Namespace) -> bool:
+    """One metered call — and it is charged to this smoke's ledger like every other call (ADR-010).
+
+    It is small (one call, `--ping-max-tokens`), but "small" is not "unaccounted": an unpriced ping means the price
+    table does not cover the model the provider reported, which is exactly the thing to discover before the worker
+    stage, not after."""
     _hr(f"1/4 ping  {args.worker}")
-    rc = cli.main(["models", "--ping", "--spec", args.worker])
-    return rc == 0
+    record = cli.ping_spec(args.worker, role="worker", max_tokens=args.ping_max_tokens)
+    args.evidence["ping"] = record
+    if record["ok"]:
+        print(f"{args.worker}: {record.get('stop_reason')} {record.get('text', '')!r}")
+    else:
+        print(f"{args.worker}: FAILED {record['error']}", file=sys.stderr)
+    for call in record["calls"]:
+        print("   ", json.dumps(call, default=str))
+    if record["models"]:
+        print(f"  provider reported model(s): {record['models']}  priced={record['priced']}")
+    if not record["priced"]:
+        print(
+            "  the ping is unpriced: MAS_MODEL_PRICES does not cover the model the provider reported "
+            f"({record['models'] or 'unknown'})",
+            file=sys.stderr,
+        )
+    return bool(record["ok"]) and (record["priced"] or args.allow_unpriced)
 
 
 def _budgets(args: argparse.Namespace) -> Budgets:
@@ -425,6 +461,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--max-wallclock-s", type=int, default=1800)
     ap.add_argument("--max-attempt-runtime-s", type=int, default=600)
     ap.add_argument("--max-replans", type=int, default=1)
+    ap.add_argument("--ping-max-tokens", type=int, default=64, help="output ceiling for the ping's single call")
     ap.add_argument(
         "--no-auto-approve", action="store_true", help="wait for `mas approve` instead of approving the proposal here"
     )

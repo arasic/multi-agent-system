@@ -459,3 +459,78 @@ def test_cli_models_and_ping(monkeypatch, capsys):
     assert "[adhoc] fake:other" in capsys.readouterr().out
     monkeypatch.setenv("MAS_MODEL_WORKER", "")
     assert main(["models", "--ping"]) == 2  # nothing configured to ping
+
+
+# ----------------------------------------------------------------------------- tool-continuation probe
+
+
+def test_tool_continuation_probe_runs_the_two_turn_round_trip_and_reports_it_as_data():
+    """The path `--ping` cannot reach: model -> tool call -> tool result -> SECOND call. Two calls, one echo tool."""
+    from mas.providers.probe import PROBE_TOOL, probe_tools
+
+    report = probe_tools(providers.from_spec("fake:probe"), pricing=Pricing.from_json(json.dumps({"probe": [1, 5]})))
+    assert report["ok"] and all(report["checks"].values())
+    assert set(report["checks"]) == {
+        "asked_for_the_tool",
+        "called_the_offered_tool",
+        "continuation_accepted",
+        "answered_after_the_tool_result",
+        "tool_result_reached_the_model",
+    }
+    assert len(report["calls"]) == 2 and report["calls"][0]["meta"]["tools"] == 1
+    assert report["models"] == ["probe"] and report["priced"] and report["cost_usd"] > 0
+    assert report["nonce"] in report["text"]
+    assert PROBE_TOOL["name"] == "mas_probe_echo"  # one harmless tool: reads nothing, writes nothing
+
+
+def test_the_probe_reports_a_rejected_continuation_instead_of_raising():
+    """A 400 on the second call is the finding the probe exists to produce — cheaply, before a whole worker run."""
+    from mas.providers.probe import probe_tools
+
+    def script(messages, tools):
+        if messages[-1].get("role") == "tool":
+            raise ProviderRequestError("400 messages.1: thinking blocks missing from the assistant turn")
+        return {
+            "text": "",
+            "tool_calls": [{"id": "c1", "name": "mas_probe_echo", "input": {"text": "x"}}],
+            "stop_reason": "tool_use",
+        }
+
+    report = probe_tools(FakeProvider(script))
+    assert not report["ok"] and report["checks"]["continuation_accepted"] is False
+    assert "thinking blocks missing" in report["error"] and len(report["calls"]) == 2
+
+    silent = probe_tools(FakeProvider("I will not use tools."))  # never calls the tool: also a failed probe, not a crash
+    assert not silent["ok"] and "did not call the tool" in silent["error"]
+    assert silent["checks"] == {"asked_for_the_tool": False, "called_the_offered_tool": False}
+
+    broken = probe_tools(FakeProvider([ProviderUnavailable("upstream down")]))
+    assert not broken["ok"] and "first call failed" in broken["error"]
+
+
+def test_native_summary_describes_a_signed_turn_without_leaking_it():
+    """The probe must be able to say "this turn carried signed reasoning we replayed" without vendor blocks escaping
+    `mas/providers/` (base.py's contract)."""
+    from mas.providers.base import native_summary
+
+    turn = {
+        "role": "assistant",
+        "content": "",
+        "native": {
+            "provider": "anthropic",
+            "content": [
+                {"type": "thinking", "thinking": "...", "signature": "SIGNATURE-PAYLOAD"},
+                {"type": "redacted_thinking", "data": "OPAQUE-PAYLOAD"},
+                {"type": "tool_use", "id": "t1", "name": "mas_probe_echo", "input": {}},
+            ],
+        },
+    }
+    summary = native_summary(turn)
+    assert summary == {
+        "provider": "anthropic",
+        "blocks": 3,
+        "block_types": {"redacted_thinking": 1, "thinking": 1, "tool_use": 1},
+        "signed_reasoning": 2,
+    }
+    assert "PAYLOAD" not in json.dumps(summary)  # types and counts leave; signed payloads never do
+    assert native_summary({"role": "assistant", "content": "plain"}) is None

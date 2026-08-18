@@ -129,6 +129,28 @@ def native_content(message: dict[str, Any], provider: str) -> list[dict[str, Any
     return [dict(b) for b in content if isinstance(b, dict)]
 
 
+def native_summary(message: dict[str, Any]) -> dict[str, Any] | None:
+    """A vendor-shape-free description of an assistant turn's `native` blocks, for diagnostics.
+
+    `native` itself stays opaque outside this package (see the module docstring), but *whether* a turn carries signed
+    reasoning that a continuation must replay is exactly what a live probe needs to report. Block *types* and counts
+    are safe to hand out; the signed payloads never leave here."""
+    native = message.get("native")
+    if not isinstance(native, dict):
+        return None
+    blocks = [b for b in (native.get("content") or []) if isinstance(b, dict)]
+    types: dict[str, int] = {}
+    for block in blocks:
+        key = str(block.get("type") or "unknown")
+        types[key] = types.get(key, 0) + 1
+    return {
+        "provider": native.get("provider"),
+        "blocks": len(blocks),
+        "block_types": dict(sorted(types.items())),
+        "signed_reasoning": types.get("thinking", 0) + types.get("redacted_thinking", 0),
+    }
+
+
 class ModelProvider(Protocol):
     name: str  # vendor/family label used in telemetry ("anthropic", "openai", "fake", ...)
     model: str  # model id as configured

@@ -52,6 +52,18 @@ Anthropic credentials resolve the SDK way (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_
 
 Cache multipliers are the vendor's standard ratios, not per-model confirmations. Whatever ends up in `MAS_MODEL_PRICES` must be copied from the vendor's current page on the day, with the date recorded here.
 
+**Carry the provenance in the table itself.** Keys beginning with `_` are ignored by the parser ([pricing.py](../mas/providers/pricing.py)), so the snapshot that priced an experiment can say where it came from — and `experiment.json` freezes the whole table, provenance included:
+
+```json
+{
+  "_verified_at": "YYYY-MM-DD",
+  "_source": "<the vendor pricing page you actually opened>",
+  "<exact model id the provider reports back>": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+}
+```
+
+Price the **exact id the provider reports**, not the alias you requested — `mas models --ping` prints it (`models`), and prefix matching covers dated variants. An unpriced model makes every cost figure a floor: the live smoke fails, and the matrix refuses to start.
+
 ## What we measure regardless of model
 
 Per call (`model_calls`): provider, model, role, tokens (incl. cache), cost, `priced`, latency, stop reason / error. Per attempt: `model`, `input_tokens`, `output_tokens`, `cost_usd` (settled from the meter). Per run: totals; `mas status` shows both and flags unpriced usage. This is what makes configs A–D comparable when models change.

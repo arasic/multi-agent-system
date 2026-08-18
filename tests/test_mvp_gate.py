@@ -953,6 +953,97 @@ def test_live_smoke_request_shape_records_what_the_matrix_will_freeze(monkeypatc
     assert {"provider_timeout_s", "provider_max_retries", "attempt_max_calls"} <= set(shape)
 
 
+def _ping_record(*, priced: bool = True, ok: bool = True, cost: float = 0.0004) -> dict:
+    """What `cli.ping_spec` returns: the telemetry of the one metered call, as data."""
+    return {
+        "role": "worker",
+        "spec": "p:w",
+        "ok": ok,
+        "error": None if ok else "ProviderRequestError: 401",
+        "stop_reason": "end_turn" if ok else None,
+        "text": "OK" if ok else "",
+        "calls": [{"model": "m-1", "priced": priced, "cost_usd": cost if priced else 0.0}] if ok else [],
+        "models": ["m-1"] if ok else [],
+        "input_tokens": 15,
+        "output_tokens": 2,
+        "cache_read_tokens": 0,
+        "duration_ms": 900,
+        "priced": priced,
+        "cost_usd": cost if priced else None,
+    }
+
+
+def _ping_args(**overrides) -> argparse.Namespace:
+    base = dict(
+        worker="p:w",
+        ping_max_tokens=64,
+        allow_unpriced=False,
+        max_cost_usd=10.0,
+        max_total_cost_usd=30.0,
+        evidence={"runs": []},
+        output=None,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_the_ping_is_billed_to_the_smoke_ledger_and_an_unpriced_one_fails_the_gate(monkeypatch):
+    """It is one small call, but "small" is not "unaccounted": an unpriced ping means the price table does not cover
+    the model the provider reported, and every cost figure after it would be a floor (ADR-010 / D15)."""
+    args = _ping_args()
+    monkeypatch.setattr(live_smoke.cli, "ping_spec", lambda *a, **kw: _ping_record())
+    assert live_smoke.step_ping(args) is True
+    assert args.evidence["ping"]["models"] == ["m-1"]
+    spend = live_smoke._spend(args)
+    assert spend["billed_usd"] == 0.0004 and spend["by_step"]["ping"] == 0.0004 and spend["unpriced_calls"] == 0
+
+    unpriced = _ping_args()
+    monkeypatch.setattr(live_smoke.cli, "ping_spec", lambda *a, **kw: _ping_record(priced=False))
+    assert live_smoke.step_ping(unpriced) is False  # completion fails: the cost of everything after is unknowable
+    spend = live_smoke._spend(unpriced)
+    assert spend["billed_usd"] == 0.0 and spend["unpriced_calls"] == 1 and spend["by_step"]["ping"] is None
+    assert live_smoke.step_ping(_ping_args(allow_unpriced=True)) is True  # ...unless explicitly accepted
+
+    failed = _ping_args()
+    monkeypatch.setattr(live_smoke.cli, "ping_spec", lambda *a, **kw: _ping_record(ok=False))
+    assert live_smoke.step_ping(failed) is False
+    assert live_smoke._spend(failed)["billed_usd"] == 0.0  # a call that never happened bills nothing
+
+
+def test_a_paid_ping_is_carried_forward_exactly_once_and_never_billed_twice():
+    previous = _live_evidence(steps={"ping": True}, ping=_ping_record())
+    merged, skip, refusal = live_smoke.merge_resume(previous, _live_evidence(started_at="t1"))
+    assert refusal is None and skip == ["ping"] and merged["ping"] == previous["ping"]
+    args = argparse.Namespace(evidence=merged, max_total_cost_usd=30.0, max_cost_usd=10.0)
+    assert live_smoke._spend(args)["billed_usd"] == 0.0004  # counted once, from the carried record
+
+    # a ping that is going to be re-run must not carry the earlier charge into the new evidence
+    stale = _live_evidence(steps={"worker": True}, ping=_ping_record())
+    merged, skip, _ = live_smoke.merge_resume(stale, _live_evidence(started_at="t1"))
+    assert skip == ["worker"] and "ping" not in merged
+
+
+def test_an_exhausted_smoke_ceiling_stops_even_the_ping():
+    args = _ping_args(max_total_cost_usd=1.0, evidence={"runs": [{"step": "worker", "metrics": {"call_cost_usd": 1.0}}]})
+    assert live_smoke._admit(args, "ping").startswith("the $1.0000 smoke ceiling is already spent")
+    args.max_total_cost_usd = 1.5  # any headroom admits it; its cost is billed afterwards like everything else
+    assert live_smoke._admit(args, "ping") is None
+
+
+def test_mvp_gate_rejects_evidence_whose_ping_was_unpriced(tmp_path: Path):
+    live, distributed, bench = tmp_path / "live.json", tmp_path / "distributed.json", tmp_path / "bench"
+    _write_live_and_distributed(live, distributed)
+    _write_matrix(bench, _rows())
+    evidence = json.loads(live.read_text(encoding="utf-8"))
+    evidence["ping"] = _ping_record(priced=False)
+    _write(live, evidence)
+    assert "live.priced" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+    evidence["ping"] = _ping_record()
+    _write(live, evidence)
+    assert not _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+
 def test_live_smoke_is_bounded_as_a_whole_and_reports_what_each_stage_cost(capsys):
     """The smoke is the first thing that spends money and the run that tells you what a run costs (ADR-010)."""
     args = argparse.Namespace(max_cost_usd=10.0, max_total_cost_usd=30.0, evidence={"runs": []})

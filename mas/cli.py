@@ -75,6 +75,8 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+PING_PROMPT = "Reply with the single word OK."
+
 # Credential variable names each provider accepts, in precedence order. One source of truth for three consumers:
 # `mas doctor --require-live` (does a live run have a credential?), `mas up` (which variables must NOT leak into the
 # trusted host services), and the Compose `gateway` service, which must forward every name doctor accepts — otherwise
@@ -936,9 +938,51 @@ def cmd_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def ping_spec(spec: str, *, role: str = "adhoc", prompt: str = PING_PROMPT, max_tokens: int = 64, cfg=None) -> dict[str, Any]:
+    """One metered call through `spec`, returned as **data** (never printed here, never raising).
+
+    `scripts/live_smoke.py` charges this call to its ledger (ADR-010: the first paid workflow is accounted for in
+    full), so the telemetry has to be a value, not console output."""
+    from mas import providers
+
+    cfg = cfg or settings()
+    sink = providers.MemorySink()
+    record: dict[str, Any] = {"role": role, "spec": spec, "ok": False, "error": None}
+    try:
+        base = providers.from_spec(spec, cfg=cfg)
+        meter = providers.meter(
+            base,
+            role="ping",
+            sink=sink,
+            pricing=providers.pricing_from_settings(cfg),
+            budget=providers.CallBudget(max_calls=1),
+        )
+        comp = meter.complete([{"role": "user", "content": prompt}], max_tokens=max_tokens)
+        record.update({"ok": True, "stop_reason": comp.stop_reason, "text": (comp.text or "").strip()[:200]})
+    except Exception as exc:  # noqa: BLE001 - diagnostic boundary: surface anything
+        record["error"] = f"{type(exc).__name__}: {exc}"
+    calls = [r.as_dict() for r in sink.records]
+    priced = bool(calls) and all(c["priced"] for c in calls)
+    record.update(
+        {
+            "calls": calls,
+            # what the provider called itself: compare it against the price table before spending anything larger
+            "models": sorted({c["model"] for c in calls if c["model"]}),
+            "input_tokens": sum(c["input_tokens"] for c in calls),
+            "output_tokens": sum(c["output_tokens"] for c in calls),
+            "cache_read_tokens": sum(c["cache_read_tokens"] for c in calls),
+            "duration_ms": sum(c["duration_ms"] for c in calls),
+            "priced": priced,
+            "cost_usd": round(sum(c["cost_usd"] for c in calls), 8) if priced else None,
+        }
+    )
+    return record
+
+
 def cmd_models(args: argparse.Namespace) -> int:
     """Show the configured model roles and pricing status; --ping makes one small metered call per configured role
-    (or the given --spec) and prints the telemetry record — the smallest end-to-end proof that a provider works."""
+    (or the given --spec) and prints the telemetry record — the smallest end-to-end proof that a provider works.
+    --probe-tools additionally runs a two-turn tool round-trip, which is where a continuation actually breaks."""
     from mas import providers
 
     cfg = settings()
@@ -957,24 +1001,47 @@ def cmd_models(args: argparse.Namespace) -> int:
                 specs.append((role, spec))
     ceiling = cfg.attempt_max_tokens if cfg.attempt_max_tokens is not None else "(run's max_attempt_tokens)"
     print(f"  attempt budget: max_calls={cfg.attempt_max_calls} max_tokens={ceiling}")
-    if not args.ping:
+    if not args.ping and not args.probe_tools:
         return 0
     if not specs:
-        print("nothing to ping: set MAS_MODEL_WORKER / MAS_MODEL_PLANNER or pass --spec <provider>:<model>", file=sys.stderr)
+        print("nothing to call: set MAS_MODEL_WORKER / MAS_MODEL_PLANNER or pass --spec <provider>:<model>", file=sys.stderr)
         return 2
-    rc = 0
+    rc, out = 0, []
     for role, spec in specs:
-        sink = providers.MemorySink()
-        try:
-            base = providers.from_spec(spec, cfg=cfg)
-            m = providers.meter(base, role="ping", sink=sink, pricing=pricing, budget=providers.CallBudget(max_calls=1))
-            comp = m.complete([{"role": "user", "content": args.prompt}], max_tokens=args.max_tokens)
-            print(f"[{role}] {spec}: {comp.stop_reason} {comp.text.strip()[:200]!r}")
-        except Exception as e:  # noqa: BLE001 - diagnostic command: surface anything
-            print(f"[{role}] {spec}: FAILED {type(e).__name__}: {e}", file=sys.stderr)
-            rc = 1
-        for rec in sink.records:
-            print("   ", json.dumps(rec.as_dict(), default=str))
+        if args.ping:
+            record = ping_spec(spec, role=role, prompt=args.prompt, max_tokens=args.max_tokens, cfg=cfg)
+            out.append(record)
+            if record["ok"]:
+                print(f"[{role}] {spec}: {record['stop_reason']} {record.get('text', '')!r}")
+            else:
+                print(f"[{role}] {spec}: FAILED {record['error']}", file=sys.stderr)
+                rc = 1
+            if not args.json:
+                for call in record["calls"]:
+                    print("   ", json.dumps(call, default=str))
+        if args.probe_tools:
+            from mas.providers.probe import probe_tools
+
+            try:
+                base = providers.from_spec(spec, cfg=cfg)
+                report = probe_tools(base, pricing=pricing, max_tokens=args.max_tokens, cfg=cfg)
+            except Exception as e:  # noqa: BLE001 - diagnostic command: surface anything
+                report = {"probe": "tool_continuation", "ok": False, "error": f"{type(e).__name__}: {e}", "checks": {}}
+            report["role"], report["spec"] = role, spec
+            out.append(report)
+            rc = rc or (0 if report.get("ok") else 1)
+            if not args.json:
+                print(f"[{role}] {spec} tool continuation: {'OK' if report.get('ok') else 'FAILED'}")
+                for name, passed in (report.get("checks") or {}).items():
+                    print(f"    {'PASS' if passed else 'FAIL'} {name}")
+                if report.get("native"):
+                    print(f"    native turn replayed: {json.dumps(report['native'], sort_keys=True)}")
+                if report.get("error"):
+                    print(f"    error: {report['error']}", file=sys.stderr)
+                for call in report.get("calls") or []:
+                    print("   ", json.dumps(call, default=str))
+    if args.json:
+        print(json.dumps(out, indent=2, default=str))
     return rc
 
 
@@ -1361,9 +1428,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     md = sub.add_parser("models", help="configured model roles + pricing status; --ping makes one metered test call")
     md.add_argument("--ping", action="store_true", help="make one small metered call per configured role (or --spec)")
-    md.add_argument("--spec", default=None, help="ad-hoc <provider>:<model> to ping instead of the configured roles")
-    md.add_argument("--prompt", default="Reply with the single word OK.", help="prompt used by --ping")
+    md.add_argument(
+        "--probe-tools",
+        action="store_true",
+        help="two-turn tool round-trip (model -> tool call -> tool result -> model): the path a continuation breaks on. "
+        "At most two small calls, one harmless echo tool, no repository or database. Point --spec at the gateway to "
+        "run the same exchange across the wire",
+    )
+    md.add_argument("--spec", default=None, help="ad-hoc <provider>:<model> to call instead of the configured roles")
+    md.add_argument("--prompt", default=PING_PROMPT, help="prompt used by --ping")
     md.add_argument("--max-tokens", type=int, default=64)
+    md.add_argument("--json", action="store_true", help="print the telemetry records as one JSON document")
     md.set_defaults(fn=cmd_models)
 
     s = sub.add_parser("status", help="run summary + metrics")

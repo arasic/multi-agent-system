@@ -269,3 +269,29 @@ def planner_script(messages: list[dict[str, Any]], tools: list[dict[str, Any]] |
 
 
 FakeProvider.SCRIPTS["planner"] = planner_script  # type: ignore[attr-defined]
+
+
+# ----------------------------------------------------------------------------- fake:probe (tool-continuation double)
+
+
+def probe_script(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> Any:
+    """`fake:probe`: a model that plays the two-turn round trip of `mas models --probe-tools` — call the one offered
+    tool, then answer from its result. Keeps the probe's own plumbing testable without a key (CLAUDE.md)."""
+    last = messages[-1] if messages else {}
+    if last.get("role") == "tool":
+        try:
+            return str(json.loads(last.get("content") or "{}").get("text", "OK"))
+        except (json.JSONDecodeError, AttributeError):
+            return "OK"
+    name = (tools or [{}])[0].get("name", "mas_probe_echo")
+    prompt = str(last.get("content") or "")
+    quoted = [part for part in prompt.split("'") if part.strip()]
+    text = quoted[1] if len(quoted) > 1 else "OK"
+    return {
+        "text": "",
+        "tool_calls": [{"id": "probe-call-1", "name": name, "input": {"text": text}}],
+        "stop_reason": "tool_use",
+    }
+
+
+FakeProvider.SCRIPTS["probe"] = probe_script  # type: ignore[attr-defined]

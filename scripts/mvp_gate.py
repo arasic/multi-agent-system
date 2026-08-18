@@ -352,8 +352,12 @@ def evaluate(
         ),
         Check(
             "live.priced",
-            bool(runs) and all(isinstance(r, dict) and r.get("priced") is True for r in runs),
-            "every live run must have known model prices",
+            bool(runs)
+            and all(isinstance(r, dict) and r.get("priced") is True for r in runs)
+            # the ping is one call, but an unpriced one means the price table does not cover the model the provider
+            # reported — which makes every cost figure that follows a floor rather than a number (ADR-010)
+            and (not isinstance(live.get("ping"), dict) or live["ping"].get("priced") is True),
+            "every live run and the ping must have known model prices",
         ),
         Check(
             "live.manual_contract_approval",

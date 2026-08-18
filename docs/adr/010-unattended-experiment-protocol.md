@@ -52,7 +52,11 @@ that change, plus two protocol gaps, that would each have corrupted the evidence
    The same rule bounds `scripts/live_smoke.py` — the *first* thing that spends money — with a default ceiling of
    three runs; it prints each stage's measured cost and the total, which is what the matrix's ceilings should be
    chosen from, and its resume identity includes the request shape (thinking, effort, timeout, retries), because a
-   stage that passed at another effort cost something else.
+   stage that passed at another effort cost something else. **The ping is in that ledger too**: `cli.ping_spec`
+   returns its telemetry as data, the evidence records the reported model id and cost under `ping`, and an unpriced
+   ping fails the gate — a ping the price table cannot price means every later cost figure is a floor. Its own USD
+   cost cannot be bounded before the call, so it is admitted while any ceiling remains and billed afterwards; the
+   ceiling is crossed by at most one small call, never bypassed.
 5. **Pacing and a circuit breaker.** `--pace-s` between operations, `--cooldown-s` after a machinery failure, and a
    stop after `--max-consecutive-infrastructure` (default 3) in a row, with the reason printed. Stopping never
    discards anything: rerunning the same command resumes.
@@ -89,6 +93,10 @@ that change, plus two protocol gaps, that would each have corrupted the evidence
   A/B. Both are out of MVP scope.
 - On a filesystem without advisory locking, runs now fail instead of racing. That is a real behavioural regression for
   exotic bind mounts, and the error says exactly what to change.
+- `mas models --probe-tools` exists so the riskiest live path — model → tool call → tool result → **second** call — is
+  proven for two small calls instead of being discovered mid-run. Our replay of the assistant turn is regression-tested
+  only against SDK-shaped doubles; the probe is what tests it against a real API, and it reports the reported model id
+  (compare it with the price table) and whether the turn carried signed reasoning that had to be replayed.
 
 ## Alternatives considered
 

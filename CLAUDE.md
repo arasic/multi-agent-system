@@ -90,6 +90,10 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
 .venv/Scripts/mas run --dag ... --agent llm --model fake:demo    # LLM worker loop (fake provider: no key; real: anthropic:<model> / openai:<model>)
 .venv/Scripts/mas models                                         # configured model roles + pricing status (MAS_MODEL_*, MAS_MODEL_PRICES)
 .venv/Scripts/mas models --ping --spec fake:demo                 # one metered test call (use anthropic:<model> / openai:<model> with a key)
+.venv/Scripts/mas models --probe-tools --spec fake:probe [--json]  # two-turn tool round-trip: model -> tool call -> tool result -> model.
+                                                                 #   The path a continuation breaks on (Anthropic requires the assistant turn back
+                                                                 #   unchanged, signed thinking blocks included). <=2 small calls, one echo tool, no
+                                                                 #   repo/DB. Run it against the gateway spec too before trusting distributed mode.
 .venv/Scripts/python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m>   # M2 live gate (key in THIS process): ping -> LLM workers on the benchmark -> LLM planner goal->contract->approve->DAG->PASS
 git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's whole history (one branch per attempt)
 .venv/Scripts/mas run --dag ... --workspace none                 # no filesystem (fastest; opaque stub refs)
@@ -132,7 +136,9 @@ latency.
 
 `live_smoke.py` is bounded as a whole by `--max-total-cost-usd` (default 30 = three runs at the default per-run
 ceiling): a stage starts only if the ceiling still covers its per-run maximum, each stage prints what it cost, and the
-summary states the total — that measurement is what the matrix's two ceilings should be chosen from. It refuses to
+summary states the total — **the ping included** (its telemetry, reported model id and cost land in the evidence under
+`ping` and in the ledger; an unpriced ping fails the gate, because the price table then does not cover the model the
+provider actually reported) — that measurement is what the matrix's two ceilings should be chosen from. It refuses to
 start with an Anthropic model and `MAS_ANTHROPIC_EFFORT` unset (`mas doctor --require-live` says so earlier).
 `live_smoke.py --resume` (with `--output`) skips stages already PASSED in that file when it came from the same commit,
 models, approval mode, pricing rule and price table, budgets, worker count, concurrency, replan limit **and request
