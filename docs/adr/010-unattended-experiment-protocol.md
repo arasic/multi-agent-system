@@ -56,7 +56,9 @@ that change, plus two protocol gaps, that would each have corrupted the evidence
    returns its telemetry as data, the evidence records the reported model id and cost under `ping`, and an unpriced
    ping fails the gate — a ping the price table cannot price means every later cost figure is a floor. Its own USD
    cost cannot be bounded before the call, so it is admitted while any ceiling remains and billed afterwards; the
-   ceiling is crossed by at most one small call, never bypassed.
+   ceiling is crossed by at most one small call, never bypassed. `live_smoke.py --step ping` is therefore *the*
+   first paid call; `mas models --ping` is a diagnostic that bills separately and is recorded nowhere, so running
+   both means paying twice for the same proof.
 5. **Pacing and a circuit breaker.** `--pace-s` between operations, `--cooldown-s` after a machinery failure, and a
    stop after `--max-consecutive-infrastructure` (default 3) in a row, with the reason printed. Stopping never
    discards anything: rerunning the same command resumes.

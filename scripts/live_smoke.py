@@ -72,12 +72,22 @@ def _git_state() -> dict[str, object]:
 
 
 def _write_evidence(args: argparse.Namespace) -> None:
+    """Atomic, and retried: this file is written after every stage of a paid run, and on Windows the rename can lose a
+    brief race with a scanner holding the previous version (`PermissionError: [WinError 5]`). Losing a stage's evidence
+    to an antivirus mid-scan would mean paying for it again."""
     if args.output is None:
         return
     args.output.parent.mkdir(parents=True, exist_ok=True)
     tmp = args.output.with_suffix(args.output.suffix + ".tmp")
     tmp.write_text(json.dumps(args.evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(args.output)
+    for attempt in range(6):
+        try:
+            tmp.replace(args.output)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(0.1 * (attempt + 1))
 
 
 # evidence fields that must be identical for an earlier file's passed stages to count towards this invocation: the

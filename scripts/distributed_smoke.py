@@ -64,10 +64,23 @@ def running_services() -> set[str]:
 
 
 def _write(path: Path, evidence: dict) -> None:
+    """Atomic evidence write, retried briefly.
+
+    The rename is atomic, but on Windows it can lose a race with a scanner or indexer still holding the previous file
+    (`PermissionError: [WinError 5]`) — observed under parallel test load, seconds after the same file was written.
+    This runs repeatedly during a live (paid) smoke, and dropping a run's evidence because an antivirus was mid-scan
+    would be an absurd way to lose it, so a few short retries stand between the two."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    for attempt in range(6):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(0.1 * (attempt + 1))
 
 
 def _stop_up(proc: subprocess.Popen) -> None:

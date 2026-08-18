@@ -95,6 +95,7 @@ Local (in-process orchestrator + N stub worker threads — dev/demo):
                                                                  #   unchanged, signed thinking blocks included). <=2 small calls, one echo tool, no
                                                                  #   repo/DB. Run it against the gateway spec too before trusting distributed mode.
 .venv/Scripts/python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m>   # M2 live gate (key in THIS process): ping -> LLM workers on the benchmark -> LLM planner goal->contract->approve->DAG->PASS
+                                                                 #   run it one --step at a time with --resume; its ping is the recorded one
 git -C .mas/repos/<run_id>.git log --oneline --graph --all       # the run's whole history (one branch per attempt)
 .venv/Scripts/mas run --dag ... --workspace none                 # no filesystem (fastest; opaque stub refs)
 .venv/Scripts/mas run --dag ... --verifier-fail-times 1 --planner fake --max-replans 1   # 13-lite demo: FAIL -> amendment -> PASS (replans=1); --verifier-fail -> NO_PROGRESS
@@ -114,6 +115,22 @@ docker kill multi-agent-system-worker-2                          # A5 demo: reap
 .venv/Scripts/mas down                                           # stop the Compose services started by `mas up`
 python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-smoke.json
 ```
+
+First live calls, in this order — each gate authorizes only the next one:
+
+```
+.venv/Scripts/mas doctor --require-live                          # every required row green IN THE SHELL that will run it
+python scripts/live_smoke.py --worker <p>:<m> --step ping --max-cost-usd <small> --max-total-cost-usd <small> \
+    --output mvp-evidence/live-smoke.json                        # THE canonical first paid call: one call, recorded as evidence
+.venv/Scripts/mas models --probe-tools --spec <p>:<m>            # then the two-turn continuation (<=2 calls)
+.venv/Scripts/mas models --probe-tools --spec openai:<m>         # ...and the same exchange across the gateway
+python scripts/live_smoke.py --worker ... --planner ... --step worker --resume --output mvp-evidence/live-smoke.json
+```
+
+`mas models --ping` is a **diagnostic**, not the gate: it makes its own billable call and is recorded nowhere. The
+ping that counts is `live_smoke.py --step ping`, whose telemetry (reported model id, tokens, latency, cost, priced)
+goes into the evidence and the ledger — and `mvp_gate.py` requires it to be present and priced. Use the standalone
+ping only when you deliberately want a throwaway probe of a spec the smoke will not run.
 
 Frozen MVP evidence (run on one clean commit with a real provider and exact `MAS_MODEL_PRICES`):
 
@@ -173,7 +190,10 @@ Which tier when: `unit` while iterating on pure logic · `core` before committin
 workers or CLI · `full` before committing changes to sandboxes, the verifier, the runner, the gateway or service mode
 · `gate` after touching leases, the state machine, the worker loop or workspaces. `-m docker` is auto-applied to tests
 that use the `verifier_image` fixture. Don't use `-n auto` here (12 workers): a few tests measure real concurrency
-and sockets and flake under that load; `MAS_TEST_WORKERS` overrides the default 4. Known parallel-load flake: `test_acceptance.py::test_output_flood_is_capped_killed_and_never_reaches_host_disk` (Docker output flood; passes alone) — rerun it serially before blaming a change.
+and sockets and flake under that load; `MAS_TEST_WORKERS` overrides the default 4. Known parallel-load flakes, both Windows-under-`-n 4` and both passing serially — rerun them alone before blaming a
+change: `test_acceptance.py::test_output_flood_is_capped_killed_and_never_reaches_host_disk` (Docker output flood) and
+`test_gateway.py::test_gateway_maps_upstream_errors_and_bounds_requests` (`ConnectionAbortedError [WinError 10053]` on
+a real local socket).
 
 Verifier/sandbox changes additionally require Docker and the five-fixture gate:
 
