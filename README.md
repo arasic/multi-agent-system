@@ -174,14 +174,25 @@ docker kill multi-agent-system-worker-2      # the reaper reassigns its task; th
 .venv/Scripts/mas down
 ```
 
-For a real provider, copy `.env.example` to `.env`, select a real `MAS_GATEWAY_UPSTREAM`, configure current prices,
-inject its vendor key into the launching shell, run `mas doctor --require-live`, then `mas up --build`. The one-command
-live gate is:
+For a real provider, copy `.env.example` to `.env`, select a real `MAS_GATEWAY_UPSTREAM`, configure current prices and
+an explicit `MAS_ANTHROPIC_EFFORT`, inject the vendor key into the launching shell, and run `mas doctor --require-live`
+until every row is green **in that shell**. Then spend, one stage at a time, inspecting between stages — the four
+stages accumulate into one evidence file, and each repeats the same identity arguments (both models, approval mode,
+prices, budgets):
 
 ```
-python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m> --step all --no-auto-approve --output mvp-evidence/live-smoke.json
-python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-smoke.json
+python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m> --no-auto-approve \
+    --max-cost-usd <frozen> --max-total-cost-usd <frozen> --output mvp-evidence/live-smoke.json --step ping
+mas models --probe-tools --spec <p>:<m> --json          # two-turn tool continuation, billed separately
+python scripts/live_smoke.py ...same arguments... --step worker  --resume
+python scripts/live_smoke.py ...same arguments... --step planner --resume
+python scripts/live_smoke.py ...same arguments... --step repair  --resume
+python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-smoke.json \
+    --result mvp-evidence/distributed-live-result
 ```
+
+`--step all` runs the same four stages in one command; prefer the staged form for the *first* live evidence, so a
+failure costs one stage instead of the set.
 
 The second command proves the configured provider through the actual gateway, Compose workers, trusted host executor,
 external verifier, and verified-result export. The smoke is bounded as a whole by `--max-total-cost-usd` (default 30)
@@ -219,7 +230,7 @@ system-level (planning added back) cost and latency.
 
 **M1 and the M2 implementation are complete.** Provider-neutral models, per-call telemetry, hard token reservations, the path-jailed tool layer, hardened per-attempt command sandboxes, the bounded LLM worker, execution-runner service, isolated model gateway, typed LLM planner, frozen human-approved acceptance contracts, deterministic validator rules 1–10, and all three bounded-repair triggers are implemented. Only a verifier `FAIL` is repairable; infrastructure outcomes receive bounded verifier handling and coded terminal verdicts. Offline Compose, death recovery, disagreement/decision/supersession, and verifier-driven repair are repeatably tested without a key.
 
-The remaining M2 item is **live evidence**, not missing runtime code: configure a provider and exact prices, then run `python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m> --step all --no-auto-approve --output mvp-evidence/live-smoke.json`. The M3 runner records an immutable, resumable experiment manifest and refuses mixed, duplicate, missing or unpriced evidence. `python scripts/mvp_gate.py` is the final machine-readable completion check. See [docs/roadmap.md](docs/roadmap.md).
+The remaining M2 item is **live evidence**, not missing runtime code: configure a provider, exact prices and an explicit reasoning effort, then run `scripts/live_smoke.py` one `--step` at a time as above (`--resume` accumulates the stages into one evidence file). The M3 runner records an immutable, resumable experiment manifest and refuses mixed, duplicate, missing or unpriced evidence. `python scripts/mvp_gate.py` is the final machine-readable completion check. See [docs/roadmap.md](docs/roadmap.md).
 
 **MVP productization pass (2026-08-17):** `mas doctor`, supervised `mas up`/`mas down`, and `mas result --output`
 provide preflight, one-command local operation, and a normal checkout of the exact verified commit plus a sidecar evidence
