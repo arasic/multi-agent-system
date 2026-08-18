@@ -154,6 +154,16 @@ def _doctor_checks(*, require_live: bool = False) -> list[dict[str, Any]]:
     add("planner_model", bool(planner_model), planner_model or "not configured", required=require_live)
     prices = value("MAS_MODEL_PRICES", cfg.model_prices).strip()
     add("model_prices", bool(prices), "configured" if prices else "not configured (cost will be unknown)", required=require_live)
+    # ADR-010: reasoning effort drives cost and behavior and is frozen into an experiment's fingerprint, so it must be
+    # a deliberate choice before anything is measured — not the provider's default arrived at by omission.
+    anthropic = [m for m in (upstream, worker_model, planner_model) if str(m).startswith("anthropic")]
+    effort = value("MAS_ANTHROPIC_EFFORT", cfg.anthropic_effort).strip()
+    add(
+        "anthropic_effort",
+        bool(effort) or not anthropic,
+        effort or ("not set: the provider default decides cost and behavior" if anthropic else "no Anthropic model configured"),
+        required=require_live and bool(anthropic),
+    )
     if require_live:
         provider = upstream.split(":", 1)[0] if upstream else ""
         key_names = VENDOR_KEY_NAMES.get(provider, ())

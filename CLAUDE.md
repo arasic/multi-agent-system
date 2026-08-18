@@ -130,8 +130,13 @@ incident. Every stop is resumable — rerun the same command. C/D execute under 
 the equal total budget, and every row carries both the execution-only and the `system_*` (planning added back) cost and
 latency.
 
+`live_smoke.py` is bounded as a whole by `--max-total-cost-usd` (default 30 = three runs at the default per-run
+ceiling): a stage starts only if the ceiling still covers its per-run maximum, each stage prints what it cost, and the
+summary states the total — that measurement is what the matrix's two ceilings should be chosen from. It refuses to
+start with an Anthropic model and `MAS_ANTHROPIC_EFFORT` unset (`mas doctor --require-live` says so earlier).
 `live_smoke.py --resume` (with `--output`) skips stages already PASSED in that file when it came from the same commit,
-models, approval mode, pricing rule and price table, budgets, worker count, concurrency and replan limit. `benchmark.py`
+models, approval mode, pricing rule and price table, budgets, worker count, concurrency, replan limit **and request
+shape** (thinking, effort, timeout, retries, attempt call budget). `benchmark.py`
 re-invoked with the same arguments resumes: recorded cells are skipped, cells whose last row is `infrastructure`-invalid
 (verifier crash/timeout, unusable suite, provider outage, sandbox/workspace failure, worker death, lost client) are
 rerun; `experimental` failures (the model, the plan — an unmappable contract included — or the budgets) are kept as

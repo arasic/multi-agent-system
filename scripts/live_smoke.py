@@ -23,7 +23,10 @@ The key stays in this host process's environment (ANTHROPIC_API_KEY / MAS_OPENAI
 never in compose YAML; workers here are in-process threads, so no other process ever sees it.
 
 Budgets are hard: --max-tokens / --max-cost-usd / --max-wallclock-s end a run with a verdict (I-4). Defaults are meant
-for a smoke, not a benchmark. Exit code 0 only when every requested step passed. Everything the run did is on record:
+for a smoke, not a benchmark. `--max-total-cost-usd` bounds the WHOLE smoke on top of that (ADR-010): spend is summed
+from the metered telemetry of the stages already run, a stage may only start if the ceiling still covers its own
+per-run maximum, and every stage prints what it cost — this is the run that tells you what a real run costs, so it
+says so out loud. Exit code 0 only when every requested step passed. Everything the run did is on record:
 `mas status <run>`, `mas replay <run>`, `mas artifacts <run>`.
 """
 
@@ -81,7 +84,7 @@ def _write_evidence(args: argparse.Namespace) -> None:
 # commit and tree state, the models, the approval mode, the pricing rule AND the price table, and the whole
 # experimental setup (every budget, worker count, concurrency, repair limit) — a stage passed under other conditions
 # is different evidence
-_RESUME_IDENTITY = ("git", "models", "manual_contract_approval", "allow_unpriced", "model_prices", "setup")
+_RESUME_IDENTITY = ("git", "models", "manual_contract_approval", "allow_unpriced", "model_prices", "setup", "request_shape")
 
 
 def _price_snapshot() -> object:
@@ -93,9 +96,66 @@ def _price_snapshot() -> object:
         return prices
 
 
+def _request_shape() -> dict:
+    """How calls are made — thinking, reasoning effort, timeout and retries (ADR-010).
+
+    Part of the resume identity because it changes what a stage costs and how it behaves: a stage that passed at one
+    effort is not evidence for another, and this smoke's whole purpose is to measure the cost of the shape the matrix
+    will then freeze."""
+    s = settings()
+    return {
+        "anthropic_thinking": s.anthropic_thinking,
+        "anthropic_effort": s.anthropic_effort,
+        "anthropic_fallbacks": s.anthropic_fallbacks,
+        "provider_timeout_s": s.provider_timeout_s,
+        "provider_max_retries": s.provider_max_retries,
+        "attempt_max_calls": s.attempt_max_calls,
+    }
+
+
 def _setup(args: argparse.Namespace) -> dict:
     """Everything about the experimental setup that decides how a stage runs (identical for a resume to count)."""
     return {"workers": args.workers, **asdict(_budgets(args))}
+
+
+def _spend(args: argparse.Namespace) -> dict:
+    """What this smoke has been billed so far, from the metered telemetry of the stages on record (ADR-010).
+
+    Carried-forward stages count: their calls were paid for, even if in an earlier invocation. A stage with unpriced
+    calls makes the total a floor, so it is reported separately rather than folded in as zero. The ping's single call
+    has no run and is not in the ledger — `mas models --ping` prints its own cost."""
+    billed, unpriced, by_step = 0.0, 0, {}
+    for record in args.evidence.get("runs", []):
+        m = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        cost, unknown = m.get("call_cost_usd"), int(m.get("unpriced_calls") or 0)
+        if cost is not None and not unknown:
+            billed += float(cost)
+        unpriced += unknown
+        by_step[record.get("step")] = None if unknown else round(float(cost or 0.0), 6)
+    return {
+        "billed_usd": round(billed, 6),
+        "unpriced_calls": unpriced,
+        "ceiling_usd": args.max_total_cost_usd,
+        "by_step": by_step,
+    }
+
+
+def _admit(args: argparse.Namespace, step: str) -> str | None:
+    """Print what this stage may cost against the ceiling; return the reason it must not start (ADR-010)."""
+    spend = _spend(args)
+    cap, billed = args.max_total_cost_usd, spend["billed_usd"]
+    print(
+        f"[spend] billed ${billed:.4f} of ${cap:.4f} ceiling; {step} <= ${args.max_cost_usd:.4f} per run"
+        + (f"; {spend['unpriced_calls']} unpriced call(s) so far" if spend["unpriced_calls"] else "")
+    )
+    if step == "ping":  # one metered call, bounded by nothing else; never worth refusing
+        return None
+    if billed + args.max_cost_usd > cap:
+        return (
+            f"the ${cap:.4f} smoke ceiling does not cover another ${args.max_cost_usd:.4f} run (billed ${billed:.4f}); "
+            "raise --max-total-cost-usd deliberately to continue"
+        )
+    return None
 
 
 def merge_resume(previous: dict, current: dict) -> tuple[dict, list[str], str | None]:
@@ -140,6 +200,16 @@ def _preflight(args: argparse.Namespace) -> list[str]:
             print(f"WARNING: {message}")
         else:
             problems.append(message + " (or explicitly use --allow-unpriced for a non-completion rehearsal)")
+    shape = _request_shape()
+    print("request shape: " + json.dumps(shape, sort_keys=True))
+    if any(str(m or "").startswith("anthropic:") for m in (args.worker, args.planner)) and not shape["anthropic_effort"]:
+        # this smoke measures the cost of the shape the M3 manifest then freezes (ADR-010)
+        problems.append("MAS_ANTHROPIC_EFFORT is not set: the provider default would decide cost and behavior")
+    if args.max_total_cost_usd < args.max_cost_usd:
+        problems.append(
+            f"--max-total-cost-usd {args.max_total_cost_usd} is below the per-run --max-cost-usd {args.max_cost_usd}: "
+            "no stage could start"
+        )
     d = subprocess.run(["docker", "info"], capture_output=True, timeout=30, check=False)
     if d.returncode != 0:
         problems.append("Docker daemon unreachable (sandboxed command tools and the real verifier need it)")
@@ -345,7 +415,13 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--max-concurrency", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=1_500_000)
     ap.add_argument("--max-attempt-tokens", type=int, default=250_000)
-    ap.add_argument("--max-cost-usd", type=float, default=10.0)
+    ap.add_argument("--max-cost-usd", type=float, default=10.0, help="per-run ceiling (three runs in a full smoke)")
+    ap.add_argument(
+        "--max-total-cost-usd",
+        type=float,
+        default=30.0,
+        help="ceiling for the WHOLE smoke (ADR-010): a stage may only start if this still covers its per-run maximum",
+    )
     ap.add_argument("--max-wallclock-s", type=int, default=1800)
     ap.add_argument("--max-attempt-runtime-s", type=int, default=600)
     ap.add_argument("--max-replans", type=int, default=1)
@@ -382,6 +458,7 @@ def main(argv: list[str]) -> int:
         "allow_unpriced": bool(args.allow_unpriced),
         "model_prices": _price_snapshot(),
         "setup": _setup(args),
+        "request_shape": _request_shape(),
         "steps": {},
         "runs": [],
         "complete": False,
@@ -412,8 +489,8 @@ def main(argv: list[str]) -> int:
         return 2
     print(f"worker={args.worker} planner={args.planner or '(not needed)'} step={args.step}")
     print(
-        f"budgets: tokens={args.max_tokens} attempt_tokens={args.max_attempt_tokens} cost=${args.max_cost_usd} "
-        f"wallclock={args.max_wallclock_s}s"
+        f"budgets: tokens={args.max_tokens} attempt_tokens={args.max_attempt_tokens} cost=${args.max_cost_usd}/run "
+        f"(smoke ceiling ${args.max_total_cost_usd}) wallclock={args.max_wallclock_s}s"
     )
     if args.dry_run:
         args.evidence["preflight_only"] = True
@@ -421,21 +498,37 @@ def main(argv: list[str]) -> int:
         _write_evidence(args)
         return 0
     results: dict[str, bool] = {}
+    stopped: str | None = None
     for step in order:
         if step in skip:
             results[step] = True
             print(f"\n--> {step}: PASS (carried forward from earlier evidence)")
             continue
+        stopped = _admit(args, step)
+        if stopped:
+            print(f"\n[stop] {stopped}")
+            break
         ok = {"ping": step_ping, "worker": step_worker, "planner": step_planner, "repair": step_repair}[step](args)
         results[step] = ok
         args.evidence["steps"][step] = ok
+        args.evidence["spend"] = _spend(args)
         _write_evidence(args)
-        print(f"\n--> {step}: {'PASS' if ok else 'FAIL'}")
+        print(f"\n--> {step}: {'PASS' if ok else 'FAIL'}  (billed so far ${args.evidence['spend']['billed_usd']:.4f})")
         if not ok:
             break
     _hr("live smoke summary")
     for k, v in results.items():
         print(f"  {k:8s} {'PASS' if v else 'FAIL'}" + ("  (resumed)" if k in skip else ""))
+    spend = _spend(args)
+    args.evidence["spend"] = spend
+    print(
+        f"\nspend: ${spend['billed_usd']:.4f} of the ${spend['ceiling_usd']:.4f} smoke ceiling; per stage "
+        + json.dumps(spend["by_step"], sort_keys=True)
+        + (f"; {spend['unpriced_calls']} unpriced call(s) (the total is a floor)" if spend["unpriced_calls"] else "")
+    )
+    print("use this to choose the matrix ceilings (--max-cost-usd per run, --max-total-cost-usd for 125 operations)")
+    if stopped:
+        args.evidence["stopped"] = stopped
     complete = bool(results) and all(results.values()) and len(results) == len(order)
     args.evidence["complete"] = complete
     args.evidence["finished_at"] = datetime.now(UTC).isoformat()

@@ -853,6 +853,16 @@ _LIVE_SETUP = {
 }
 
 
+_LIVE_SHAPE = {
+    "anthropic_thinking": True,
+    "anthropic_effort": "medium",
+    "anthropic_fallbacks": "",
+    "provider_timeout_s": 600.0,
+    "provider_max_retries": 2,
+    "attempt_max_calls": 40,
+}
+
+
 def _live_evidence(**overrides) -> dict:
     base = {
         "schema": 1,
@@ -864,6 +874,7 @@ def _live_evidence(**overrides) -> dict:
         "allow_unpriced": False,
         "model_prices": {"m": [1.0, 2.0]},
         "setup": dict(_LIVE_SETUP),
+        "request_shape": dict(_LIVE_SHAPE),
         "steps": {},
         "runs": [],
         "complete": False,
@@ -899,6 +910,11 @@ def test_live_smoke_resume_carries_passed_stages_only_from_identical_setup():
         {"setup": {**_LIVE_SETUP, "max_concurrency": 1}},
         {"setup": {**_LIVE_SETUP, "max_replans": 2}},
         {"setup": None},
+        # a stage that passed at another reasoning effort (or timeout/retry shape) cost something else and may well
+        # have behaved differently — it is not evidence for this one (ADR-010)
+        {"request_shape": {**_LIVE_SHAPE, "anthropic_effort": "high"}},
+        {"request_shape": {**_LIVE_SHAPE, "anthropic_thinking": False}},
+        {"request_shape": None},
     ):
         current = _live_evidence(started_at="t1")
         _, skip, refusal = live_smoke.merge_resume(_live_evidence(steps={"ping": True}, **change), current)
@@ -925,8 +941,44 @@ def test_live_smoke_evidence_records_the_full_experimental_setup(monkeypatch):
     assert {"workers", "max_concurrency", "max_tokens", "max_attempt_tokens", "max_cost_usd", "max_wallclock_s"} <= set(setup)
     assert {"max_attempt_runtime_s", "max_replans", "max_attempts_per_task", "lease_s"} <= set(setup)
     assert live_smoke._price_snapshot() == {"m": [1.0, 2.0]}
-    identity = {"git", "models", "manual_contract_approval", "allow_unpriced", "model_prices", "setup"}
+    identity = {"git", "models", "manual_contract_approval", "allow_unpriced", "model_prices", "setup", "request_shape"}
     assert set(live_smoke._RESUME_IDENTITY) >= identity
+
+
+def test_live_smoke_request_shape_records_what_the_matrix_will_freeze(monkeypatch):
+    monkeypatch.setenv("MAS_ANTHROPIC_EFFORT", "medium")
+    monkeypatch.setenv("MAS_ANTHROPIC_THINKING", "1")
+    shape = live_smoke._request_shape()
+    assert shape["anthropic_effort"] == "medium" and shape["anthropic_thinking"] is True
+    assert {"provider_timeout_s", "provider_max_retries", "attempt_max_calls"} <= set(shape)
+
+
+def test_live_smoke_is_bounded_as_a_whole_and_reports_what_each_stage_cost(capsys):
+    """The smoke is the first thing that spends money and the run that tells you what a run costs (ADR-010)."""
+    args = argparse.Namespace(max_cost_usd=10.0, max_total_cost_usd=30.0, evidence={"runs": []})
+    assert live_smoke._spend(args) == {"billed_usd": 0.0, "unpriced_calls": 0, "ceiling_usd": 30.0, "by_step": {}}
+    assert live_smoke._admit(args, "worker") is None
+
+    args.evidence["runs"] = [
+        {"step": "worker", "metrics": {"call_cost_usd": 4.25, "unpriced_calls": 0}},
+        {"step": "planner", "metrics": {"call_cost_usd": 6.5, "unpriced_calls": 0}},
+    ]
+    spend = live_smoke._spend(args)
+    assert spend["billed_usd"] == 10.75 and spend["by_step"] == {"worker": 4.25, "planner": 6.5}
+    assert live_smoke._admit(args, "repair") is None
+
+    args.max_total_cost_usd = 15.0  # 10.75 billed + another 10.00 run would cross it
+    stop = live_smoke._admit(args, "repair")
+    assert stop and "does not cover another $10.0000" in stop
+    assert live_smoke._admit(args, "ping") is None  # one metered call is never worth refusing
+
+    # an unpriced stage makes the total a floor: reported, never folded in as zero
+    args.evidence["runs"].append({"step": "repair", "metrics": {"call_cost_usd": None, "unpriced_calls": 3}})
+    spend = live_smoke._spend(args)
+    assert spend["billed_usd"] == 10.75 and spend["unpriced_calls"] == 3 and spend["by_step"]["repair"] is None
+    capsys.readouterr()
+    live_smoke._admit(args, "ping")
+    assert "unpriced call(s) so far" in capsys.readouterr().out  # unknown spend is stated, not hidden
 
 
 def test_distributed_smoke_refuses_running_actors_but_reuses_the_shared_postgres():

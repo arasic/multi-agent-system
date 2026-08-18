@@ -49,12 +49,17 @@ that change, plus two protocol gaps, that would each have corrupted the evidence
    `spent + this operation's ceiling <= cap`, prints billed / remaining / worst-case, and stops when an operation
    reported unknown cost (unless `--allow-unpriced` was given). The ceiling is recorded in `experiment.json` with an
    append-only `spend_cap_history`, and `scripts/mvp_gate.py` fails without it or if the recomputed spend exceeds it.
+   The same rule bounds `scripts/live_smoke.py` — the *first* thing that spends money — with a default ceiling of
+   three runs; it prints each stage's measured cost and the total, which is what the matrix's ceilings should be
+   chosen from, and its resume identity includes the request shape (thinking, effort, timeout, retries), because a
+   stage that passed at another effort cost something else.
 5. **Pacing and a circuit breaker.** `--pace-s` between operations, `--cooldown-s` after a machinery failure, and a
    stop after `--max-consecutive-infrastructure` (default 3) in a row, with the reason printed. Stopping never
    discards anything: rerunning the same command resumes.
 6. **Reasoning effort is an explicit experimental parameter.** A live matrix with any `anthropic:` model refuses to
-   start unless `MAS_ANTHROPIC_EFFORT` is set; the value is frozen in the environment fingerprint and audited by the
-   gate. Choosing it is a protocol decision made before the manifest exists, not an environment tweak.
+   start unless `MAS_ANTHROPIC_EFFORT` is set; so does the live smoke, and `mas doctor --require-live` reports it as a
+   required check so the omission surfaces before anything is spent. The value is frozen in the environment
+   fingerprint and audited by the gate. Choosing it is a protocol decision made before the manifest exists, not an environment tweak.
 7. **The schedule is audited against the evidence.** The gate regenerates the schedule from the frozen seed and
    requires the recorded one to match exactly, and requires the rows to show it was followed: every row carries its
    block's `schedule_index`, and first-pass rows (not reruns) appear in schedule order.
