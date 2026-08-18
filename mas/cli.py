@@ -987,8 +987,10 @@ def cmd_models(args: argparse.Namespace) -> int:
 
     cfg = settings()
     pricing = providers.pricing_from_settings(cfg)
+    # --json makes stdout ONE parseable document: anything human goes to stderr, so a caller can pipe it
+    out = sys.stderr if args.json else sys.stdout
     known = f": {pricing.known_models()}" if len(pricing) else ""
-    print(f"pricing: {len(pricing)} model(s) configured via MAS_MODEL_PRICES{known}")
+    print(f"pricing: {len(pricing)} model(s) configured via MAS_MODEL_PRICES{known}", file=out)
     specs: list[tuple[str, str]] = []
     if args.spec:
         specs.append(("adhoc", args.spec))
@@ -996,29 +998,28 @@ def cmd_models(args: argparse.Namespace) -> int:
         for role in providers.ROLES:
             spec = providers.role_spec(role, cfg)
             flag = "" if not spec or pricing.price(providers.parse_spec(spec)[1]) else "  [unpriced]"
-            print(f"  {role:9s} {spec or '(none)'}{flag}")
+            print(f"  {role:9s} {spec or '(none)'}{flag}", file=out)
             if spec:
                 specs.append((role, spec))
     ceiling = cfg.attempt_max_tokens if cfg.attempt_max_tokens is not None else "(run's max_attempt_tokens)"
-    print(f"  attempt budget: max_calls={cfg.attempt_max_calls} max_tokens={ceiling}")
+    print(f"  attempt budget: max_calls={cfg.attempt_max_calls} max_tokens={ceiling}", file=out)
     if not args.ping and not args.probe_tools:
         return 0
     if not specs:
         print("nothing to call: set MAS_MODEL_WORKER / MAS_MODEL_PLANNER or pass --spec <provider>:<model>", file=sys.stderr)
         return 2
-    rc, out = 0, []
+    rc, records = 0, []
     for role, spec in specs:
         if args.ping:
             record = ping_spec(spec, role=role, prompt=args.prompt, max_tokens=args.max_tokens, cfg=cfg)
-            out.append(record)
+            records.append(record)
             if record["ok"]:
-                print(f"[{role}] {spec}: {record['stop_reason']} {record.get('text', '')!r}")
+                print(f"[{role}] {spec}: {record['stop_reason']} {record.get('text', '')!r}", file=out)
             else:
                 print(f"[{role}] {spec}: FAILED {record['error']}", file=sys.stderr)
                 rc = 1
-            if not args.json:
-                for call in record["calls"]:
-                    print("   ", json.dumps(call, default=str))
+            for call in record["calls"]:
+                print("   ", json.dumps(call, default=str), file=out)
         if args.probe_tools:
             from mas.providers.probe import probe_tools
 
@@ -1028,20 +1029,21 @@ def cmd_models(args: argparse.Namespace) -> int:
             except Exception as e:  # noqa: BLE001 - diagnostic command: surface anything
                 report = {"probe": "tool_continuation", "ok": False, "error": f"{type(e).__name__}: {e}", "checks": {}}
             report["role"], report["spec"] = role, spec
-            out.append(report)
+            records.append(report)
             rc = rc or (0 if report.get("ok") else 1)
-            if not args.json:
-                print(f"[{role}] {spec} tool continuation: {'OK' if report.get('ok') else 'FAILED'}")
-                for name, passed in (report.get("checks") or {}).items():
-                    print(f"    {'PASS' if passed else 'FAIL'} {name}")
-                if report.get("native"):
-                    print(f"    native turn replayed: {json.dumps(report['native'], sort_keys=True)}")
-                if report.get("error"):
-                    print(f"    error: {report['error']}", file=sys.stderr)
-                for call in report.get("calls") or []:
-                    print("   ", json.dumps(call, default=str))
+            print(f"[{role}] {spec} tool continuation: {'OK' if report.get('ok') else 'FAILED'}", file=out)
+            for name, passed in (report.get("checks") or {}).items():
+                print(f"    {'PASS' if passed else 'FAIL'} {name}", file=out)
+            for name, seen in (report.get("observations") or {}).items():
+                print(f"    {'yes ' if seen else 'no  '} {name} (observation, not a gate)", file=out)
+            if report.get("native"):
+                print(f"    native turn replayed: {json.dumps(report['native'], sort_keys=True)}", file=out)
+            if report.get("error"):
+                print(f"    error: {report['error']}", file=sys.stderr)
+            for call in report.get("calls") or []:
+                print("   ", json.dumps(call, default=str), file=out)
     if args.json:
-        print(json.dumps(out, indent=2, default=str))
+        print(json.dumps(records, indent=2, default=str))
     return rc
 
 

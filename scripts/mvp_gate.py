@@ -338,6 +338,7 @@ def evaluate(
     distributed_run = distributed.get("run") if isinstance(distributed.get("run"), dict) else {}
     runs = live.get("runs") if isinstance(live.get("runs"), list) else []
     steps = live.get("steps") if isinstance(live.get("steps"), dict) else {}
+    ping = live.get("ping") if isinstance(live.get("ping"), dict) else None
     checks = [
         Check("live.complete", live.get("complete") is True, f"steps={steps}"),
         Check(
@@ -354,10 +355,15 @@ def evaluate(
             "live.priced",
             bool(runs)
             and all(isinstance(r, dict) and r.get("priced") is True for r in runs)
-            # the ping is one call, but an unpriced one means the price table does not cover the model the provider
-            # reported — which makes every cost figure that follows a floor rather than a number (ADR-010)
-            and (not isinstance(live.get("ping"), dict) or live["ping"].get("priced") is True),
-            "every live run and the ping must have known model prices",
+            # The ping is one call, but an unpriced one means the price table does not cover the model the provider
+            # reported — every cost figure after it is then a floor (ADR-010). Its telemetry must be *present*: a
+            # `steps.ping = true` with no record is a claim with no evidence behind it, which is what this gate exists
+            # to refuse.
+            and isinstance(ping, dict)
+            and bool(ping.get("calls"))
+            and ping.get("priced") is True,
+            "every live run must have known model prices, and the ping must be on record and priced"
+            + ("" if isinstance(ping, dict) else " (no ping telemetry in the evidence)"),
         ),
         Check(
             "live.manual_contract_approval",

@@ -461,6 +461,19 @@ def test_cli_models_and_ping(monkeypatch, capsys):
     assert main(["models", "--ping"]) == 2  # nothing configured to ping
 
 
+def test_models_json_output_is_one_parseable_document(monkeypatch, capsys):
+    """`--json` is for a caller, not a reader: the roles table, the ping line and the telemetry all go to stderr."""
+    from mas.cli import main
+
+    monkeypatch.setenv("MAS_MODEL_PRICES", json.dumps({"probe": [1, 5]}))
+    assert main(["models", "--ping", "--probe-tools", "--spec", "fake:probe", "--json"]) == 0
+    captured = capsys.readouterr()
+    records = json.loads(captured.out)  # would raise if anything human were printed to stdout
+    assert [r.get("probe") or "ping" for r in records] == ["ping", "tool_continuation"]
+    assert records[0]["priced"] and records[1]["ok"] and records[1]["models"] == ["probe"]
+    assert "pricing:" in captured.err and "tool continuation: OK" in captured.err
+
+
 # ----------------------------------------------------------------------------- tool-continuation probe
 
 
@@ -470,17 +483,37 @@ def test_tool_continuation_probe_runs_the_two_turn_round_trip_and_reports_it_as_
 
     report = probe_tools(providers.from_spec("fake:probe"), pricing=Pricing.from_json(json.dumps({"probe": [1, 5]})))
     assert report["ok"] and all(report["checks"].values())
+    # protocol facts decide `ok`; what the model did with the result is observed, not gated
     assert set(report["checks"]) == {
         "asked_for_the_tool",
         "called_the_offered_tool",
         "continuation_accepted",
         "answered_after_the_tool_result",
-        "tool_result_reached_the_model",
     }
+    assert report["observations"] == {"echoed_nonce_in_the_answer": True, "nonce_sent_to_the_tool": True}
     assert len(report["calls"]) == 2 and report["calls"][0]["meta"]["tools"] == 1
     assert report["models"] == ["probe"] and report["priced"] and report["cost_usd"] > 0
     assert report["nonce"] in report["text"]
     assert PROBE_TOOL["name"] == "mas_probe_echo"  # one harmless tool: reads nothing, writes nothing
+
+
+def test_the_answer_check_reads_only_the_second_turn_not_the_models_own_tool_call():
+    """A provider that dropped the tool result entirely would still have the nonce in the *first* turn's tool call.
+    Reading it there would pass a check about the continuation on evidence from before the continuation."""
+    from mas.providers.probe import NONCE, probe_tools
+
+    def drops_the_result(messages, tools):
+        if messages[-1].get("role") == "tool":
+            return "I have nothing to report."  # answered, but never used what came back
+        return {
+            "text": "",
+            "tool_calls": [{"id": "c1", "name": "mas_probe_echo", "input": {"text": NONCE}}],
+            "stop_reason": "tool_use",
+        }
+
+    report = probe_tools(FakeProvider(drops_the_result))
+    assert report["ok"]  # the protocol worked: the continuation was accepted and answered
+    assert report["observations"] == {"echoed_nonce_in_the_answer": False, "nonce_sent_to_the_tool": True}
 
 
 def test_the_probe_reports_a_rejected_continuation_instead_of_raising():
@@ -504,8 +537,10 @@ def test_the_probe_reports_a_rejected_continuation_instead_of_raising():
     assert not silent["ok"] and "did not call the tool" in silent["error"]
     assert silent["checks"] == {"asked_for_the_tool": False, "called_the_offered_tool": False}
 
-    broken = probe_tools(FakeProvider([ProviderUnavailable("upstream down")]))
+    broken = probe_tools(FakeProvider([ProviderUnavailable("upstream down")]), pricing=Pricing({"fake-1": Price(1, 5)}))
     assert not broken["ok"] and "first call failed" in broken["error"]
+    # a probe where nothing was billed must not announce "$0.00, priced": an empty meter is priced by construction
+    assert broken["priced"] is False and broken["cost_usd"] is None
 
 
 def test_native_summary_describes_a_signed_turn_without_leaking_it():

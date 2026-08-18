@@ -106,6 +106,18 @@ def main(argv: list[str] | None = None) -> int:
         "complete": False,
     }
     _write(args.output, evidence)
+    # `mas result` refuses to overwrite an export — rightly, that is verified evidence. Finding out afterwards would
+    # mean a completed (and, live, paid) run whose result cannot be written, so the collision is checked here first.
+    occupied = [p for p in (args.result, Path(str(args.result) + ".mas-result.json")) if p.exists()]
+    if occupied:
+        evidence["error"] = (
+            f"result path already in use: {[str(p) for p in occupied]} — pass --result <new path> "
+            "(exports are never overwritten, so an earlier verified result is never lost)"
+        )
+        evidence["finished_at"] = datetime.now(UTC).isoformat()
+        _write(args.output, evidence)
+        print(evidence["error"], file=sys.stderr)
+        return 2
     existing = running_services()
     evidence["preexisting_services"] = sorted(existing)
     blocking = blocking_services(existing)

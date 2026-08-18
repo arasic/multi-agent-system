@@ -182,6 +182,7 @@ def _write_live_and_distributed(live: Path, distributed: Path) -> None:
                 {"step": "repair", "status": "PASSED", "priced": True},
             ],
             "manual_contract_approval": True,
+            "ping": _ping_record(),
             "git": {"commit": COMMIT, "dirty": False},
         },
     )
@@ -1030,18 +1031,25 @@ def test_an_exhausted_smoke_ceiling_stops_even_the_ping():
     assert live_smoke._admit(args, "ping") is None
 
 
-def test_mvp_gate_rejects_evidence_whose_ping_was_unpriced(tmp_path: Path):
+def test_mvp_gate_rejects_evidence_whose_ping_was_unpriced_or_simply_absent(tmp_path: Path):
     live, distributed, bench = tmp_path / "live.json", tmp_path / "distributed.json", tmp_path / "bench"
     _write_live_and_distributed(live, distributed)
     _write_matrix(bench, _rows())
+    assert not _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
     evidence = json.loads(live.read_text(encoding="utf-8"))
     evidence["ping"] = _ping_record(priced=False)
     _write(live, evidence)
     assert "live.priced" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
 
-    evidence["ping"] = _ping_record()
+    # `steps.ping = true` with no telemetry behind it is a claim, not evidence — exactly what this gate refuses
+    del evidence["ping"]
     _write(live, evidence)
-    assert not _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+    assert "live.priced" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+    evidence["ping"] = {**_ping_record(), "calls": []}  # priced, but nothing was actually called
+    _write(live, evidence)
+    assert "live.priced" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
 
 
 def test_live_smoke_is_bounded_as_a_whole_and_reports_what_each_stage_cost(capsys):
@@ -1070,6 +1078,25 @@ def test_live_smoke_is_bounded_as_a_whole_and_reports_what_each_stage_cost(capsy
     capsys.readouterr()
     live_smoke._admit(args, "ping")
     assert "unpriced call(s) so far" in capsys.readouterr().out  # unknown spend is stated, not hidden
+
+
+def test_distributed_smoke_refuses_a_colliding_result_path_before_it_runs_anything(tmp_path: Path, monkeypatch, capsys):
+    """`mas result` never overwrites an export. Discovering that *after* the run would waste it — and live, it is paid."""
+    result = tmp_path / "verified"
+    result.mkdir()
+    argv = ["--offline", "--output", str(tmp_path / "smoke.json"), "--result", str(result)]
+    called: list[str] = []
+    monkeypatch.setattr(distributed_smoke, "running_services", lambda: called.append("services") or set())
+    assert distributed_smoke.main(argv) == 2
+    assert called == []  # nothing was started, nothing was submitted
+    assert "result path already in use" in capsys.readouterr().err
+    evidence = json.loads((tmp_path / "smoke.json").read_text(encoding="utf-8"))
+    assert evidence["complete"] is False and "result path already in use" in evidence["error"]
+
+    # the sidecar alone is enough of a collision: `mas result` writes both
+    sidecar = tmp_path / "other.mas-result.json"
+    sidecar.write_text("{}", encoding="utf-8")
+    assert distributed_smoke.main([*argv[:-1], str(tmp_path / "other")]) == 2
 
 
 def test_distributed_smoke_refuses_running_actors_but_reuses_the_shared_postgres():

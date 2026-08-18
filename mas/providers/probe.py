@@ -14,6 +14,10 @@ The probe is deliberately minimal: one harmless echo tool, at most two calls, ti
 database, no filesystem. It reports structured telemetry and *what the provider called itself*, so the reported model
 id can be compared against the price table before anything expensive starts.
 
+`checks` are protocol facts and decide `ok`; `observations` are what the model chose to do with the result and are
+reported without failing the probe. Keeping them apart is the point: "the model did not quote the echoed text" is not
+the same finding as "the provider rejected the continuation", and only the second one blocks a worker run.
+
 Same-shape gateway check: point `--spec` at the gateway (`openai:<model>` with `MAS_OPENAI_BASE_URL`) and the identical
 exchange runs across the wire, which is what workers do in distributed mode.
 """
@@ -65,7 +69,8 @@ def probe_tools(
     result: dict[str, Any] = {
         "probe": "tool_continuation",
         "nonce": NONCE,
-        "checks": {},
+        "checks": {},  # protocol: these decide `ok`
+        "observations": {},  # what the model did with the result: reported, never fatal
         "calls": [],
         "models": [],
         "native": None,
@@ -73,13 +78,16 @@ def probe_tools(
     }
 
     def finish(ok: bool) -> dict[str, Any]:
-        result["calls"] = [r.as_dict() for r in sink.records]
-        result["models"] = sorted({r.model for r in sink.records if r.model})
-        usage = meter.total
-        result["usage"] = usage.as_dict()
-        result["priced"] = usage.priced
-        result["cost_usd"] = usage.cost_usd if usage.priced else None
-        result["ok"] = ok and all(result["checks"].values())
+        records = list(sink.records)
+        result["calls"] = [r.as_dict() for r in records]
+        result["models"] = sorted({r.model for r in records if r.model})
+        result["usage"] = meter.total.as_dict()
+        # priced comes from the calls that actually happened: an empty meter reports `priced` by construction, which
+        # would announce "$0.00, priced" for a probe where every call failed
+        billed = [r for r in records if r.status not in ("budget", "cancelled", "deadline")]
+        result["priced"] = bool(billed) and all(r.priced for r in billed)
+        result["cost_usd"] = round(sum(r.cost_usd for r in billed), 8) if result["priced"] else None
+        result["ok"] = ok and bool(result["checks"]) and all(result["checks"].values())
         return result
 
     messages: list[dict[str, Any]] = [{"role": "user", "content": PROMPT}]
@@ -111,6 +119,11 @@ def probe_tools(
         return finish(False)
     result["checks"]["continuation_accepted"] = True
     result["checks"]["answered_after_the_tool_result"] = second.stop_reason in ("end_turn", "max_tokens")
-    result["checks"]["tool_result_reached_the_model"] = NONCE in (second.text or "") or NONCE in echoed
+    # Only the SECOND turn's own text can show the tool result came back through the model. The nonce the model put
+    # *into* its tool call proves nothing about that — reading it there would pass this check on a provider that
+    # dropped the result entirely. Not fatal either way: a model may answer correctly without quoting it, which is
+    # instruction-following, not protocol.
+    result["observations"]["echoed_nonce_in_the_answer"] = NONCE in (second.text or "")
+    result["observations"]["nonce_sent_to_the_tool"] = NONCE in echoed
     result["text"] = (second.text or "").strip()[:400]
     return finish(True)
