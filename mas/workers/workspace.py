@@ -19,6 +19,7 @@ GitWorkspace
 
     Every *administrative* git command (branch creation, worktree add/remove/prune) runs under `repo_admin_lock`,
     an exclusive per-bare-repo lock held across processes and threads — see its docstring for the race it closes.
+    Creating a worktree fails closed if the filesystem cannot lock across processes.
 
 NullWorkspace: no filesystem; agents get workspace=None (fast unit tests, LLM-free stubs).
 
@@ -137,10 +138,14 @@ def repo_admin_lock(repo: Path, *, timeout_s: float | None = None, required: boo
     Per bare repo, so attempts of different runs never contend, and held only around the administrative commands —
     never around input assembly, a commit, or an agent's work. Cross-process via an advisory file lock the OS releases
     if the holder is killed, cross-thread via an in-process mutex (so correctness does not depend on the platform's
-    per-descriptor lock semantics). Where the filesystem cannot lock at all — some bind mounts — the in-process mutex
-    stands alone and the caller proceeds: degrading is strictly better than failing every attempt, and it is logged.
-    `required=False` callers (cleanup, GC) skip the git command instead of failing: what they would have removed is
-    registration garbage that `gc_run` prunes when the run ends.
+    per-descriptor lock semantics).
+
+    **Fail closed where the filesystem cannot lock at all** (some bind mounts): workers are separate processes and
+    containers, so the in-process mutex alone guarantees nothing — proceeding there would reintroduce exactly the race
+    this lock exists to close, silently and only under load. A `required=True` caller (creating a worktree) therefore
+    raises; move `MAS_REPO_ROOT` to a volume that supports advisory locks. `required=False` callers (cleanup, GC) do
+    proceed with in-process serialization only: they run after the risky window, what they would have removed is
+    registration garbage that `gc_run` prunes when the run ends, and refusing to clean up helps nobody.
     """
     global _unsupported_warned
     deadline = time.monotonic() + (ADMIN_LOCK_TIMEOUT_S if timeout_s is None else timeout_s)
@@ -157,7 +162,11 @@ def repo_admin_lock(repo: Path, *, timeout_s: float | None = None, required: boo
         try:
             fd = os.open(str(repo / ADMIN_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o644)
         except OSError as ex:
-            # exotic/read-only filesystem: keep the in-process guarantee rather than failing every attempt
+            if required:  # no cross-process lock is possible here, and workers are processes: fail closed
+                raise WorkspaceError(
+                    f"workspace: cannot open the git administration lock {repo / ADMIN_LOCK_FILE} ({ex}); "
+                    "worktree creation needs a filesystem that supports advisory locking (see MAS_REPO_ROOT)"
+                ) from ex
             log.warning("workspace: cannot open %s (%s); serializing in-process only", repo / ADMIN_LOCK_FILE, ex)
             yield True
             return
@@ -177,6 +186,11 @@ def repo_admin_lock(repo: Path, *, timeout_s: float | None = None, required: boo
                 break
             time.sleep(delay)
             delay = min(0.05, delay * 1.6)
+        if not supported and required:
+            raise WorkspaceError(
+                f"workspace: {repo} is on a filesystem that does not support advisory locking, so git administration "
+                "cannot be serialized across worker processes; move MAS_REPO_ROOT to a volume that supports it"
+            )
         if supported and not held:
             if required:
                 raise WorkspaceError(f"workspace: timed out waiting for the git administration lock of {repo}")

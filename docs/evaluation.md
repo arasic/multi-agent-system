@@ -67,8 +67,11 @@ their cell is rerun
 audits the *raw* rows: it recomputes completion, regenerates the report and requires the summaries on disk to match, and
 requires the evidence commit to be the clean, currently checked-out one. It also audits the experimental design
 (ADR-009): a frozen randomized block schedule covering every cell, a frozen environment fingerprint, and one recorded
-plan per block that C and D both executed. It rejects incomplete, mixed-revision, dirty, infrastructure-invalid,
-unpriced or unpaired evidence and does not require MAS to win—the measured result is the point of M3.
+plan per block that C and D both executed — plus (ADR-010) that the schedule is exactly what its seed draws and the
+rows show it was followed, that an aggregate spend ceiling was recorded and the recomputed spend stayed inside it, and
+that reasoning effort was an explicit frozen choice. It rejects incomplete, mixed-revision, dirty,
+infrastructure-invalid, unpriced or unpaired evidence and does not require MAS to win—the measured result is the point
+of M3.
 
 ---
 
@@ -111,6 +114,10 @@ are recorded in `experiment.json` and replayed verbatim on resume; `analysis.md`
 
 - A/B run **inside the same runtime**: one `solve` task + system integration task, same worktree/tool layer, same read-only acceptance, same verifier stage, failure report fed back on the next cycle.
 - Equal **total** budgets: tokens, cost, wall-clock. Equal number of verifier-driven repair cycles (single-agent "re-plan" = next attempt with the failure report).
+  A and B plan inside their run, so their planning is already charged against that budget; C and D plan once per block,
+  outside the run, and therefore execute under what the shared plan **left** of the same total (ADR-010). A block whose
+  planning consumed the whole budget records `ABORTED`/`BUDGET_EXHAUSTED` for C and D — a finding about the
+  decomposition's cost, never a reason to hand execution a fresh budget.
 - C and D are the same code path with one knob, running **one and the same validated plan** per (N, repetition)
   (ADR-009). Never two implementations, and never two plans.
 - Same acceptance suite version across all configs and all N.
@@ -118,7 +125,20 @@ are recorded in `experiment.json` and replayed verbatim on resume; `analysis.md`
   hashes, the schedule seed **and the environment** (Python/platform, provider timeout/retries and Anthropic request
   shape, per-attempt call budget, sandbox/verifier image ids and limits). A changed environment is a new experiment.
 - Each (config, N) cell run ≥ 5 times; report distributions, not single runs.
-- Clarifying questions (ADR-006): every config may ask through the same channel; a fixed, pre-written answer key per benchmark is used so answers are identical across configs. Report `questions` and `human_wait_s` separately and compare on `machine_s` — a config is not "faster" because a human answered quickly, nor "slower" because it asked a good question.
+- The reasoning effort of every model role is chosen **before** the manifest exists and frozen with it (ADR-010); a
+  live matrix using an Anthropic model refuses to start with `MAS_ANTHROPIC_EFFORT` unset, because the provider default
+  would otherwise decide cost and behaviour silently.
+- **M3 is unattended and has no clarification answer key** (ADR-010, replacing the earlier answer-key rule). The width
+  benchmarks are frozen, fully specified and machine-checkable; a planner that asks a question instead of planning is
+  recording a real property of the planner, so it is an **experimental** planning outcome and stays as evidence.
+  `questions` and `human_wait_s` are still reported, and comparisons are still made on `machine_s`. Clarification
+  behaviour itself (ADR-006) is exercised deliberately in `scripts/live_smoke.py`, not measured here — doing that
+  fairly would need a resumable plan-only run and equal clarification rights for A/B, both post-MVP.
+- **The matrix is financially bounded and stoppable** (ADR-010): `--max-total-cost-usd` is required for a live matrix
+  and is enforced *before* each operation from spend recomputed out of the raw append-only logs (superseded and retried
+  operations included); unknown cost stops it; `--pace-s`/`--cooldown-s` pace it; and
+  `--max-consecutive-infrastructure` stops it during a provider incident. Stopping never discards evidence — the same
+  command resumes.
 
 ---
 
@@ -127,7 +147,7 @@ are recorded in `experiment.json` and replayed verbatim on resume; `analysis.md`
 Outcome: verdict · acceptance pass rate · human interventions other than answering questions (must be 0).
 Time: total (creation→finish) · machine time (total − human wait) · wall-clock of the execution phase · human wait · critical-path duration · parallelism efficiency (sum of attempt durations / wall-clock).
 Questions: batches asked · assumptions recorded (planner proceeded without asking).
-Cost: input tokens · output/thinking tokens · cache-read tokens · total USD · tokens-in per attempt (context-scoping claim) · model calls and call latency per attempt. Source of truth: `model_calls` (per-call telemetry, written as each call finishes) reconciled with the settled `attempts.*` columns; a run with any **unpriced** call (`priced=false`, no price in `MAS_MODEL_PRICES`) must be reported as *cost unknown*, never as cheap.
+Cost: input tokens · output/thinking tokens · cache-read tokens · total USD · tokens-in per attempt (context-scoping claim) · model calls and call latency per attempt. Two readings for C/D (ADR-010): the run's own `call_cost_usd`/`machine_s` are **execution-only** (the right C-versus-D contrast, since both replay the same plan) and `system_call_cost_usd`/`system_machine_s` add the block's shared planning back — the figures to quote against A/B, whose planning is inside their run. Source of truth: `model_calls` (per-call telemetry, written as each call finishes) reconciled with the settled `attempts.*` columns; a run with any **unpriced** call (`priced=false`, no price in `MAS_MODEL_PRICES`) must be reported as *cost unknown*, never as cheap.
 Structure: tasks created · attempts · retries · re-plans · plan-attempts · agent calls · worker utilisation.
 Task shape: estimated independent width · dependency density · estimated critical-path ratio · overlapping-output risk · coupling/risk flags · planner-suggested mode versus configured mode. These fields are descriptive through M3 and become selector inputs only after the fixed-mode evidence exists.
 Failures: acceptance failures · integration failures · planning/validation failures · abandoned attempts.

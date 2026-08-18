@@ -191,9 +191,17 @@ changed code, suites, models, prices or budgets in one output; infrastructure-in
 failures are kept, and the gate recomputes everything from the raw rows on the clean, checked-out commit:
 
 ```
-python scripts/benchmark.py --cheap-model <p:m> --strong-model <p:m> --planner-model <p:m> --worker-model <p:m> --repeats 5 --output benchmark-results
+export MAS_ANTHROPIC_EFFORT=medium   # an explicit, frozen experimental parameter (ADR-010)
+python scripts/benchmark.py --cheap-model <p:m> --strong-model <p:m> --planner-model <p:m> --worker-model <p:m> \
+    --repeats 5 --max-total-cost-usd <ceiling> --output benchmark-results
 python scripts/mvp_gate.py
 ```
+
+The matrix is 125 billable operations, so it is bounded and stoppable (ADR-010): `--max-total-cost-usd` is required
+live and enforced before every operation from spend recomputed out of the raw logs, unknown cost stops it, and
+`--max-consecutive-infrastructure` stops it during a provider incident — always resumably. C and D execute under what
+their block's shared plan left of the equal total budget, and each row records both the execution-only and the
+system-level (planning added back) cost and latency.
 
 ## Status
 

@@ -22,6 +22,11 @@ unpriced cells) and regenerates `analysis.md` from the rows, and requires `compl
 agree with what it recomputed. It also audits the experiment's *design* (ADR-009): a frozen randomized block schedule
 covering every cell, a frozen environment fingerprint, and one recorded plan per block that configs C and D both
 executed — without that, a C-versus-D difference does not isolate concurrency.
+
+Protocol audits (ADR-010): the schedule must be exactly what its seed draws *and* the rows must show it was followed
+(every row carries its block's `schedule_index`, first-pass rows in schedule order); an aggregate spend ceiling must be
+recorded, with the spend recomputed from the raw logs inside it and no operation of unknown cost; and where an
+Anthropic model was used, the reasoning effort must have been an explicit frozen choice.
 """
 
 from __future__ import annotations
@@ -40,11 +45,13 @@ sys.path.insert(0, str(ROOT))
 from scripts.benchmark import (  # noqa: E402
     REPLAY_CONFIGS,
     aggregate,
+    build_schedule,
     completion,
     load_plans,
     load_rows,
     render_analysis,
     schedule_cells,
+    spend_ledger,
 )
 
 CONFIGS = {"A", "B", "C", "D"}
@@ -90,6 +97,31 @@ def current_git_state() -> tuple[str, bool]:
     return (rev.stdout.strip() if rev.returncode == 0 else "unknown", bool(dirty.stdout.strip()) or dirty.returncode != 0)
 
 
+def _schedule_followed(schedule: list[dict[str, Any]], rows: list[dict[str, Any]]) -> str | None:
+    """Did the evidence actually come out in the frozen order? (ADR-009/ADR-010)
+
+    Two claims, both auditable from the rows alone: every row carries the `schedule_index` of *its* block, and the
+    first-pass rows (those that are not reruns of an infrastructure-invalid cell) appear in schedule order. A recorded
+    schedule nobody followed is decoration; reruns are appended out of order by construction and are exempt."""
+    if not schedule:
+        return "no schedule to audit"
+    index_of = {(int(b["n"]), int(b["repetition"])): int(b["index"]) for b in schedule}
+    position = {cell: i for i, cell in enumerate(schedule_cells(schedule))}
+    mislabelled, order = [], []
+    for number, row in enumerate(rows, 1):
+        key = (row.get("config"), row.get("n"), row.get("repetition"))
+        block = index_of.get((row.get("n"), row.get("repetition")))
+        if block is None or row.get("schedule_index") != block:
+            mislabelled.append(number)
+        elif not row.get("rerun_of") and key in position:
+            order.append(position[key])
+    if mislabelled:
+        return f"{len(mislabelled)} row(s) carry no/!= schedule_index of their block (first at line {mislabelled[0]})"
+    if order != sorted(order):
+        return "rows were not produced in the frozen schedule order"
+    return None
+
+
 def _design_checks(
     spec: dict[str, Any],
     manifest: dict[str, Any],
@@ -100,12 +132,17 @@ def _design_checks(
     configs: list[str],
     widths: list[int],
     repeats: int,
+    plan_rows: list[dict[str, Any]],
 ) -> list[Check]:
-    """ADR-009: the experiment's *design* is part of the evidence — a frozen randomized schedule, a frozen environment,
-    and one shared plan per block that C and D both executed."""
+    """ADR-009/ADR-010: the experiment's *design* is part of the evidence — a frozen randomized schedule that was
+    actually followed, a frozen environment, one shared plan per block that C and D both executed, an explicit
+    reasoning effort, and an aggregate spend ceiling the recomputed spend stayed inside."""
     schedule = manifest.get("schedule") if isinstance(manifest.get("schedule"), list) else []
     expected_cells = sorted((c, n, r) for c in configs for n in widths for r in range(1, repeats + 1))
     scheduled = sorted(schedule_cells(schedule)) if schedule else []
+    seed = spec.get("seed")
+    redrawn = build_schedule(configs, widths, repeats, int(seed)) if seed is not None and configs and widths else []
+    followed = _schedule_followed(schedule, rows)
     env = spec.get("environment") if isinstance(spec.get("environment"), dict) else {}
     env_missing = [k for k in ("python", "platform", "provider", "attempt", "exec", "verifier") if not env.get(k)]
     blocks = [(n, r) for n in widths for r in range(1, repeats + 1)]
@@ -127,13 +164,28 @@ def _design_checks(
         elif not all(r.get("plan_failed") for r in rows_by_config.values()):
             # no plan for this block: C and D must both record exactly that, and neither may have run anyway
             unpaired.append(f"N={block[0]} r={block[1]} ran without the block's plan")
+    models = spec.get("models") if isinstance(spec.get("models"), dict) else {}
+    anthropic = [k for k, v in models.items() if str(v).startswith("anthropic:")]
+    effort = str(((env.get("provider") or {}) if isinstance(env.get("provider"), dict) else {}).get("anthropic_effort") or "")
+    cap = manifest.get("spend_cap_usd")
+    ledger = spend_ledger(rows, plan_rows)
+    within_cap = isinstance(cap, int | float) and cap > 0 and ledger["spent_usd"] <= float(cap)
     return [
         Check(
             "matrix.schedule",
-            bool(schedule) and scheduled == expected_cells and spec.get("seed") is not None,
-            f"seed={spec.get('seed')} blocks={len(schedule)} cells={len(scheduled)}/{len(expected_cells)}"
+            bool(schedule) and scheduled == expected_cells and seed is not None and schedule == redrawn,
+            (
+                f"seed={seed} blocks={len(schedule)} cells={len(scheduled)}/{len(expected_cells)}"
+                if schedule == redrawn
+                else f"the recorded schedule is not what seed {seed} draws (hand-edited or a different harness)"
+            )
             if schedule
             else "no randomized block schedule recorded in experiment.json",
+        ),
+        Check(
+            "matrix.schedule_followed",
+            followed is None,
+            followed or f"{len(rows)} rows carry their block's schedule_index and are in the frozen order",
         ),
         Check(
             "matrix.environment",
@@ -158,6 +210,24 @@ def _design_checks(
             "C and D executed the same recorded plan in every block"
             if not unpaired
             else f"{len(unpaired)} block(s) where C and D did not share one plan: {unpaired[:3]}",
+        ),
+        Check(
+            "matrix.spend_cap",
+            within_cap and not ledger["unpriced_operations"],
+            f"${ledger['spent_usd']:.4f} billed over {ledger['operations']} operation(s) against a ${cap} ceiling"
+            f" ({len(manifest.get('spend_cap_history') or [])} recorded setting(s))"
+            if within_cap and not ledger["unpriced_operations"]
+            else (
+                "no aggregate spend ceiling recorded (ADR-010)"
+                if not isinstance(cap, int | float) or cap <= 0
+                else f"${ledger['spent_usd']:.4f} billed against a ${cap} ceiling, "
+                f"{ledger['unpriced_operations']} operation(s) with unknown cost"
+            ),
+        ),
+        Check(
+            "matrix.frozen_effort",
+            not anthropic or bool(effort),
+            f"anthropic models {anthropic} ran at effort '{effort}'" if anthropic else "no Anthropic model in this experiment",
         ),
     ]
 
@@ -199,11 +269,15 @@ def _matrix_checks(benchmark_dir: Path) -> tuple[list[Check], dict[str, Any]]:
     recomputed = completion(rows, configs=configs, widths=widths, repeats=repeats, require_priced=spec.get("mode") == "live")
     disagreements = [k for k in _RECOMPUTED_COMPLETION_FIELDS if done.get(k) != recomputed.get(k)]
     try:
-        plans = load_plans(benchmark_dir / "plans.jsonl", experiment_id)
+        plans_path = benchmark_dir / "plans.jsonl"
+        plans = load_plans(plans_path, experiment_id)
+        plan_rows = load_rows(plans_path, experiment_id)
         plans_error = None
     except ValueError as exc:
-        plans, plans_error = {}, str(exc)
-    checks += _design_checks(spec, manifest, rows, plans, plans_error, configs=configs, widths=widths, repeats=repeats)
+        plans, plan_rows, plans_error = {}, [], str(exc)
+    checks += _design_checks(
+        spec, manifest, rows, plans, plans_error, configs=configs, widths=widths, repeats=repeats, plan_rows=plan_rows
+    )
     checks += [
         Check("matrix.live", spec.get("mode") == "live", f"mode={spec.get('mode')}"),
         Check("matrix.configs", set(configs) == CONFIGS, f"configs={configs}"),

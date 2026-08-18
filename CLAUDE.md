@@ -116,9 +116,19 @@ Frozen MVP evidence (run on one clean commit with a real provider and exact `MAS
 ```
 python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m> --step all --no-auto-approve --output mvp-evidence/live-smoke.json
 python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-smoke.json
-python scripts/benchmark.py --cheap-model <p:m> --strong-model <p:m> --planner-model <p:m> --worker-model <p:m> --repeats 5 --output benchmark-results
+export MAS_ANTHROPIC_EFFORT=medium                              # frozen in the manifest; a live matrix refuses to start unset
+python scripts/benchmark.py --cheap-model <p:m> --strong-model <p:m> --planner-model <p:m> --worker-model <p:m> \
+    --repeats 5 --max-total-cost-usd <ceiling> --pace-s 5 --output benchmark-results
 python scripts/mvp_gate.py                                      # direct live + distributed + priced 100-run matrix, recomputed from raw rows, bound to the current clean HEAD
 ```
+
+**The matrix is 100 execution runs plus up to 25 planning rounds, all billable.** `--max-total-cost-usd` is required
+live (ADR-010): spend is recomputed from the raw logs (superseded and retried operations included) and an operation may
+only start if the ceiling still covers its own maximum; billed/remaining/worst-case is printed before each one; unknown
+cost stops it. `--cooldown-s` (60) and `--max-consecutive-infrastructure` (3) stop the matrix during a provider
+incident. Every stop is resumable — rerun the same command. C/D execute under what their block's shared plan left of
+the equal total budget, and every row carries both the execution-only and the `system_*` (planning added back) cost and
+latency.
 
 `live_smoke.py --resume` (with `--output`) skips stages already PASSED in that file when it came from the same commit,
 models, approval mode, pricing rule and price table, budgets, worker count, concurrency and replan limit. `benchmark.py`

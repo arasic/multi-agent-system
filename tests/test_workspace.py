@@ -208,21 +208,39 @@ def test_repo_admin_lock_excludes_another_process_and_is_released_on_exit(gws):
     assert (repo / ADMIN_LOCK_FILE).exists()
 
 
-def test_a_filesystem_without_locking_degrades_to_in_process_serialization(gws, monkeypatch, caplog):
-    """Some bind mounts refuse advisory locks. Failing every attempt there would be worse than the race: the
-    in-process mutex still serializes this process's threads, and the fallback is logged, not silent."""
+def test_a_filesystem_without_cross_process_locking_fails_closed_for_worktree_creation(gws, monkeypatch, caplog):
+    """Workers are separate processes and containers, so the in-process mutex alone guarantees nothing: where the
+    volume refuses advisory locks, creating a worktree must fail rather than reintroduce the race silently and only
+    under load. Cleanup/GC still degrade — they run outside the risky window (ADR-010)."""
     import mas.workers.workspace as ws_mod
 
     run_id = uuid.uuid4()
     repo = gws.ensure_repo(run_id)
     monkeypatch.setattr(ws_mod, "_try_lock", lambda fd: None)  # ENOLCK/EINVAL: locking unsupported here
     monkeypatch.setattr(ws_mod, "_unsupported_warned", False)
-    with caplog.at_level("WARNING"), ws_mod.repo_admin_lock(repo, timeout_s=0.2) as may_administer:
-        assert may_administer is True  # proceed, do not raise
+    with pytest.raises(ws_mod.WorkspaceError, match="does not support advisory locking"):
+        with ws_mod.repo_admin_lock(repo, timeout_s=0.2):
+            pass
+    with caplog.at_level("WARNING"), ws_mod.repo_admin_lock(repo, timeout_s=0.2, required=False) as may_administer:
+        assert may_administer is True
     assert any("does not support file locking" in r.message for r in caplog.records)
 
-    monkeypatch.setattr(ws_mod, "_try_lock", lambda fd: False)  # ...but a lock genuinely held elsewhere still waits out
+    monkeypatch.setattr(ws_mod, "_try_lock", lambda fd: False)  # ...and a lock genuinely held elsewhere still waits out
     with pytest.raises(ws_mod.WorkspaceError, match="administration lock"):
+        with ws_mod.repo_admin_lock(repo, timeout_s=0.2):
+            pass
+
+
+def test_a_repo_whose_lock_file_cannot_be_opened_fails_closed_too(gws, monkeypatch):
+    import mas.workers.workspace as ws_mod
+
+    repo = gws.ensure_repo(uuid.uuid4())
+
+    def refuse(*a, **kw):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(ws_mod.os, "open", refuse)
+    with pytest.raises(ws_mod.WorkspaceError, match="cannot open the git administration lock"):
         with ws_mod.repo_admin_lock(repo, timeout_s=0.2):
             pass
 

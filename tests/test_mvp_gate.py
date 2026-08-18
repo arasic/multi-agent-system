@@ -20,6 +20,10 @@ WIDTHS = [1, 2, 4, 8, 16]
 COMMIT = "abc"
 SUITES = {str(n): f"suite{n}" for n in WIDTHS}
 EXPERIMENT = "exp-1"
+SEED = 7
+SPEND_CAP = 500.0
+SCHEDULE = benchmark.build_schedule(CONFIGS, WIDTHS, 5, SEED)
+BLOCK_INDEX = {(int(b["n"]), int(b["repetition"])): int(b["index"]) for b in SCHEDULE}
 
 
 def _plan_sha(n: int, repetition: int) -> str:
@@ -91,13 +95,21 @@ def _row(config: str, n: int, repetition: int, *, status: str = "PASSED", priced
         "experiment_id": EXPERIMENT,
         "git_commit": COMMIT,
         "suite_sha256": SUITES[str(n)],
+        "schedule_index": BLOCK_INDEX[(n, repetition)],
     }
     row.update(extra)
     return row
 
 
 def _rows(*, priced: bool = True, status: str = "PASSED") -> list[dict]:
-    return [_row(c, n, r, status=status, priced=priced) for c in CONFIGS for n in WIDTHS for r in range(1, 6)]
+    """In the frozen schedule's own order — that is how the harness appends them, and the gate audits it."""
+    return [_row(c, n, r, status=status, priced=priced) for c, n, r in benchmark.schedule_cells(SCHEDULE)]
+
+
+def _replace(rows: list[dict], row: dict) -> list[dict]:
+    """Swap the row for one cell, keeping the recorded order (positions are schedule order, not config order)."""
+    key = (row["config"], row["n"], row["repetition"])
+    return [row if (r["config"], r["n"], r["repetition"]) == key else r for r in rows]
 
 
 ENVIRONMENT = {
@@ -110,15 +122,16 @@ ENVIRONMENT = {
     "verifier": {"image": "mas-verifier:latest", "image_id": "sha256:aaa", "timeout_s": 300},
     "worker_capabilities": ["implementation"],
 }
-SEED = 7
 
 
 def _manifest() -> dict:
     return {
-        "schema": 2,
+        "schema": 3,
         "experiment_id": EXPERIMENT,
         "git_commit": COMMIT,
         "git_dirty": False,
+        "spend_cap_usd": SPEND_CAP,
+        "spend_cap_history": [{"at": "t0", "git_commit": COMMIT, "from_usd": None, "to_usd": SPEND_CAP}],
         "spec": {
             "mode": "live",
             "configs": CONFIGS,
@@ -131,7 +144,7 @@ def _manifest() -> dict:
             "suite_sha256": SUITES,
             "environment": ENVIRONMENT,
         },
-        "schedule": benchmark.build_schedule(CONFIGS, WIDTHS, 5, SEED),
+        "schedule": SCHEDULE,
     }
 
 
@@ -341,13 +354,16 @@ def test_mvp_gate_rejects_rows_from_another_commit_or_suite_and_infrastructure_i
     _write_matrix(bench, rows)
     assert _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False))) == {"matrix.rows_bound"}
 
-    rows = _rows()
-    rows[3] = _row("A", 1, 4, status="FAILED", verdict_reason="UNSUPPORTED", reason_text="verification not completed (INVALID)")
+    rows = _replace(
+        _rows(),
+        _row("A", 1, 4, status="FAILED", verdict_reason="UNSUPPORTED", reason_text="verification not completed (INVALID)"),
+    )
     _write_matrix(bench, rows)
     failed = _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
     assert failed == {"matrix.complete", "matrix.no_infrastructure_invalid"}
-    # ...and passes again once the cell has been rerun (append-only: the invalid row stays on record)
-    _write_matrix(bench, rows + [_row("A", 1, 4, suffix=1)])
+    # ...and passes again once the cell has been rerun (append-only: the invalid row stays on record). A rerun is
+    # appended out of schedule order by construction, which is why it carries `rerun_of` and is exempt from the audit.
+    _write_matrix(bench, rows + [_row("A", 1, 4, suffix=1, rerun_of="run-A-1-4-0", rerun_index=1)])
     assert not _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
 
 
@@ -384,9 +400,14 @@ def test_a_block_the_planner_could_not_plan_is_evidence_not_a_reason_to_re_roll_
     _write_live_and_distributed(live, distributed)
     dead = _plan(8, 3, planned=False, outcome="failed", plan_sha256=None, tasks=None, verdict_reason="INVALID_PLAN")
     plans = [p for p in _plans() if (p["n"], p["repetition"]) != (8, 3)] + [dead]
+    stamps = {
+        "experiment_id": EXPERIMENT,
+        "git_commit": COMMIT,
+        "suite_sha256": SUITES["8"],
+        "schedule_index": BLOCK_INDEX[(8, 3)],
+    }
     rows = [
-        benchmark.plan_failure_row(r["config"], 8, 3, {"status": "FAILED", "verdict": "no plan", **dead})
-        | {"experiment_id": EXPERIMENT, "git_commit": COMMIT, "suite_sha256": SUITES["8"]}
+        benchmark.plan_failure_row(r["config"], 8, 3, {"status": "FAILED", "verdict": "no plan", **dead}) | stamps
         if (r["config"], r["n"], r["repetition"]) in {("C", 8, 3), ("D", 8, 3)}
         else r
         for r in _rows()
@@ -418,6 +439,64 @@ def test_mvp_gate_requires_a_frozen_schedule_and_environment(tmp_path: Path):
     del manifest["spec"]["environment"]
     _write_matrix(bench, _rows(), manifest=manifest)
     assert "matrix.environment" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+    # a schedule that covers every cell but is not what the frozen seed draws: hand-edited, or another harness
+    manifest = _manifest()
+    manifest["schedule"] = [dict(b, configs=sorted(b["configs"])) for b in manifest["schedule"]]
+    _write_matrix(bench, _rows(), manifest=manifest)
+    assert "matrix.schedule" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+
+def test_mvp_gate_requires_the_evidence_to_have_been_produced_in_the_frozen_order(tmp_path: Path):
+    """A recorded schedule nobody followed is decoration (ADR-010)."""
+    live, distributed, bench = tmp_path / "live.json", tmp_path / "distributed.json", tmp_path / "bench"
+    _write_live_and_distributed(live, distributed)
+    _write_matrix(bench, _rows())
+    assert not _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+    # rows produced config-major (the pre-ADR-009 order), while the manifest claims a randomized schedule
+    ordered = sorted(_rows(), key=lambda r: (r["config"], r["n"], r["repetition"]))
+    _write_matrix(bench, ordered)
+    assert "matrix.schedule_followed" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+    # ...and a row that does not carry its own block's index is just as unacceptable
+    rows = _replace(_rows(), _row("D", 8, 3, schedule_index=BLOCK_INDEX[(8, 3)] + 1))
+    _write_matrix(bench, rows)
+    assert "matrix.schedule_followed" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+
+def test_mvp_gate_requires_a_recorded_spend_ceiling_the_recomputed_spend_stayed_inside(tmp_path: Path):
+    live, distributed, bench = tmp_path / "live.json", tmp_path / "distributed.json", tmp_path / "bench"
+    _write_live_and_distributed(live, distributed)
+
+    manifest = _manifest()
+    del manifest["spend_cap_usd"]
+    _write_matrix(bench, _rows(), manifest=manifest)
+    assert "matrix.spend_cap" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+    manifest = _manifest()  # a ceiling the evidence itself shows was blown through
+    manifest["spend_cap_usd"] = 0.5
+    _write_matrix(bench, _rows(), manifest=manifest)
+    assert "matrix.spend_cap" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+
+def test_mvp_gate_requires_reasoning_effort_to_have_been_an_explicit_frozen_choice(tmp_path: Path):
+    """An unset effort means the provider's default decided cost and behaviour, on a run whose manifest claims to
+    freeze exactly that."""
+    live, distributed, bench = tmp_path / "live.json", tmp_path / "distributed.json", tmp_path / "bench"
+    _write_live_and_distributed(live, distributed)
+    anthropic = {"cheap": "anthropic:a", "strong": "anthropic:b", "planner": "anthropic:c", "worker": "anthropic:d"}
+
+    manifest = _manifest()
+    manifest["spec"]["models"] = anthropic
+    _write_matrix(bench, _rows(), manifest=manifest)
+    assert "matrix.frozen_effort" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+    manifest = _manifest()
+    manifest["spec"]["models"] = anthropic
+    manifest["spec"]["environment"] = {**ENVIRONMENT, "provider": {**ENVIRONMENT["provider"], "anthropic_effort": "medium"}}
+    _write_matrix(bench, _rows(), manifest=manifest)
+    assert not _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
 
 
 def test_schedule_is_deterministic_covers_every_cell_and_interleaves_configurations():
@@ -567,6 +646,184 @@ def test_resumed_experiment_refuses_a_changed_revision_dirty_tree_or_environment
     for changed in ({**spec, "seed": SEED + 1}, {**spec, "environment": {**ENVIRONMENT, "python": "3.13.0"}}):
         with pytest.raises(ValueError, match="different experiment"):
             benchmark.open_experiment(tmp_path, changed)
+
+
+# ----------------------------------------------------------------------------- ADR-010: budgets, spend, pacing
+
+
+def _bench_args(**overrides) -> argparse.Namespace:
+    base = dict(
+        offline=False,
+        cheap_model="p:cheap",
+        strong_model="p:strong",
+        planner_model="p:planner",
+        worker_model="p:worker",
+        max_tokens=1_000_000,
+        max_attempt_tokens=250_000,
+        max_cost_usd=20.0,
+        max_wallclock_s=1800,
+        max_replans=1,
+        pace_s=0.0,
+        cooldown_s=0.0,
+        max_consecutive_infrastructure=3,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_c_and_d_execute_under_what_the_shared_plan_left_of_the_equal_total_budget():
+    """ADR-010: A/B plan inside their run. If C/D also got the full budget after planning outside it, they would
+    silently receive more than A/B — in the direction that flatters MAS."""
+    args = _bench_args()
+    plan = _plan(4, 1, call_input_tokens=30_000, call_output_tokens=10_000, call_cost_usd=1.25, plan_s=64.0)
+    assert benchmark.execution_budgets(args, None) == benchmark.full_budgets(args)  # A and B
+    assert benchmark.execution_budgets(args, plan) == {
+        "max_tokens": 1_000_000 - 40_000,
+        "max_cost_usd": 18.75,
+        "max_wallclock_s": 1800 - 64,
+    }
+    argv = benchmark.command(args, "D", 4, Path("fixture.json"), Path("plan.json"), benchmark.execution_budgets(args, plan))
+    assert argv[argv.index("--max-cost-usd") + 1] == "18.75"
+    assert argv[argv.index("--max-tokens") + 1] == "960000"
+
+    # unpriced planning subtracts nothing rather than guessing — that case stops the matrix through the ledger instead
+    unpriced = _plan(4, 1, call_cost_usd=None, cost_known=False, call_input_tokens=10, call_output_tokens=0)
+    assert benchmark.execution_budgets(args, unpriced)["max_cost_usd"] == 20.0
+
+
+def test_planning_that_consumed_the_whole_budget_is_an_experimental_result_not_a_fresh_budget():
+    args = _bench_args(max_cost_usd=1.0, max_tokens=1000, max_wallclock_s=60)
+    plan = _plan(8, 2, call_input_tokens=900, call_output_tokens=200, call_cost_usd=1.0, plan_s=70.0)
+    budgets = benchmark.execution_budgets(args, plan)
+    assert budgets == {"max_tokens": 0, "max_cost_usd": 0.0, "max_wallclock_s": 0}
+    row = benchmark.budget_exhausted_row("C", 8, 2, plan, budgets)
+    assert classify_run(row) == "experimental" and row["status"] == "ABORTED"
+    assert row["verdict_reason"] == "BUDGET_EXHAUSTED" and row["plan_sha256"] == _plan_sha(8, 2)
+
+
+def test_system_totals_add_the_block_plan_back_so_c_d_can_be_compared_with_a_b():
+    plan = _plan(4, 1, call_cost_usd=0.5, call_input_tokens=100, call_output_tokens=50, plan_s=12.0)
+    d = benchmark.attach_system_totals(_row("D", 4, 1, call_cost_usd=2.0, machine_s=40.0), plan)
+    assert (d["call_cost_usd"], d["machine_s"]) == (2.0, 40.0)  # execution-only: the C-vs-D contrast is unchanged
+    assert (d["system_call_cost_usd"], d["system_machine_s"]) == (2.5, 52.0) and d["system_cost_known"]
+    a = benchmark.attach_system_totals(_row("A", 4, 1, call_cost_usd=2.0, machine_s=40.0), None)
+    assert (a["system_call_cost_usd"], a["system_machine_s"]) == (2.0, 40.0)  # A/B plan inside their run
+    unpriced = benchmark.attach_system_totals(
+        _row("C", 4, 1, call_cost_usd=2.0), _plan(4, 1, call_cost_usd=None, cost_known=False)
+    )
+    assert unpriced["system_call_cost_usd"] is None and not unpriced["system_cost_known"]
+
+
+def test_spend_ledger_counts_every_billed_operation_including_superseded_reruns_and_retried_plans():
+    """The cap must see what the provider billed, not what the summary keeps: an infrastructure row that was later
+    rerun, and a planning round that had to be retried, were both paid for."""
+    infra = _row("A", 1, 1, status="FAILED", verdict_reason="UNSUPPORTED", reason_text="verification not completed (INVALID)")
+    rerun = _row("A", 1, 1, suffix=1)
+    plans = [_plan(1, 1, planned=False, outcome="failed", call_cost_usd=0.5), _plan(1, 1, call_cost_usd=0.75)]
+    ledger = benchmark.spend_ledger([infra, rerun], plans)
+    assert ledger == {"spent_usd": 0.01 + 0.01 + 0.5 + 0.75, "unpriced_operations": 0, "operations": 4}
+
+    # a run whose cost is unknown makes the total a floor, and is counted so the ceiling can refuse to continue
+    lost = {"config": "B", "n": 1, "repetition": 2, "status": "CLIENT_ERROR"}
+    assert benchmark.spend_ledger([lost], [])["unpriced_operations"] == 1
+    # bookkeeping rows echo the planning round's cost for classification; counting them would bill the plan three times
+    skipped = benchmark.plan_failure_row("C", 1, 1, plans[0])
+    assert benchmark.spend_ledger([skipped], [])["spent_usd"] == 0.0
+
+
+def test_no_operation_may_start_unless_the_ceiling_still_covers_its_own_maximum():
+    owed = [("plan", 4, 1), ("C", 4, 1), ("D", 4, 1)]
+    ledger = {"spent_usd": 40.0, "unpriced_operations": 0, "operations": 6}
+    line, refusal = benchmark.spend_admission(ledger, 100.0, 20.0, owed, "C N=4 repeat=1")
+    assert refusal is None and "billed $40.0000 of $100.0000" in line and "worst case <= $100.0000" in line
+
+    _, refusal = benchmark.spend_admission({**ledger, "spent_usd": 85.0}, 100.0, 20.0, owed, "C N=4 repeat=1")
+    assert refusal and "does not cover another $20.0000" in refusal  # stops *before* spending, not after
+
+    _, refusal = benchmark.spend_admission({**ledger, "unpriced_operations": 1}, 100.0, 20.0, owed, "C")
+    assert refusal and "unknown cost" in refusal
+    _, allowed = benchmark.spend_admission({**ledger, "unpriced_operations": 1}, 100.0, 20.0, owed, "C", stop_on_unpriced=False)
+    assert allowed is None  # ...unless the operator explicitly accepted unknown cost (--allow-unpriced)
+
+    line, refusal = benchmark.spend_admission(ledger, None, 20.0, owed, "C")
+    assert refusal is None and "no ceiling configured" in line
+
+
+def test_worst_case_projection_counts_exactly_the_operations_still_owed():
+    schedule = benchmark.build_schedule(["C", "D"], [4], 1, SEED)
+    assert benchmark.pending_operations(schedule, {}, {}) == [("plan", 4, 1), ("C", 4, 1), ("D", 4, 1)]
+
+    plans = {(4, 1): _plan(4, 1)}
+    done = {("C", 4, 1): _row("C", 4, 1)}
+    assert benchmark.pending_operations(schedule, done, plans) == [("D", 4, 1)]  # plan on record, C recorded
+
+    invalid = _row("C", 4, 1, status="FAILED", verdict_reason="UNSUPPORTED", reason_text="verification not completed (INVALID)")
+    owed = benchmark.pending_operations(schedule, {("C", 4, 1): invalid}, plans)
+    assert owed == [("C", 4, 1), ("D", 4, 1)]  # an infrastructure-invalid cell is owed again, the usable plan is not
+
+
+def test_consecutive_infrastructure_failures_stop_the_matrix_and_a_success_resets_the_breaker(monkeypatch):
+    """A provider-wide incident must never be walked through automatically: every cell would be rerun anyway."""
+    slept: list[float] = []
+    monkeypatch.setattr(benchmark.time, "sleep", slept.append)
+    args = _bench_args(pace_s=1.0, cooldown_s=30.0, max_consecutive_infrastructure=3)
+    state = {"consecutive": 0}
+    assert benchmark.after_operation(True, state, args) is None
+    assert benchmark.after_operation(True, state, args) is None
+    assert slept == [30.0, 30.0]  # a machinery failure waits longer than the pace
+    assert benchmark.after_operation(False, state, args) is None and state["consecutive"] == 0 and slept[-1] == 1.0
+    for _ in range(2):
+        assert benchmark.after_operation(True, state, args) is None
+    stop = benchmark.after_operation(True, state, args)
+    assert stop and "3 consecutive infrastructure failures" in stop and "resume" in stop
+
+    disabled = _bench_args(max_consecutive_infrastructure=0, cooldown_s=0.0)
+    assert benchmark.after_operation(True, {"consecutive": 99}, disabled) is None
+
+
+def test_a_live_matrix_refuses_to_start_without_a_ceiling_or_an_explicit_reasoning_effort(monkeypatch, tmp_path: Path):
+    common = [
+        "--cheap-model",
+        "anthropic:cheap",
+        "--strong-model",
+        "anthropic:strong",
+        "--planner-model",
+        "anthropic:planner",
+        "--worker-model",
+        "anthropic:worker",
+        "--repeats",
+        "5",
+        "--output",
+        str(tmp_path),
+        "--allow-dirty",
+    ]
+    monkeypatch.setenv("MAS_MODEL_PRICES", '{"m": [1.0, 2.0]}')
+    monkeypatch.setenv("MAS_ANTHROPIC_EFFORT", "medium")
+    with pytest.raises(SystemExit):  # no aggregate ceiling
+        benchmark.main(common)
+
+    monkeypatch.setenv("MAS_ANTHROPIC_EFFORT", "")
+    with pytest.raises(SystemExit):  # ceiling given, but effort left to the provider's default
+        benchmark.main([*common, "--max-total-cost-usd", "250"])
+
+
+def test_the_spend_ceiling_is_recorded_with_an_append_only_history_rather_than_frozen_into_the_identity(
+    tmp_path: Path, monkeypatch
+):
+    """Freezing the ceiling inside `spec` would make an experiment that reaches it unresumable — the operator's only
+    way forward would be to discard evidence already paid for (ADR-010)."""
+    spec = {"configs": CONFIGS, "widths": WIDTHS, "repeats": 5, "seed": SEED, "environment": ENVIRONMENT}
+    monkeypatch.setattr(benchmark, "_git_state", lambda: ("abc", False))
+    manifest = benchmark.open_experiment(tmp_path, spec, spend_cap_usd=250.0)
+    assert manifest["spend_cap_usd"] == 250.0 and len(manifest["spend_cap_history"]) == 1
+
+    same = benchmark.open_experiment(tmp_path, spec, spend_cap_usd=250.0)
+    assert len(same["spend_cap_history"]) == 1  # unchanged: nothing to record
+    raised = benchmark.open_experiment(tmp_path, spec, spend_cap_usd=400.0)
+    assert raised["spend_cap_usd"] == 400.0 and len(raised["spend_cap_history"]) == 2
+    assert raised["spend_cap_history"][-1]["from_usd"] == 250.0 and raised["spend_cap_history"][-1]["to_usd"] == 400.0
+    on_disk = json.loads((tmp_path / "experiment.json").read_text(encoding="utf-8"))
+    assert on_disk["spend_cap_usd"] == 400.0 and "max_total_cost_usd" not in json.dumps(on_disk["spec"])
 
 
 def test_crossover_requires_parallel_to_preserve_success_and_improve_the_metric():

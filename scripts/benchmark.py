@@ -25,6 +25,24 @@ Experimental design (ADR-009):
     per-attempt call budget, and the sandbox/verifier image ids and limits. A different environment is a different
     experiment and will not resume into the same directory.
 
+Protocol and safety (ADR-010):
+  * **Equal *total* budgets across the plan boundary.** A and B plan inside their run, so their planning is already
+    inside their budget. C and D plan once per block, outside the run — so their execution runs get only what the
+    block's shared plan left (`execution_budgets`), and each row also carries the system-level totals that add the
+    planning back (`system_call_cost_usd`, `system_machine_s`) for comparison against A/B. C versus D stays an
+    execution-only contrast: the shared planning component is identical and cancels.
+  * **An aggregate spend ceiling.** `--max-total-cost-usd` bounds the whole matrix, not just each run. Spend is
+    recomputed from the raw append-only logs (superseded and retried operations included — the provider billed those
+    too); before every operation the harness requires `spent + this operation's ceiling <= cap`, prints the billed /
+    remaining / worst-case projection, and stops if unpriced usage makes the total unknowable. The ceiling is recorded
+    in `experiment.json` (with an append-only history of any change) and audited by `scripts/mvp_gate.py`.
+  * **Pacing and a circuit breaker.** `--pace-s` between operations, `--cooldown-s` after a machinery failure, and a
+    stop after `--max-consecutive-infrastructure` failures in a row: a provider-wide incident must never be walked
+    through automatically. Stopping is always resumable — rerun the same command.
+  * **No clarification answer key (unattended M3).** The width benchmarks are frozen and fully specified, and the
+    matrix runs unattended; a planner that asks a question is a valid *experimental* planning outcome, not an
+    infrastructure failure. Clarification is exercised deliberately in `scripts/live_smoke.py` (ADR-006).
+
 Failure classification (`classify_run`): a run that ends PASSED, or FAILED/ABORTED because the model, the plan or the
 experiment's budgets did (`experimental`), is evidence and stays. A run that ends because the machinery did — verifier
 crash/timeout, unusable suite, provider outage, sandbox/workspace failure, worker death, a client that could not read
@@ -46,6 +64,7 @@ import re
 import statistics
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -80,6 +99,8 @@ DISTRIBUTION_FIELDS = (
     ("parallelism_efficiency", "parallelism efficiency (sum of attempt seconds / wall-clock)"),
     ("worker_utilisation", "worker utilisation (attempt seconds / (wall-clock x workers))"),
     ("call_cost_usd", "cost USD (metered model calls)"),
+    ("system_call_cost_usd", "system-level cost USD (run + the block's shared planning, ADR-010)"),
+    ("system_machine_s", "system-level machine seconds (run + the block's shared planning, ADR-010)"),
     ("call_input_tokens", "input tokens"),
     ("call_output_tokens", "output tokens"),
     ("call_cache_read_tokens", "cache-read tokens"),
@@ -117,7 +138,9 @@ def classify_run(row: dict) -> str:
         # C/D never started: the block's shared plan could not be produced (ADR-009). The planner is part of the
         # system under test, so its refusals/invalid plans/budget are evidence; a crash or a lost client is not.
         if row.get("plan_outcome") == "questions":
-            return "experimental"  # it chose to ask; an unattended experiment has no answer key for this benchmark
+            # ADR-010: the M3 benchmarks are frozen, fully specified and run unattended, so there is deliberately no
+            # answer key. Choosing to ask rather than to plan is the planner's own outcome, hence evidence.
+            return "experimental"
         return "experimental" if row.get("verdict_reason") in _EXPERIMENTAL_PLAN_REASONS else "infrastructure"
     if status == "PASSED":
         return "pass"
@@ -266,7 +289,7 @@ def experiment_spec(args) -> dict:
     except json.JSONDecodeError:
         price_snapshot = prices
     return {
-        "schema": 2,
+        "schema": 3,
         "mode": "offline" if args.offline else "live",
         "configs": list(args.configs),
         "widths": list(args.widths),
@@ -291,11 +314,18 @@ def experiment_spec(args) -> dict:
     }
 
 
-def open_experiment(output: Path, spec: dict) -> dict:
-    """Create or resume one immutable experiment. Refuse to mix configurations in the same evidence directory."""
+def open_experiment(output: Path, spec: dict, *, spend_cap_usd: float | None = None) -> dict:
+    """Create or resume one immutable experiment. Refuse to mix configurations in the same evidence directory.
+
+    The aggregate spend ceiling (ADR-010) is recorded in the manifest but *outside* `spec`: freezing it inside the
+    experiment's identity would make an experiment that reaches its ceiling unresumable, so the operator's only way
+    forward would be to discard the evidence already paid for. It is instead append-only history — every change is
+    stamped with when, at which commit, and from what to what, and the gate audits the recomputed spend against the
+    recorded ceiling."""
     path = output / "experiment.json"
     revision, dirty = _git_state()
     schedule = build_schedule(list(spec["configs"]), list(spec["widths"]), int(spec["repeats"]), int(spec["seed"]))
+    now = datetime.now(UTC).isoformat()
     if path.exists():
         manifest = json.loads(path.read_text(encoding="utf-8"))
         if manifest.get("spec") != spec:
@@ -307,15 +337,25 @@ def open_experiment(output: Path, spec: dict) -> dict:
         recorded = manifest.get("schedule")
         if not isinstance(recorded, list) or sorted(schedule_cells(recorded)) != sorted(schedule_cells(schedule)):
             raise ValueError(f"{path} records a schedule that no longer covers this matrix; choose a new --output directory")
+        if spend_cap_usd is not None and manifest.get("spend_cap_usd") != spend_cap_usd:
+            previous = manifest.get("spend_cap_usd")
+            manifest["spend_cap_usd"] = spend_cap_usd
+            manifest.setdefault("spend_cap_history", []).append(
+                {"at": now, "git_commit": revision, "from_usd": previous, "to_usd": spend_cap_usd}
+            )
+            print(f"[spend] ceiling changed from {previous} to {spend_cap_usd} USD (recorded in experiment.json)", flush=True)
+            path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return manifest  # the recorded order is the experiment's design: replay it, never redraw it
     manifest = {
-        "schema": 2,
+        "schema": 3,
         "experiment_id": str(uuid4()),
-        "created_at": datetime.now(UTC).isoformat(),
+        "created_at": now,
         "git_commit": revision,
         "git_dirty": dirty,
         "spec": spec,
         "schedule": schedule,
+        "spend_cap_usd": spend_cap_usd,
+        "spend_cap_history": [{"at": now, "git_commit": revision, "from_usd": None, "to_usd": spend_cap_usd}],
     }
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
@@ -469,6 +509,190 @@ def plan_failure_row(config: str, n: int, repetition: int, plan: dict) -> dict:
     }
 
 
+def plan_usage(plan: dict | None) -> dict:
+    """What a block's shared planning round already spent of that block's equal total budget."""
+    plan = plan or {}
+    cost = plan.get("call_cost_usd")
+    known = bool(plan.get("cost_known")) and cost is not None
+    return {
+        "tokens": int(plan.get("call_input_tokens") or 0) + int(plan.get("call_output_tokens") or 0),
+        "cost_usd": float(cost) if cost is not None else None,
+        "seconds": float(plan.get("plan_s") or 0.0),
+        "cost_known": known,
+    }
+
+
+def full_budgets(args) -> dict:
+    """The run budget every configuration starts from (evaluation.md §3: equal totals)."""
+    return {
+        "max_tokens": int(args.max_tokens),
+        "max_cost_usd": float(args.max_cost_usd),
+        "max_wallclock_s": int(args.max_wallclock_s),
+    }
+
+
+def execution_budgets(args, plan: dict | None) -> dict:
+    """C/D execute under what the block's shared plan left of the run's *total* budget (ADR-010).
+
+    A and B plan inside their run, so their planning is already charged against their tokens, cost and wall-clock. C
+    and D plan once per block, outside the run: if execution then received the full budget again, they would silently
+    get more than A/B and the comparison would stop being fair. Unpriced planning subtracts nothing — that case stops
+    the matrix instead (`spend_ledger`), rather than quietly guessing."""
+    if plan is None:
+        return full_budgets(args)
+    usage = plan_usage(plan)
+    spent = usage["cost_usd"] if usage["cost_known"] else 0.0
+    return {
+        "max_tokens": max(0, int(args.max_tokens) - usage["tokens"]),
+        "max_cost_usd": round(max(0.0, float(args.max_cost_usd) - (spent or 0.0)), 6),
+        "max_wallclock_s": max(0, int(args.max_wallclock_s) - int(usage["seconds"])),
+    }
+
+
+def attach_system_totals(row: dict, plan: dict | None) -> dict:
+    """Record both readings of cost and latency (ADR-010).
+
+    The row's own `call_cost_usd`/`machine_s` are *execution-only* for C and D, which is exactly what makes C versus D
+    a clean concurrency contrast: both replay the same plan, so the planning component is identical and cancels. The
+    `system_*` fields add the block's planning back, because a deployment of either configuration would have paid for
+    it — that is the number to quote against A/B, whose planning is already inside the run."""
+    usage = plan_usage(plan)
+    cost, machine = row.get("call_cost_usd"), row.get("machine_s")
+    known = bool(row.get("cost_known")) and (plan is None or usage["cost_known"])
+    row["plan_call_cost_usd"] = usage["cost_usd"]
+    row["plan_machine_s"] = usage["seconds"]
+    row["plan_tokens"] = usage["tokens"]
+    row["system_cost_known"] = known
+    row["system_call_cost_usd"] = None if cost is None or not known else round(float(cost) + (usage["cost_usd"] or 0.0), 6)
+    row["system_machine_s"] = None if machine is None else round(float(machine) + usage["seconds"], 3)
+    return row
+
+
+def budget_exhausted_row(config: str, n: int, repetition: int, plan: dict, budgets: dict) -> dict:
+    """The block's shared plan consumed the whole equal total budget, so there is nothing left to execute with.
+
+    That is the experiment's budgets deciding the outcome — an experimental result (ABORTED/`BUDGET_EXHAUSTED`), not a
+    machinery failure, and not something to paper over by handing the execution run a fresh budget."""
+    return {
+        "config": config,
+        "n": n,
+        "repetition": repetition,
+        "status": "ABORTED",
+        "verdict": "ABORTED:the block's shared plan consumed the run's total budget",
+        "verdict_reason": "BUDGET_EXHAUSTED",
+        "plan_failed": False,
+        "budget_exhausted_by_plan": True,
+        "execution_budgets": dict(budgets),
+        "plan_sha256": plan.get("plan_sha256"),
+        "plan_tasks": plan.get("tasks"),
+        "cost_known": True,
+        "call_cost_usd": 0.0,
+        "model_calls": 0,
+    }
+
+
+def spend_ledger(rows: list[dict], plan_rows: list[dict]) -> dict:
+    """Every priced dollar this experiment has already been billed, from the raw append-only logs (ADR-010).
+
+    Superseded infrastructure rows and retried planning rounds are counted: the provider charged for those too, so the
+    cap must see them. An operation that reported no known cost makes the total a floor rather than a total, and is
+    counted separately — with a ceiling to enforce, unknown spend is a reason to stop, not to continue."""
+    spent, unpriced, billing = 0.0, [], []
+    for record in list(rows) + list(plan_rows):
+        # bookkeeping rows for a cell that never executed (no shared plan, or the plan ate the budget) echo the
+        # planning round's cost for classification; the planning round itself is already in the ledger
+        if record.get("plan_failed") or record.get("budget_exhausted_by_plan"):
+            continue
+        billing.append(record)
+        cost = record.get("call_cost_usd")
+        if record.get("cost_known") is True and cost is not None:
+            spent += float(cost)
+        else:
+            unpriced.append(record)
+    return {"spent_usd": round(spent, 6), "unpriced_operations": len(unpriced), "operations": len(billing)}
+
+
+def pending_operations(schedule: list[dict], effective: dict[tuple, dict], plans: dict[tuple[int, int], dict]) -> list[tuple]:
+    """The billable operations this invocation still owes: `('plan', N, rep)` and `(config, N, rep)`, in schedule order.
+
+    Resume rules, so the worst-case projection is honest: a cell with a valid effective row is done, an
+    infrastructure-invalid one is owed again, and a block needs a planning round only when a replay config still owes a
+    run and no usable plan is on record."""
+    owed: list[tuple] = []
+    for block in schedule:
+        n, repetition = int(block["n"]), int(block["repetition"])
+        cells = [
+            c
+            for c in block["configs"]
+            if effective.get((c, n, repetition)) is None or classify_run(effective[(c, n, repetition)]) == "infrastructure"
+        ]
+        if any(c in REPLAY_CONFIGS for c in cells) and not (plans.get((n, repetition)) or {}).get("planned"):
+            owed.append(("plan", n, repetition))
+        owed += [(c, n, repetition) for c in cells]
+    return owed
+
+
+def spend_admission(
+    ledger: dict,
+    cap: float | None,
+    next_max: float,
+    owed: list[tuple],
+    label: str,
+    *,
+    stop_on_unpriced: bool = True,
+) -> tuple[str, str | None]:
+    """(what to print before this operation, why the matrix must stop instead). ADR-010's admission rule.
+
+    Stop *before* spending: an operation may only start if the ceiling still covers its own maximum, and unknown spend
+    is never assumed to be zero — an operation that reported no priced cost makes the ceiling unenforceable, so the
+    matrix stops unless the operator explicitly accepted unknown cost (`--allow-unpriced`)."""
+    spent = float(ledger["spent_usd"])
+    if cap is None:
+        return f"[spend] billed ${spent:.4f} (no ceiling configured); {label} <= ${next_max:.4f}", None
+    worst = spent + sum(next_max for _ in owed)
+    line = (
+        f"[spend] billed ${spent:.4f} of ${cap:.4f} ceiling; {label} <= ${next_max:.4f}; "
+        f"{len(owed)} operation(s) left, worst case <= ${worst:.4f}"
+    )
+    if ledger["unpriced_operations"] and stop_on_unpriced:
+        return line, (
+            f"{ledger['unpriced_operations']} recorded operation(s) have unknown cost, so the ${cap:.4f} ceiling "
+            "cannot be enforced (price every model in MAS_MODEL_PRICES, or accept it with --allow-unpriced)"
+        )
+    if spent + next_max > cap:
+        return line, (
+            f"the ${cap:.4f} ceiling does not cover another ${next_max:.4f} operation (billed ${spent:.4f}); "
+            "raise --max-total-cost-usd deliberately to continue"
+        )
+    return line, None
+
+
+def _pause(seconds: float, why: str) -> None:
+    if seconds and seconds > 0:
+        print(f"[pause] {seconds:g}s ({why})", flush=True)
+        time.sleep(seconds)
+
+
+def after_operation(infrastructure: bool, state: dict, args) -> str | None:
+    """Pace between operations, cool down after a machinery failure, stop after too many in a row (ADR-010).
+
+    Consecutive infrastructure failures mean the provider, Docker or the network is down — continuing would spend real
+    money on runs that cannot answer anything, and would fill the log with cells to rerun. Returns the stop reason."""
+    if not infrastructure:
+        state["consecutive"] = 0
+        _pause(args.pace_s, "pacing")
+        return None
+    state["consecutive"] += 1
+    limit = int(args.max_consecutive_infrastructure or 0)
+    if limit and state["consecutive"] >= limit:
+        return (
+            f"{state['consecutive']} consecutive infrastructure failures (limit {limit}): the machinery or the "
+            "provider is unavailable. Rerun the same command to resume once it is healthy."
+        )
+    _pause(args.cooldown_s, "cooldown after an infrastructure failure")
+    return None
+
+
 def completion(rows: list[dict], *, configs: list[str], widths: list[int], repeats: int, require_priced: bool) -> dict:
     """Is the raw evidence complete? Computed from the rows alone (the gate recomputes it the same way).
 
@@ -506,7 +730,10 @@ def completion(rows: list[dict], *, configs: list[str], widths: list[int], repea
     }
 
 
-def command(args, config: str, n: int, dag_file: Path, plan_file: Path | None = None) -> list[str]:
+def command(args, config: str, n: int, dag_file: Path, plan_file: Path | None = None, budgets: dict | None = None) -> list[str]:
+    """The `mas run` argv for one cell. `budgets` is what this run may still spend of its equal total budget (ADR-010);
+    without it the full per-run budget is used (A/B, and the dry-run listing)."""
+    budgets = budgets or full_budgets(args)
     common = [
         sys.executable,
         "-m",
@@ -517,13 +744,13 @@ def command(args, config: str, n: int, dag_file: Path, plan_file: Path | None = 
         "--benchmark",
         f"adapters_{n}",
         "--max-tokens",
-        str(args.max_tokens),
+        str(budgets["max_tokens"]),
         "--max-attempt-tokens",
         str(args.max_attempt_tokens),
         "--max-cost-usd",
-        str(args.max_cost_usd),
+        str(budgets["max_cost_usd"]),
         "--max-wallclock-s",
-        str(args.max_wallclock_s),
+        str(budgets["max_wallclock_s"]),
         "--max-replans",
         str(args.max_replans),
     ]
@@ -793,6 +1020,8 @@ def render_analysis(summary: list[dict], manifest: dict, done: dict, plans: dict
         f"Mode: `{spec.get('mode')}`; models: `{json.dumps(spec.get('models'), sort_keys=True)}`  ",
         f"Budgets per run: `{json.dumps(spec.get('budgets'), sort_keys=True)}`  ",
         f"Schedule: randomized blocks, seed `{spec.get('seed')}` (order frozen in `experiment.json`)  ",
+        f"Aggregate spend ceiling: `{manifest.get('spend_cap_usd')}` USD "
+        f"({len(manifest.get('spend_cap_history') or [])} recorded setting(s), ADR-010)  ",
         f"Environment: python `{env.get('python')}` on `{env.get('platform')}`; "
         f"exec image `{str((env.get('exec') or {}).get('image_id'))[:19]}`, "
         f"verifier image `{str((env.get('verifier') or {}).get('image_id'))[:19]}`  ",
@@ -829,8 +1058,12 @@ def render_analysis(summary: list[dict], manifest: dict, done: dict, plans: dict
         "",
         "One validated plan per (N, repetition) block, produced under the parallel budget and executed by **both** C "
         "and D — so C versus D differs in concurrency alone. Planning cost is charged to the plan-only run below, "
-        "once per block, and is therefore *not* inside any C or D run: a system-level comparison against A/B must add "
-        "it back.",
+        "once per block, and is therefore *not* inside any C or D run. Two readings follow from that (ADR-010): the "
+        "per-run `call_cost_usd` / `machine_s` are **execution-only** — the right C-versus-D contrast, because the "
+        "shared planning component is identical and cancels — while `system_call_cost_usd` / `system_machine_s` add "
+        "the block's planning back and are the numbers to quote against A/B, whose planning is inside their run. C "
+        "and D also execute under what the shared plan *left* of the equal total budget, so no configuration receives "
+        "more than another.",
         "",
         "| N | Rep | Plan | Tasks | Outcome | Planner cost USD | Planner s | Calls | Rejections |",
         "|---:|---:|:---|---:|:---|---:|---:|---:|---:|",
@@ -936,9 +1169,33 @@ def main(argv=None) -> int:
     ap.add_argument("--max-wallclock-s", type=int, default=1800)
     ap.add_argument("--max-replans", type=int, default=1)
     ap.add_argument("--seed", type=int, default=20260817, help="draws the block/config execution order (frozen in the manifest)")
+    ap.add_argument(
+        "--max-total-cost-usd",
+        type=float,
+        default=None,
+        help="aggregate ceiling for the WHOLE matrix (ADR-010); required live. Recomputed from the raw logs before "
+        "every operation, which may only start if the ceiling still covers its own maximum",
+    )
+    ap.add_argument("--pace-s", type=float, default=0.0, help="wait this long between operations (provider pacing)")
+    ap.add_argument("--cooldown-s", type=float, default=60.0, help="wait this long after an infrastructure failure")
+    ap.add_argument(
+        "--max-consecutive-infrastructure",
+        type=int,
+        default=3,
+        help="stop the matrix after this many machinery/provider failures in a row (0 disables the circuit breaker)",
+    )
     args = ap.parse_args(argv)
     if args.repeats < 1:
         ap.error("--repeats must be positive")
+    if args.max_total_cost_usd is not None:
+        if args.max_total_cost_usd <= 0:
+            ap.error("--max-total-cost-usd must be positive")
+        if args.max_total_cost_usd < args.max_cost_usd:
+            # otherwise the admission rule refuses the very first operation: no ceiling can cover one run's maximum
+            ap.error(
+                f"--max-total-cost-usd {args.max_total_cost_usd} is below the per-run --max-cost-usd "
+                f"{args.max_cost_usd}: no operation could ever start"
+            )
     if not args.offline and not args.dry_run:
         missing = [name for name in ("cheap_model", "strong_model", "planner_model", "worker_model") if not getattr(args, name)]
         if missing:
@@ -950,18 +1207,33 @@ def main(argv=None) -> int:
             ap.error("real matrix requires a clean Git tree so results identify exact code (or explicitly use --allow-dirty)")
         if not settings().model_prices.strip() and not args.allow_unpriced:
             ap.error("real matrix requires MAS_MODEL_PRICES so cost is measurable (or explicitly use --allow-unpriced)")
+        if args.max_total_cost_usd is None:
+            ap.error(
+                "real matrix requires --max-total-cost-usd: without an aggregate ceiling the worst case is "
+                f"{len(args.configs) * len(args.widths) * args.repeats} runs + planning rounds at "
+                f"${args.max_cost_usd} each (ADR-010)"
+            )
+        # the request shape is frozen in the manifest, so it must be a deliberate choice before the first block runs
+        if any(str(getattr(args, f"{r}_model") or "").startswith("anthropic:") for r in ("cheap", "strong", "planner", "worker")):
+            if not settings().anthropic_effort.strip():
+                ap.error(
+                    "set MAS_ANTHROPIC_EFFORT explicitly (e.g. 'medium') before a live matrix: reasoning effort drives "
+                    "cost and behavior, it is frozen in experiment.json, and it cannot change mid-experiment (ADR-010)"
+                )
     if args.dry_run:
         manifest = {
             "experiment_id": "dry-run",
             "schedule": build_schedule(list(args.configs), list(args.widths), args.repeats, args.seed),
         }
         rows: list[dict] = []
+        plan_rows: list[dict] = []
         plans: dict[tuple[int, int], dict] = {}
     else:
         args.output.mkdir(parents=True, exist_ok=True)
         try:
-            manifest = open_experiment(args.output, experiment_spec(args))
+            manifest = open_experiment(args.output, experiment_spec(args), spend_cap_usd=args.max_total_cost_usd)
             rows = load_rows(args.output / "runs.jsonl", manifest["experiment_id"])
+            plan_rows = load_rows(args.output / "plans.jsonl", manifest["experiment_id"])
             plans = load_plans(args.output / "plans.jsonl", manifest["experiment_id"])
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             ap.error(str(exc))
@@ -971,8 +1243,13 @@ def main(argv=None) -> int:
     effective, _audit = effective_rows(rows)
     if not args.dry_run:
         plans_dir.mkdir(parents=True, exist_ok=True)
+    cap = manifest.get("spend_cap_usd") if not args.dry_run else args.max_total_cost_usd
+    breaker = {"consecutive": 0}
+    stop_reason: str | None = None
     # the frozen randomized schedule (ADR-009): one (N, repetition) block at a time, its configs in the drawn order
     for block in manifest["schedule"]:
+        if stop_reason:
+            break
         n, repetition, order = int(block["n"]), int(block["repetition"]), list(block["configs"])
         needs_plan = any(c in REPLAY_CONFIGS for c in order)
         plan_file = plans_dir / f"n{n:02d}-r{repetition}.json"
@@ -991,12 +1268,30 @@ def main(argv=None) -> int:
             if effective.get((c, n, repetition)) is None or classify_run(effective[(c, n, repetition)]) == "infrastructure"
         ]
         if needs_plan and any(c in REPLAY_CONFIGS for c in pending):
+            ledger = spend_ledger(rows, plan_rows)
+            owed = pending_operations(manifest["schedule"], effective, plans)
+            line, refusal = spend_admission(
+                ledger,
+                cap,
+                float(args.max_cost_usd),
+                owed,
+                f"plan N={n} repeat={repetition}",
+                stop_on_unpriced=not args.allow_unpriced,
+            )
+            print(line, flush=True)
+            if refusal:
+                stop_reason = refusal
+                break
             produced = block_plan(args, plans, n, repetition, plans_dir)
             if produced is not plans.get((n, repetition)):  # newly produced (or retried): append it to the evidence
                 record = dict(produced, experiment_id=manifest["experiment_id"], git_commit=manifest["git_commit"])
                 plans[(n, repetition)] = record
+                plan_rows.append(record)
                 with plans_jsonl.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(record, default=str) + "\n")
+                stop_reason = after_operation(record.get("outcome") == "client_error", breaker, args)
+                if stop_reason:
+                    break
         plan = plans.get((n, repetition))
         for config in order:
             key = (config, n, repetition)
@@ -1011,14 +1306,37 @@ def main(argv=None) -> int:
                     f"was infrastructure-invalid ({why})",
                     flush=True,
                 )
+            shared = plan if config in REPLAY_CONFIGS else None
+            budgets = execution_budgets(args, shared)
+            executed = False
             if config in REPLAY_CONFIGS and not (plan or {}).get("planned"):
                 row = plan_failure_row(config, n, repetition, plan or {})
                 print(f"[skip] {config} N={n} repeat={repetition}: no shared plan ({row['verdict']})", flush=True)
+            elif min(budgets["max_tokens"], budgets["max_cost_usd"], budgets["max_wallclock_s"]) <= 0:
+                row = budget_exhausted_row(config, n, repetition, plan or {}, budgets)
+                print(f"[skip] {config} N={n} repeat={repetition}: {row['verdict']} ({budgets})", flush=True)
             else:
-                row = run_one(command(args, config, n, fixture, plan_file), config=config, n=n, repetition=repetition)
+                ledger = spend_ledger(rows, plan_rows)
+                owed = pending_operations(manifest["schedule"], effective, plans)
+                line, refusal = spend_admission(
+                    ledger,
+                    cap,
+                    float(budgets["max_cost_usd"]),
+                    owed,
+                    f"{config} N={n} repeat={repetition}",
+                    stop_on_unpriced=not args.allow_unpriced,
+                )
+                print(line, flush=True)
+                if refusal:
+                    stop_reason = refusal
+                    break
+                row = run_one(command(args, config, n, fixture, plan_file, budgets), config=config, n=n, repetition=repetition)
+                executed = True
+                row["execution_budgets"] = budgets
                 if config in REPLAY_CONFIGS:
                     row["plan_sha256"] = (plan or {}).get("plan_sha256")
                     row["plan_tasks"] = (plan or {}).get("tasks")
+            attach_system_totals(row, shared)
             row["experiment_id"] = manifest["experiment_id"]
             row["git_commit"] = manifest["git_commit"]
             row["suite_sha256"] = manifest["spec"]["suite_sha256"][str(n)]
@@ -1030,6 +1348,10 @@ def main(argv=None) -> int:
             effective[key] = row
             with jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, default=str) + "\n")
+            if executed:  # only a real operation paces or trips the breaker; bookkeeping rows called no provider
+                stop_reason = after_operation(classify_run(row) == "infrastructure", breaker, args)
+                if stop_reason:
+                    break
     if args.dry_run:
         return 0
     summary = aggregate(rows)
@@ -1056,13 +1378,23 @@ def main(argv=None) -> int:
     )
     (args.output / "completion.json").write_text(json.dumps(done, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_analysis(summary, manifest, done, plans, args.output / "analysis.md")
+    ledger = spend_ledger(rows, plan_rows)
     print(
         f"\nresults: {args.output} ({done['effective_runs']}/{done['expected_runs']} effective runs, {len(rows)} rows; "
         f"evidence_complete={done['evidence_complete']}; all_passed={done['all_passed']}; "
         f"failure_classes={done['failure_classes']}; needing_rerun={len(done['keys_needing_rerun'])})"
     )
+    print(
+        f"spend: ${ledger['spent_usd']:.4f} billed over {ledger['operations']} recorded operation(s)"
+        + (f" of a ${float(cap):.4f} ceiling" if cap is not None else " (no ceiling configured)")
+        + (f"; {ledger['unpriced_operations']} with unknown cost" if ledger["unpriced_operations"] else "")
+    )
     if done["keys_needing_rerun"]:
         print("infrastructure-invalid cells will be rerun on the next invocation with the same arguments")
+    if stop_reason:
+        print(f"\n[stop] {stop_reason}")
+        print("the experiment is resumable: nothing was discarded, rerun the same command to continue")
+        return 1
     # A model/task failure is valid experimental data. Missing/duplicate/infrastructure/unpriced evidence is not.
     return 0 if done["evidence_complete"] else 1
 

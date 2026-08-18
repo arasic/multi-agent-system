@@ -1,6 +1,10 @@
 # 009 — Paired C/D evidence: one plan per (N, repetition), replayed; plan-only runs
 Status: Accepted
 Date: 2026-08-17
+Amended by: [ADR-010](010-unattended-experiment-protocol.md) — §3's "planning cost sits in neither C nor D" now has a
+second, recorded reading (`system_*` columns add it back for the A/B comparison, and C/D execute under what the shared
+plan *left* of the equal total budget); §6's schedule is additionally audited against the rows; a plan-only run that
+ends because the planner asked a question is an experimental outcome under the unattended-M3 policy.
 
 ## Context
 [evaluation.md §3](../evaluation.md) says C isolates "decomposition without parallelism" and D "full MAS", and that
