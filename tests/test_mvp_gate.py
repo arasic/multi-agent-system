@@ -6,7 +6,9 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -183,6 +185,14 @@ def _write_live_and_distributed(live: Path, distributed: Path) -> None:
             ],
             "manual_contract_approval": True,
             "ping": _ping_record(),
+            # the append-only record of what the four stages actually cost (ADR-010)
+            "ledger": [
+                {"at": "t0", "step": "ping", "kind": "ping", "cost_usd": 0.0004, "priced": True},
+                *[
+                    {"at": f"t-{s}", "step": s, "kind": "run", "cost_usd": 1.5, "priced": True}
+                    for s in ("worker", "planner", "repair")
+                ],
+            ],
             "git": {"commit": COMMIT, "dirty": False},
         },
     )
@@ -842,6 +852,7 @@ def test_crossover_requires_parallel_to_preserve_success_and_improve_the_metric(
 
 _LIVE_SETUP = {
     "workers": 3,
+    "ping_max_tokens": 64,
     "max_concurrency": 3,
     "lease_s": 15,
     "max_wallclock_s": 1800,
@@ -878,10 +889,22 @@ def _live_evidence(**overrides) -> dict:
         "request_shape": dict(_LIVE_SHAPE),
         "steps": {},
         "runs": [],
+        "ledger": [],
         "complete": False,
     }
     base.update(overrides)
     return base
+
+
+def _charge(step: str, cost: float | None = 1.5, *, priced: bool = True, kind: str = "run", **extra) -> dict:
+    """One entry of the append-only spend ledger, as `live_smoke._charge` writes it."""
+    return {"at": f"t-{step}", "step": step, "kind": kind, "cost_usd": cost, "priced": priced, **extra}
+
+
+def _ledger_args(evidence: dict, **overrides) -> argparse.Namespace:
+    base = dict(evidence=evidence, max_cost_usd=10.0, max_total_cost_usd=30.0)
+    base.update(overrides)
+    return argparse.Namespace(**base)
 
 
 def test_live_smoke_resume_carries_passed_stages_only_from_identical_setup():
@@ -892,7 +915,7 @@ def test_live_smoke_resume_carries_passed_stages_only_from_identical_setup():
     merged, skip, refusal = live_smoke.merge_resume(previous, _live_evidence(started_at="t1"))
     assert refusal is None and skip == ["ping", "worker"]
     assert merged["steps"] == {"ping": True, "worker": True} and [r["step"] for r in merged["runs"]] == ["worker"]
-    assert merged["resumed_from"] == {"started_at": "t0", "steps": ["ping", "worker"]}
+    assert merged["resumed_from"] == {"started_at": "t0", "steps": ["ping", "worker"], "charges_carried": 0}
 
     for change in (
         {"git": {"commit": "other", "dirty": False}},
@@ -910,6 +933,7 @@ def test_live_smoke_resume_carries_passed_stages_only_from_identical_setup():
         {"setup": {**_LIVE_SETUP, "workers": 1}},
         {"setup": {**_LIVE_SETUP, "max_concurrency": 1}},
         {"setup": {**_LIVE_SETUP, "max_replans": 2}},
+        {"setup": {**_LIVE_SETUP, "ping_max_tokens": 128}},  # the ping's own ceiling decides what that stage costs
         {"setup": None},
         # a stage that passed at another reasoning effort (or timeout/retry shape) cost something else and may well
         # have behaved differently — it is not evidence for this one (ADR-010)
@@ -934,11 +958,13 @@ def test_live_smoke_evidence_records_the_full_experimental_setup(monkeypatch):
         max_attempt_tokens=250_000,
         max_cost_usd=10.0,
         max_replans=1,
+        ping_max_tokens=64,
     )
     from dataclasses import asdict
 
     setup = live_smoke._setup(args)
-    assert setup == {"workers": 3, **asdict(live_smoke._budgets(args))}  # every Budgets field, not a hand-picked few
+    # every Budgets field, not a hand-picked few — plus the ping's own output ceiling, which decides its cost
+    assert setup == {"workers": 3, "ping_max_tokens": 64, **asdict(live_smoke._budgets(args))}
     assert {"workers", "max_concurrency", "max_tokens", "max_attempt_tokens", "max_cost_usd", "max_wallclock_s"} <= set(setup)
     assert {"max_attempt_runtime_s", "max_replans", "max_attempts_per_task", "lease_s"} <= set(setup)
     assert live_smoke._price_snapshot() == {"m": [1.0, 2.0]}
@@ -1016,27 +1042,28 @@ def test_four_separate_invocations_accumulate_into_one_complete_evidence_file():
     `--step worker --resume` carried only what it re-requested, so the paid ping was deleted on the way to the worker
     stage."""
     stored = _live_evidence(steps={}, runs=[])
-    ledger = argparse.Namespace(max_cost_usd=10.0, max_total_cost_usd=30.0)
 
     for step in live_smoke.ALL_STEPS:
         current = _live_evidence(started_at=f"t-{step}", requested_steps=[step])
         merged, skip, refusal = live_smoke.merge_resume(stored, current)
         assert refusal is None and skip == []  # this stage has not passed before, so it runs
-        # ...the stage runs and records itself
+        # ...the stage runs, charges the ledger and records itself
         merged["steps"][step] = True
         if step == "ping":
             merged["ping"] = _ping_record()
+            merged["ledger"].append(_charge("ping", 0.0004, kind="ping"))
         else:
             merged["runs"].append({"step": step, "status": "PASSED", "priced": True, "metrics": {"call_cost_usd": 1.5}})
+            merged["ledger"].append(_charge(step))
         stored = merged
 
     assert stored["steps"] == {s: True for s in live_smoke.ALL_STEPS}  # four passed stages
     assert [r["step"] for r in stored["runs"]] == ["worker", "planner", "repair"]  # three runs
     assert stored["ping"] == _ping_record()  # one ping, carried through three later invocations
-    ledger.evidence = stored
-    spend = live_smoke._spend(ledger)
+    spend = live_smoke._spend(_ledger_args(stored))
     assert spend["billed_usd"] == round(0.0004 + 4.5, 6)  # the ping billed once, not four times
     assert spend["by_step"] == {"ping": 0.0004, "worker": 1.5, "planner": 1.5, "repair": 1.5}
+    assert spend["operations"] == 4
 
     # a fifth invocation of an already-passed stage skips it instead of paying again
     _, skip, refusal = live_smoke.merge_resume(stored, _live_evidence(started_at="t5", requested_steps=["worker"]))
@@ -1058,21 +1085,134 @@ def test_a_failed_stage_is_never_carried_forward_as_passed():
     assert [r["step"] for r in merged["runs"]] == ["worker"] and merged["ping"] == _ping_record()
 
 
+# --------------------------------------------------------------- ADR-010: money spent vs stage qualified
+
+
+def test_a_failed_stages_cost_survives_the_resume_that_retries_it():
+    """The one that would have burned real money: a $5 planner attempt that fails is still $5. If resume rebuilt the
+    total from the stages that *passed*, that charge would vanish and the retry could cross the ceiling unnoticed."""
+    previous = _live_evidence(
+        steps={"ping": True, "worker": True, "planner": False},
+        ping=_ping_record(),
+        runs=[{"step": "worker", "status": "PASSED", "priced": True}],
+        ledger=[_charge("ping", 0.0004, kind="ping"), _charge("worker", 2.0), _charge("planner", 5.0, status="FAILED")],
+    )
+    merged, skip, refusal = live_smoke.merge_resume(previous, _live_evidence(started_at="t1", requested_steps=["planner"]))
+    assert refusal is None and skip == []  # the planner runs again...
+    assert "planner" not in merged["steps"]  # ...it did not qualify...
+    assert [e["step"] for e in merged["ledger"]] == ["ping", "worker", "planner"]  # ...but its $5 is still on the books
+    assert live_smoke._spend(_ledger_args(merged))["billed_usd"] == round(0.0004 + 7.0, 6)
+    assert merged["resumed_from"]["charges_carried"] == 3
+
+    # and the retry is admitted against a total that includes it
+    args = _ledger_args(merged, max_total_cost_usd=8.0)
+    stop = live_smoke._admit(args, "planner")
+    assert stop and "does not cover another $10.0000" in stop
+
+
+def test_every_attempt_is_charged_while_only_a_qualifying_pass_satisfies_the_stage():
+    evidence = _live_evidence(
+        steps={"worker": True},
+        runs=[{"step": "worker", "status": "PASSED", "priced": True}],
+        ledger=[
+            _charge("worker", 3.0, status="FAILED", run_id="r1"),
+            _charge("worker", 2.0, status="ABORTED", run_id="r2"),
+            _charge("worker", 4.0, status="PASSED", run_id="r3"),
+        ],
+    )
+    spend = live_smoke._spend(_ledger_args(evidence))
+    assert spend["billed_usd"] == 9.0 and spend["operations"] == 3  # three attempts, all billed
+    assert spend["by_step"] == {"worker": 9.0}
+    assert evidence["steps"] == {"worker": True} and len(evidence["runs"]) == 1  # one qualifying pass
+
+
+def test_a_charge_with_no_stage_flag_is_still_accounted_for():
+    """A run that ended without qualifying anything — a crash between the charge and the stage flag, an aborted
+    planner — must not disappear from the total."""
+    evidence = _live_evidence(steps={}, runs=[], ledger=[_charge("planner", 6.25, status="ABORTED", run_id="r9")])
+    assert live_smoke._spend(_ledger_args(evidence))["billed_usd"] == 6.25
+    merged, _, refusal = live_smoke.merge_resume(evidence, _live_evidence(started_at="t1"))
+    assert refusal is None and live_smoke._spend(_ledger_args(merged))["billed_usd"] == 6.25
+
+
+def test_unpriced_charges_stay_visible_make_the_total_a_floor_and_fail_the_gate(tmp_path: Path):
+    evidence = _live_evidence(
+        ledger=[_charge("worker", 2.0), _charge("planner", None, priced=False, unpriced_calls=4, status="FAILED")]
+    )
+    spend = live_smoke._spend(_ledger_args(evidence))
+    assert spend["billed_usd"] == 2.0  # a floor, not a total
+    assert spend["unpriced_calls"] == 4 and spend["by_step"] == {"worker": 2.0, "planner": None}
+
+    live, distributed, bench = tmp_path / "live.json", tmp_path / "distributed.json", tmp_path / "bench"
+    _write_live_and_distributed(live, distributed)
+    _write_matrix(bench, _rows())
+    complete = json.loads(live.read_text(encoding="utf-8"))
+    complete["ledger"] = [_charge("ping", 0.0004, kind="ping"), *[_charge(s) for s in ("worker", "planner", "repair")]]
+    _write(live, complete)
+    assert not _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+    complete["ledger"].append(_charge("repair", None, priced=False, status="FAILED"))
+    _write(live, complete)
+    assert "live.attempts_audited" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+    del complete["ledger"]  # no ledger at all: the gate cannot tell what the evidence cost
+    _write(live, complete)
+    assert "live.attempts_audited" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+
+def test_existing_output_is_never_overwritten_without_resume(tmp_path: Path, monkeypatch, capsys):
+    """Even a *failed preflight* writes this file, so the refusal has to come before preflight — and long before a
+    provider is contacted."""
+    paid = tmp_path / "live-smoke.json"
+    paid.write_text(json.dumps(_live_evidence(steps={"ping": True}, ping=_ping_record())), encoding="utf-8")
+    before = paid.read_text(encoding="utf-8")
+    called: list[str] = []
+    monkeypatch.setattr(live_smoke, "_preflight", lambda args: called.append("preflight") or [])
+    monkeypatch.setattr(live_smoke.cli, "ping_spec", lambda *a, **kw: called.append("model") or _ping_record())
+
+    with pytest.raises(SystemExit):
+        live_smoke.main(["--worker", "p:w", "--step", "ping", "--output", str(paid)])
+    assert called == []  # neither the preflight nor the provider was reached
+    assert paid.read_text(encoding="utf-8") == before  # ...and the paid evidence is untouched
+    assert "already exists" in capsys.readouterr().err
+
+
+def test_waiting_for_a_human_ticks_the_run_so_its_budget_can_end_it(monkeypatch):
+    """I-4/ADR-006: a forgotten `mas approve` costs one wall-clock budget, not an unbounded process. Polling the row
+    (what this did before) never enforces the budget, because nobody else is ticking this run.
+    `tests/test_questions.py::test_waiting_for_a_human_is_bounded_by_the_clock` proves the tick itself aborts it."""
+    from mas.models.enums import RunStatus
+
+    waiting = SimpleNamespace(status=RunStatus.AWAITING_INPUT, verdict=None, verdict_reason=None)
+    aborted = SimpleNamespace(status=RunStatus.ABORTED, verdict="ABORTED:wall-clock", verdict_reason="BUDGET_EXHAUSTED")
+    ticks: list[str] = []
+
+    def fake_tick(conn, run_id, **kw):
+        ticks.append("tick")
+        return waiting if len(ticks) < 3 else aborted
+
+    monkeypatch.setattr(live_smoke.scheduler, "tick", fake_tick)
+    monkeypatch.setattr(live_smoke.cli, "_workspace", lambda kind: None)
+    monkeypatch.setattr(live_smoke.time, "sleep", lambda s: None)
+    run = live_smoke._await_human(object(), uuid.uuid4(), planner=None, what="`mas approve`", poll_s=0)
+    assert run is aborted and len(ticks) == 3  # it ticked the canonical scheduler until the run left AWAITING_INPUT
+
+
 def test_a_paid_ping_is_carried_forward_exactly_once_and_never_billed_twice():
-    previous = _live_evidence(steps={"ping": True}, ping=_ping_record())
+    previous = _live_evidence(steps={"ping": True}, ping=_ping_record(), ledger=[_charge("ping", 0.0004, kind="ping")])
     merged, skip, refusal = live_smoke.merge_resume(previous, _live_evidence(started_at="t1"))
     assert refusal is None and skip == ["ping"] and merged["ping"] == previous["ping"]
-    args = argparse.Namespace(evidence=merged, max_total_cost_usd=30.0, max_cost_usd=10.0)
-    assert live_smoke._spend(args)["billed_usd"] == 0.0004  # counted once, from the carried record
+    assert live_smoke._spend(_ledger_args(merged))["billed_usd"] == 0.0004  # counted once, from the carried ledger
 
-    # a ping that is going to be re-run must not carry the earlier charge into the new evidence
-    stale = _live_evidence(steps={"worker": True}, ping=_ping_record())
+    # the ping's stage evidence follows its stage; its charge stays either way (money is not a stage property)
+    stale = _live_evidence(steps={"worker": True}, ping=_ping_record(), ledger=[_charge("ping", 0.0004, kind="ping")])
     merged, skip, _ = live_smoke.merge_resume(stale, _live_evidence(started_at="t1"))
     assert skip == ["worker"] and "ping" not in merged
+    assert live_smoke._spend(_ledger_args(merged))["billed_usd"] == 0.0004
 
 
 def test_an_exhausted_smoke_ceiling_stops_even_the_ping():
-    args = _ping_args(max_total_cost_usd=1.0, evidence={"runs": [{"step": "worker", "metrics": {"call_cost_usd": 1.0}}]})
+    args = _ledger_args(_live_evidence(ledger=[_charge("worker", 1.0)]), max_total_cost_usd=1.0)
     assert live_smoke._admit(args, "ping").startswith("the $1.0000 smoke ceiling is already spent")
     args.max_total_cost_usd = 1.5  # any headroom admits it; its cost is billed afterwards like everything else
     assert live_smoke._admit(args, "ping") is None
@@ -1101,14 +1241,17 @@ def test_mvp_gate_rejects_evidence_whose_ping_was_unpriced_or_simply_absent(tmp_
 
 def test_live_smoke_is_bounded_as_a_whole_and_reports_what_each_stage_cost(capsys):
     """The smoke is the first thing that spends money and the run that tells you what a run costs (ADR-010)."""
-    args = argparse.Namespace(max_cost_usd=10.0, max_total_cost_usd=30.0, evidence={"runs": []})
-    assert live_smoke._spend(args) == {"billed_usd": 0.0, "unpriced_calls": 0, "ceiling_usd": 30.0, "by_step": {}}
+    args = _ledger_args(_live_evidence())
+    assert live_smoke._spend(args) == {
+        "billed_usd": 0.0,
+        "unpriced_calls": 0,
+        "ceiling_usd": 30.0,
+        "operations": 0,
+        "by_step": {},
+    }
     assert live_smoke._admit(args, "worker") is None
 
-    args.evidence["runs"] = [
-        {"step": "worker", "metrics": {"call_cost_usd": 4.25, "unpriced_calls": 0}},
-        {"step": "planner", "metrics": {"call_cost_usd": 6.5, "unpriced_calls": 0}},
-    ]
+    args.evidence["ledger"] = [_charge("worker", 4.25), _charge("planner", 6.5)]
     spend = live_smoke._spend(args)
     assert spend["billed_usd"] == 10.75 and spend["by_step"] == {"worker": 4.25, "planner": 6.5}
     assert live_smoke._admit(args, "repair") is None
@@ -1119,7 +1262,7 @@ def test_live_smoke_is_bounded_as_a_whole_and_reports_what_each_stage_cost(capsy
     assert live_smoke._admit(args, "ping") is None  # one metered call is never worth refusing
 
     # an unpriced stage makes the total a floor: reported, never folded in as zero
-    args.evidence["runs"].append({"step": "repair", "metrics": {"call_cost_usd": None, "unpriced_calls": 3}})
+    args.evidence["ledger"].append(_charge("repair", None, priced=False, unpriced_calls=3))
     spend = live_smoke._spend(args)
     assert spend["billed_usd"] == 10.75 and spend["unpriced_calls"] == 3 and spend["by_step"]["repair"] is None
     capsys.readouterr()

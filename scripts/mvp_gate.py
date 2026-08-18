@@ -339,6 +339,9 @@ def evaluate(
     runs = live.get("runs") if isinstance(live.get("runs"), list) else []
     steps = live.get("steps") if isinstance(live.get("steps"), dict) else {}
     ping = live.get("ping") if isinstance(live.get("ping"), dict) else None
+    # the append-only record of every billable operation, including the ones that did not qualify a stage (ADR-010):
+    # a gate that only ever sees successful runs cannot tell what the evidence actually cost
+    ledger = live.get("ledger") if isinstance(live.get("ledger"), list) else []
     checks = [
         Check("live.complete", live.get("complete") is True, f"steps={steps}"),
         Check(
@@ -364,6 +367,20 @@ def evaluate(
             and ping.get("priced") is True,
             "every live run must have known model prices, and the ping must be on record and priced"
             + ("" if isinstance(ping, dict) else " (no ping telemetry in the evidence)"),
+        ),
+        Check(
+            "live.attempts_audited",
+            bool(ledger)
+            and len(ledger) >= len(runs) + (1 if ping else 0)
+            and all(isinstance(e, dict) and e.get("priced") is True for e in ledger),
+            f"{len(ledger)} billable operation(s) on record, all priced"
+            if ledger and all(isinstance(e, dict) and e.get("priced") is True for e in ledger)
+            else (
+                "no spend ledger in the evidence (every paid operation must be recorded, qualifying or not)"
+                if not ledger
+                else f"{sum(1 for e in ledger if not (isinstance(e, dict) and e.get('priced') is True))} "
+                "operation(s) of unknown cost in the ledger"
+            ),
         ),
         Check(
             "live.manual_contract_approval",

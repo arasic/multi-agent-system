@@ -184,6 +184,7 @@ prices, budgets):
 python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m> --no-auto-approve \
     --max-cost-usd <frozen> --max-total-cost-usd <frozen> --output mvp-evidence/live-smoke.json --step ping
 mas models --probe-tools --spec <p>:<m> --json          # two-turn tool continuation, billed separately
+docker compose exec -T worker mas models --probe-tools --spec openai:<m> --json   # ...across the gateway (no host port)
 python scripts/live_smoke.py ...same arguments... --step worker  --resume
 python scripts/live_smoke.py ...same arguments... --step planner --resume
 python scripts/live_smoke.py ...same arguments... --step repair  --resume

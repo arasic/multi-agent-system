@@ -59,6 +59,12 @@ that change, plus two protocol gaps, that would each have corrupted the evidence
    ceiling is crossed by at most one small call, never bypassed. `live_smoke.py --step ping` is therefore *the*
    first paid call; `mas models --ping` is a diagnostic that bills separately and is recorded nowhere, so running
    both means paying twice for the same proof.
+   **Spend is an append-only ledger, separate from qualification.** `evidence["ledger"]` records every billable
+   operation as it happens — the ping, every run, failures, aborts and retries alike — and resume carries it whole,
+   while `steps`/`runs` carry only what qualified. A failed $5 planner attempt stays $5 on resume: rebuilding the
+   total from the stages that passed would let a retry cross the ceiling unseen. The charge is written *before* the
+   stage outcome, so a crash between the two loses the flag, never the money, and the gate audits the ledger
+   (`live.attempts_audited`): present, covering every run, and every entry priced.
 5. **Pacing and a circuit breaker.** `--pace-s` between operations, `--cooldown-s` after a machinery failure, and a
    stop after `--max-consecutive-infrastructure` (default 3) in a row, with the reason printed. Stopping never
    discards anything: rerunning the same command resumes.
@@ -95,6 +101,13 @@ that change, plus two protocol gaps, that would each have corrupted the evidence
   A/B. Both are out of MVP scope.
 - On a filesystem without advisory locking, runs now fail instead of racing. That is a real behavioural regression for
   exotic bind mounts, and the error says exactly what to change.
+- A human who never answers `mas approve` / `mas answer` now costs one wall-clock budget instead of an unbounded
+  process: the smoke's wait drives `scheduler.tick`, so I-4 is enforced by the same code path the orchestrator uses
+  and the run ends `ABORTED`/`BUDGET_EXHAUSTED` on its own clock (ADR-006 always said the clock runs; nothing was
+  ticking it here).
+- Evidence files are never overwritten. `--output` that exists is refused before the preflight — which itself writes
+  the file — so an unrelated preflight failure cannot erase a paid result. A separate experiment takes a separate
+  path; a continuation takes `--resume`.
 - `mas models --probe-tools` exists so the riskiest live path — model → tool call → tool result → **second** call — is
   proven for two small calls instead of being discovered mid-run. Our replay of the assistant turn is regression-tested
   only against SDK-shaped doubles; the probe is what tests it against a real API, and it reports the reported model id

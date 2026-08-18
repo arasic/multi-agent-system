@@ -125,13 +125,18 @@ was paid for under different settings, so the ping already carries the planner m
 python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m> --no-auto-approve \
     --max-cost-usd <frozen> --max-total-cost-usd <frozen> --output mvp-evidence/live-smoke.json --step ping
 .venv/Scripts/mas models --probe-tools --spec <p>:<m> --max-tokens 64 --json   # two-turn continuation (<=2 calls, billed separately)
-.venv/Scripts/mas models --probe-tools --spec openai:<m> --json  # ...the same exchange across the gateway
+docker compose exec -T worker mas models --probe-tools --spec openai:<m> --json  # the same exchange ACROSS the gateway
 python scripts/live_smoke.py ...same arguments... --step worker  --resume      # then inspect
 python scripts/live_smoke.py ...same arguments... --step planner --resume      # `mas approve <run>` from another terminal
 python scripts/live_smoke.py ...same arguments... --step repair  --resume
 python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-smoke.json \
     --result mvp-evidence/distributed-live-result                # a fresh --result path: exports are never overwritten
 ```
+
+The gateway probe must run **inside** the backend network: `gateway` publishes no host port, and `MAS_OPENAI_BASE_URL`
+on the host points at the vendor — so `mas models --probe-tools --spec openai:<m>` from your shell would silently test
+the vendor directly and prove nothing about the gateway. Run it in the `worker` container (which has
+`MAS_OPENAI_BASE_URL=http://gateway:8080/v1` and the gateway token), with the stack up.
 
 Stages accumulate into one evidence file: what passed (with its runs and the paid ping) is carried forward, `complete`
 turns true only when all four have passed, and the exit code speaks for *that* command — a green `--step ping` says

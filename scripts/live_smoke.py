@@ -139,36 +139,54 @@ def _request_shape() -> dict:
 
 
 def _setup(args: argparse.Namespace) -> dict:
-    """Everything about the experimental setup that decides how a stage runs (identical for a resume to count)."""
-    return {"workers": args.workers, **asdict(_budgets(args))}
+    """Everything about the experimental setup that decides how a stage runs (identical for a resume to count) —
+    including the ping's own output ceiling, which decides what that stage costs."""
+    return {"workers": args.workers, "ping_max_tokens": args.ping_max_tokens, **asdict(_budgets(args))}
+
+
+def _charge(args: argparse.Namespace, *, step: str, kind: str, cost_usd: float | None, priced: bool, **extra) -> dict:
+    """Append one paid operation to the **append-only ledger** and persist the evidence immediately.
+
+    Money spent and stage qualified are different facts. A planner attempt that costs $5 and then fails still cost $5:
+    if resume rebuilt the total from the stages that *passed*, that $5 would vanish and the operator could retry past
+    the ceiling they set (ADR-010). So every billable operation lands here as it happens — successes, failures,
+    infrastructure errors, retries, the ping — and nothing is ever removed. `steps`/`runs` answer "is this stage done";
+    only this ledger answers "what has this cost". Writing it before the caller records the stage outcome also means a
+    crash between the two loses the flag, never the charge."""
+    entry = {
+        "at": datetime.now(UTC).isoformat(),
+        "step": step,
+        "kind": kind,  # ping | run
+        "cost_usd": cost_usd,
+        "priced": bool(priced),
+        **extra,
+    }
+    args.evidence.setdefault("ledger", []).append(entry)
+    args.evidence["spend"] = _spend(args)
+    _write_evidence(args)
+    return entry
 
 
 def _spend(args: argparse.Namespace) -> dict:
-    """What this smoke has been billed so far, from the metered telemetry of the stages on record (ADR-010).
+    """What this smoke has been billed, computed from the whole ledger — every attempt, not only the ones that counted.
 
-    Carried-forward stages count: their calls were paid for, even if in an earlier invocation. A stage with unpriced
-    calls makes the total a floor, so it is reported separately rather than folded in as zero. The ping has no run, so
-    it is recorded under `ping` rather than in `runs` — but its one call is billed and counted here like any other."""
+    An operation with unpriced calls makes the total a **floor**: it is reported separately and never folded in as
+    zero, and its stage's per-stage figure becomes null rather than a number that understates."""
     billed, unpriced, by_step = 0.0, 0, {}
-    ping = args.evidence.get("ping")
-    if isinstance(ping, dict) and ping.get("calls"):
-        if ping.get("priced"):
-            billed += float(ping.get("cost_usd") or 0.0)
-            by_step["ping"] = round(float(ping.get("cost_usd") or 0.0), 8)
+    for entry in args.evidence.get("ledger", []):
+        step = entry.get("step")
+        if entry.get("priced") and entry.get("cost_usd") is not None:
+            billed += float(entry["cost_usd"])
+            if by_step.get(step, 0.0) is not None:
+                by_step[step] = round(by_step.get(step, 0.0) + float(entry["cost_usd"]), 8)
         else:
-            unpriced += len(ping["calls"])
-            by_step["ping"] = None
-    for record in args.evidence.get("runs", []):
-        m = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
-        cost, unknown = m.get("call_cost_usd"), int(m.get("unpriced_calls") or 0)
-        if cost is not None and not unknown:
-            billed += float(cost)
-        unpriced += unknown
-        by_step[record.get("step")] = None if unknown else round(float(cost or 0.0), 6)
+            unpriced += int(entry.get("unpriced_calls") or 1)
+            by_step[step] = None  # unknown cost in this stage: no honest number to show
     return {
         "billed_usd": round(billed, 6),
         "unpriced_calls": unpriced,
         "ceiling_usd": args.max_total_cost_usd,
+        "operations": len(args.evidence.get("ledger", [])),
         "by_step": by_step,
     }
 
@@ -219,12 +237,20 @@ def merge_resume(previous: dict, current: dict) -> tuple[dict, list[str], str | 
     merged = dict(current)
     merged["steps"] = {s: True for s in carried}
     merged["runs"] = [r for r in prev_runs if isinstance(r, dict) and r.get("step") in carried]
-    # the ping was paid for once; it travels with its stage so the ledger neither loses it nor bills it twice
+    # The ledger is carried WHOLE — every earlier charge, including the failed and abandoned stages whose runs are not
+    # carried. Qualification is per stage; spend is cumulative and irreversible (ADR-010). Dropping a failed stage's
+    # cost here is how a retry would quietly exceed the ceiling the operator set.
+    merged["ledger"] = [dict(e) for e in (previous.get("ledger") or []) if isinstance(e, dict)]
+    # the ping's stage evidence travels with its stage; its *charge* is in the ledger either way
     if "ping" in carried and isinstance(previous.get("ping"), dict):
         merged["ping"] = previous["ping"]
     else:
         merged.pop("ping", None)
-    merged["resumed_from"] = {"started_at": previous.get("started_at"), "steps": carried}
+    merged["resumed_from"] = {
+        "started_at": previous.get("started_at"),
+        "steps": carried,
+        "charges_carried": len(merged["ledger"]),
+    }
     return merged, skip, None
 
 
@@ -283,6 +309,18 @@ def step_ping(args: argparse.Namespace) -> bool:
     _hr(f"1/4 ping  {args.worker}")
     record = cli.ping_spec(args.worker, role="worker", max_tokens=args.ping_max_tokens)
     args.evidence["ping"] = record
+    if record["calls"]:  # a call that reached the provider is billable whether or not the stage qualifies
+        _charge(
+            args,
+            step="ping",
+            kind="ping",
+            cost_usd=record["cost_usd"],
+            priced=record["priced"],
+            models=record["models"],
+            calls=len(record["calls"]),
+            ok=record["ok"],
+            unpriced_calls=sum(1 for c in record["calls"] if not c.get("priced")),
+        )
     if record["ok"]:
         print(f"{args.worker}: {record.get('stop_reason')} {record.get('text', '')!r}")
     else:
@@ -344,6 +382,36 @@ class InducedFirstFail:
         )
 
 
+def _record_run(args: argparse.Namespace, run_id, *, step: str, status: str, metrics_obj, verdict=None, verdict_reason=None):
+    """One executed run: its charge in the ledger, its outcome in `runs`. Both, whatever the verdict — a run that
+    failed or was aborted still called the model, and both facts are evidence."""
+    priced = metrics_obj.unpriced_calls == 0
+    _charge(
+        args,
+        step=step,
+        kind="run",
+        cost_usd=metrics_obj.call_cost_usd if priced else None,
+        priced=priced,
+        run_id=str(run_id),
+        status=status,
+        verdict_reason=verdict_reason,
+        model_calls=metrics_obj.model_calls,
+        unpriced_calls=metrics_obj.unpriced_calls,
+    )
+    args.evidence["runs"].append(
+        {
+            "step": step,
+            "run_id": str(run_id),
+            "status": status,
+            "verdict": verdict,
+            "verdict_reason": verdict_reason,
+            "priced": priced,
+            "metrics": metrics_obj.as_dict(),
+        }
+    )
+    _write_evidence(args)
+
+
 def _execute(conn, run_id, *, args: argparse.Namespace, planner, evidence_step: str, verifier=None) -> tuple[RunStatus, bool]:
     """Workers (in-process threads, LLM agent, sandboxed command tools) + orchestrator loop with the real verifier."""
     caps = set(settings().worker_capabilities)
@@ -391,18 +459,17 @@ def _execute(conn, run_id, *, args: argparse.Namespace, planner, evidence_step: 
         print(f"  {w.worker_id}: claimed={s.claimed} completed={s.completed} failed={s.failed} stale={s.stale}")
     print(f"  mas status {run_id} | mas replay {run_id} | mas artifacts {run_id}")
     priced = m.unpriced_calls == 0
-    args.evidence["runs"].append(
-        {
-            "step": evidence_step,
-            "run_id": str(run_id),
-            "status": final.status.value,
-            "verdict": final.verdict,
-            "verdict_reason": final.verdict_reason,
-            "priced": priced,
-            "metrics": m.as_dict(),
-        }
+    # charge FIRST: the money is spent whatever the verdict, and a crash before the stage flag is written must lose
+    # the flag, never the charge
+    _record_run(
+        args,
+        run_id,
+        step=evidence_step,
+        status=final.status.value,
+        metrics_obj=m,
+        verdict=final.verdict,
+        verdict_reason=final.verdict_reason,
     )
-    _write_evidence(args)
     if not priced and not args.allow_unpriced:
         print("completion gate failed: this run contains unpriced model calls", file=sys.stderr)
     return final.status, priced or args.allow_unpriced
@@ -418,6 +485,25 @@ def step_worker(args: argparse.Namespace) -> bool:
     print(f"run {run.id}  ({len(dag.tasks)} tasks)")
     status, priced = _execute(conn, run.id, args=args, planner=None, evidence_step="worker")
     return status is RunStatus.PASSED and priced
+
+
+def _await_human(conn, run_id, *, planner, what: str, poll_s: float = 2.0):
+    """Wait for `mas approve` / `mas answer` **on the run's clock** (I-4, ADR-006).
+
+    Polling the row would let a forgotten approval wait forever: a run's wall-clock budget is only enforced when
+    somebody ticks it, and nobody else is ticking this run. So the wait drives the canonical scheduler — the same
+    `scheduler.tick` the orchestrator uses — and returns the moment the run leaves `AWAITING_INPUT`, including when
+    its own budget ended it (`ABORTED` / `BUDGET_EXHAUSTED`). A human who never answers costs one wall-clock budget,
+    not an unbounded process."""
+    caps = set(settings().worker_capabilities)
+    ws = cli._workspace("git")
+    while True:
+        run = scheduler.tick(conn, run_id, planner=planner, capabilities=caps, workspace=ws)
+        if run.status is not RunStatus.AWAITING_INPUT:
+            if run.status.terminal:
+                print(f"\nthe run ended while waiting for {what}: {run.status.value} {run.verdict}", file=sys.stderr)
+            return run
+        time.sleep(poll_s)
 
 
 def step_planner(args: argparse.Namespace) -> bool:
@@ -436,8 +522,18 @@ def step_planner(args: argparse.Namespace) -> bool:
             print(json.dumps(prop["proposal"], indent=2)[:6000])
             if args.no_auto_approve:
                 print(f"\nwaiting for:  mas approve {run.id}   (from another terminal; the run's wall-clock keeps running)")
-                while runs_mod.sm.get_run(conn, run.id).status is RunStatus.AWAITING_INPUT:
-                    time.sleep(2)
+                run = _await_human(conn, run.id, planner=planner, what="`mas approve`")
+                if run.status.terminal:
+                    _record_run(
+                        args,
+                        run.id,
+                        step="planner",
+                        status=run.status.value,
+                        metrics_obj=metrics.compute(conn, run.id),
+                        verdict=run.verdict,
+                        verdict_reason=run.verdict_reason,
+                    )
+                    return False
             else:
                 frozen = contract_mod.approve(conn, run.id, acceptance_root=settings().acceptance_root, approved_by="live_smoke")
                 print(f"\napproved (auto; --no-auto-approve to decide yourself): benchmark={frozen.benchmark}")
@@ -445,8 +541,18 @@ def step_planner(args: argparse.Namespace) -> bool:
         else:
             qs = runs_mod.pending_questions(conn, run.id)
             print(f'\nthe planner asked: {qs}\nanswer with: mas answer {run.id} "..."  (waiting)')
-            while runs_mod.sm.get_run(conn, run.id).status is RunStatus.AWAITING_INPUT:
-                time.sleep(2)
+            run = _await_human(conn, run.id, planner=planner, what="`mas answer`")
+            if run.status.terminal:
+                _record_run(
+                    args,
+                    run.id,
+                    step="planner",
+                    status=run.status.value,
+                    metrics_obj=metrics.compute(conn, run.id),
+                    verdict=run.verdict,
+                    verdict_reason=run.verdict_reason,
+                )
+                return False
     # the orchestrator loop plans further rounds (DAG, any repair amendments) and executes
     status, priced = _execute(conn, run.id, args=args, planner=planner, evidence_step="planner")
     return status is RunStatus.PASSED and priced
@@ -500,7 +606,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "--output",
         type=Path,
-        help="write incremental machine-readable gate evidence to this JSON file after every stage (overwritten unless --resume)",
+        help="write incremental machine-readable gate evidence to this JSON file after every stage. An existing file is "
+        "NEVER overwritten: continue it with --resume, or choose a new path for a separate experiment",
     )
     ap.add_argument(
         "--resume",
@@ -517,6 +624,14 @@ def main(argv: list[str]) -> int:
     )
     ap.add_argument("--dry-run", action="store_true", help="preflight only")
     args = ap.parse_args(argv)
+    # Paid evidence is never replaced. Refused here — before the preflight, before any provider contact — because even
+    # a *failed* preflight writes this file, which would erase an earlier paid result on the way to reporting an
+    # unrelated problem. A separate experiment gets a separate path; a continuation gets --resume.
+    if args.output is not None and args.output.exists() and not args.resume:
+        ap.error(
+            f"{args.output} already exists and holds paid evidence: continue it with --resume, or choose a new "
+            "--output path for a separate experiment (evidence is never overwritten)"
+        )
     order = list(ALL_STEPS) if args.step == "all" else [args.step]
     args.evidence = {
         "schema": 1,
@@ -529,8 +644,9 @@ def main(argv: list[str]) -> int:
         "model_prices": _price_snapshot(),
         "setup": _setup(args),
         "request_shape": _request_shape(),
-        "steps": {},
-        "runs": [],
+        "steps": {},  # which stages qualified
+        "runs": [],  # the runs behind the qualifying stages
+        "ledger": [],  # append-only: EVERY billable operation, qualifying or not (ADR-010)
         "complete": False,
     }
     skip: list[str] = []
