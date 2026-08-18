@@ -1011,6 +1011,53 @@ def test_the_ping_is_billed_to_the_smoke_ledger_and_an_unpriced_one_fails_the_ga
     assert live_smoke._spend(failed)["billed_usd"] == 0.0  # a call that never happened bills nothing
 
 
+def test_four_separate_invocations_accumulate_into_one_complete_evidence_file():
+    """The documented sequence is four commands, not one. Each must keep what the previous one paid for: before this,
+    `--step worker --resume` carried only what it re-requested, so the paid ping was deleted on the way to the worker
+    stage."""
+    stored = _live_evidence(steps={}, runs=[])
+    ledger = argparse.Namespace(max_cost_usd=10.0, max_total_cost_usd=30.0)
+
+    for step in live_smoke.ALL_STEPS:
+        current = _live_evidence(started_at=f"t-{step}", requested_steps=[step])
+        merged, skip, refusal = live_smoke.merge_resume(stored, current)
+        assert refusal is None and skip == []  # this stage has not passed before, so it runs
+        # ...the stage runs and records itself
+        merged["steps"][step] = True
+        if step == "ping":
+            merged["ping"] = _ping_record()
+        else:
+            merged["runs"].append({"step": step, "status": "PASSED", "priced": True, "metrics": {"call_cost_usd": 1.5}})
+        stored = merged
+
+    assert stored["steps"] == {s: True for s in live_smoke.ALL_STEPS}  # four passed stages
+    assert [r["step"] for r in stored["runs"]] == ["worker", "planner", "repair"]  # three runs
+    assert stored["ping"] == _ping_record()  # one ping, carried through three later invocations
+    ledger.evidence = stored
+    spend = live_smoke._spend(ledger)
+    assert spend["billed_usd"] == round(0.0004 + 4.5, 6)  # the ping billed once, not four times
+    assert spend["by_step"] == {"ping": 0.0004, "worker": 1.5, "planner": 1.5, "repair": 1.5}
+
+    # a fifth invocation of an already-passed stage skips it instead of paying again
+    _, skip, refusal = live_smoke.merge_resume(stored, _live_evidence(started_at="t5", requested_steps=["worker"]))
+    assert refusal is None and skip == ["worker"]
+
+
+def test_a_failed_stage_is_never_carried_forward_as_passed():
+    previous = _live_evidence(
+        steps={"ping": True, "worker": True, "planner": False},
+        ping=_ping_record(),
+        runs=[
+            {"step": "worker", "status": "PASSED", "priced": True},
+            {"step": "planner", "status": "FAILED", "priced": True},
+        ],
+    )
+    merged, skip, refusal = live_smoke.merge_resume(previous, _live_evidence(started_at="t1", requested_steps=["planner"]))
+    assert refusal is None and skip == []  # the planner failed: it must run again
+    assert merged["steps"] == {"ping": True, "worker": True}  # ...while what passed is kept
+    assert [r["step"] for r in merged["runs"]] == ["worker"] and merged["ping"] == _ping_record()
+
+
 def test_a_paid_ping_is_carried_forward_exactly_once_and_never_billed_twice():
     previous = _live_evidence(steps={"ping": True}, ping=_ping_record())
     merged, skip, refusal = live_smoke.merge_resume(previous, _live_evidence(started_at="t1"))

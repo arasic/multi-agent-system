@@ -116,21 +116,28 @@ docker kill multi-agent-system-worker-2                          # A5 demo: reap
 python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-smoke.json
 ```
 
-First live calls, in this order — each gate authorizes only the next one:
+First live calls, in this order — each gate authorizes only the next one, and **every stage repeats the identity
+arguments below verbatim** (both models, approval mode, prices, budgets, request shape). Resume refuses a stage that
+was paid for under different settings, so the ping already carries the planner model and `--no-auto-approve`:
 
 ```
 .venv/Scripts/mas doctor --require-live                          # every required row green IN THE SHELL that will run it
-python scripts/live_smoke.py --worker <p>:<m> --step ping --max-cost-usd <small> --max-total-cost-usd <small> \
-    --output mvp-evidence/live-smoke.json                        # THE canonical first paid call: one call, recorded as evidence
-.venv/Scripts/mas models --probe-tools --spec <p>:<m>            # then the two-turn continuation (<=2 calls)
-.venv/Scripts/mas models --probe-tools --spec openai:<m>         # ...and the same exchange across the gateway
-python scripts/live_smoke.py --worker ... --planner ... --step worker --resume --output mvp-evidence/live-smoke.json
+python scripts/live_smoke.py --worker <p>:<m> --planner <p>:<m> --no-auto-approve \
+    --max-cost-usd <frozen> --max-total-cost-usd <frozen> --output mvp-evidence/live-smoke.json --step ping
+.venv/Scripts/mas models --probe-tools --spec <p>:<m> --max-tokens 64 --json   # two-turn continuation (<=2 calls, billed separately)
+.venv/Scripts/mas models --probe-tools --spec openai:<m> --json  # ...the same exchange across the gateway
+python scripts/live_smoke.py ...same arguments... --step worker  --resume      # then inspect
+python scripts/live_smoke.py ...same arguments... --step planner --resume      # `mas approve <run>` from another terminal
+python scripts/live_smoke.py ...same arguments... --step repair  --resume
+python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-smoke.json \
+    --result mvp-evidence/distributed-live-result                # a fresh --result path: exports are never overwritten
 ```
 
-`mas models --ping` is a **diagnostic**, not the gate: it makes its own billable call and is recorded nowhere. The
-ping that counts is `live_smoke.py --step ping`, whose telemetry (reported model id, tokens, latency, cost, priced)
-goes into the evidence and the ledger — and `mvp_gate.py` requires it to be present and priced. Use the standalone
-ping only when you deliberately want a throwaway probe of a spec the smoke will not run.
+Stages accumulate into one evidence file: what passed (with its runs and the paid ping) is carried forward, `complete`
+turns true only when all four have passed, and the exit code speaks for *that* command — a green `--step ping` says
+the ping passed, not that the gate is finished. `mas models --ping` is a **diagnostic**, not the gate: it bills its own
+call and is recorded nowhere; the ping that counts is `live_smoke.py --step ping`, whose telemetry (reported model id,
+tokens, latency, cost, priced) is in the evidence, the ledger and `mvp_gate.py`.
 
 Frozen MVP evidence (run on one clean commit with a real provider and exact `MAS_MODEL_PRICES`):
 

@@ -22,6 +22,20 @@ outside mas/providers/ and config). Prices come from MAS_MODEL_PRICES; unpriced 
 The key stays in this host process's environment (ANTHROPIC_API_KEY / MAS_OPENAI_API_KEY): never on the command line,
 never in compose YAML; workers here are in-process threads, so no other process ever sees it.
 
+Run it **one stage at a time** and inspect between stages — a stage that exits 0 authorizes the next one, it does not
+start it:
+
+    live_smoke.py --worker <p:m> --planner <p:m> --no-auto-approve --max-cost-usd X --max-total-cost-usd Y \
+        --output mvp-evidence/live-smoke.json --step ping
+    ... same arguments ...  --step worker  --resume
+    ... same arguments ...  --step planner --resume
+    ... same arguments ...  --step repair  --resume
+
+Every stage accumulates into one evidence file: passed stages, their runs and the paid ping are carried forward, and
+`complete` turns true only when all four have passed. The identity arguments (both models, approval mode, budgets,
+prices, request shape) must be **identical from the first stage on**, including `--planner` and `--no-auto-approve` on
+the ping — resume refuses otherwise, and correctly: it would be evidence from a different experiment.
+
 Budgets are hard: --max-tokens / --max-cost-usd / --max-wallclock-s end a run with a verdict (I-4). Defaults are meant
 for a smoke, not a benchmark. `--max-total-cost-usd` bounds the WHOLE smoke on top of that (ADR-010): spend is summed
 from the metered telemetry of the stages already run, a stage may only start if the ceiling still covers its own
@@ -57,6 +71,7 @@ from mas.planner import contracts as contract_mod  # noqa: E402
 from mas.planner.dag import DagSpec  # noqa: E402
 from mas.workers.runtime import Worker, run_worker_thread  # noqa: E402
 
+ALL_STEPS = ("ping", "worker", "planner", "repair")  # the complete gate; `complete` means all four, however they ran
 GOAL = (
     "Build a small URL-shortener HTTP service in Python (standard library only, no third-party packages): "
     'POST /shorten with a JSON body {"url": ...} returns 201 and a short code; GET /<code> redirects (302) to the '
@@ -182,7 +197,9 @@ def _admit(args: argparse.Namespace, step: str) -> str | None:
 def merge_resume(previous: dict, current: dict) -> tuple[dict, list[str], str | None]:
     """Carry an earlier evidence file's PASSED stages (and their runs) into `current`.
 
-    Returns (merged evidence, stages to skip, refusal reason). Nothing is carried over unless the earlier file was
+    Returns (merged evidence, stages of *this* invocation that need not run again, refusal reason). Everything that
+    passed before is carried regardless of what this invocation requests — the stages accumulate across separate
+    commands, which is how the paid sequence is meant to be run. Nothing is carried over unless the earlier file was
     produced by the same commit with a clean/dirty state, the same worker/planner models, the same approval mode, the
     same pricing rule and price table, and the same setup (budgets, workers, concurrency, replans) — otherwise a paid
     stage from a different setup could be smuggled into this gate."""
@@ -193,16 +210,21 @@ def merge_resume(previous: dict, current: dict) -> tuple[dict, list[str], str | 
             return current, [], f"earlier evidence differs in {key}: {previous.get(key)!r} vs {current.get(key)!r}"
     prev_steps = previous.get("steps") if isinstance(previous.get("steps"), dict) else {}
     prev_runs = previous.get("runs") if isinstance(previous.get("runs"), list) else []
+    # EVERY stage that already passed is carried, not only the ones this invocation asks for. Otherwise the documented
+    # one-stage-at-a-time sequence (`--step ping`, then `--step worker --resume`, ...) would delete the evidence of
+    # each paid stage as it moved to the next. `skip` is a different question — which of the *requested* stages need
+    # not run again — and only that one depends on `requested_steps`. A failed stage is never carried as passed.
+    carried = [s for s in ALL_STEPS if prev_steps.get(s) is True]
     skip = [s for s in current["requested_steps"] if prev_steps.get(s) is True]
     merged = dict(current)
-    merged["steps"] = {s: True for s in skip}
-    merged["runs"] = [r for r in prev_runs if isinstance(r, dict) and r.get("step") in skip]
-    # the ping was paid for once; it is carried with its stage so the ledger neither loses it nor bills it twice
-    if "ping" in skip and isinstance(previous.get("ping"), dict):
+    merged["steps"] = {s: True for s in carried}
+    merged["runs"] = [r for r in prev_runs if isinstance(r, dict) and r.get("step") in carried]
+    # the ping was paid for once; it travels with its stage so the ledger neither loses it nor bills it twice
+    if "ping" in carried and isinstance(previous.get("ping"), dict):
         merged["ping"] = previous["ping"]
     else:
         merged.pop("ping", None)
-    merged["resumed_from"] = {"started_at": previous.get("started_at"), "steps": skip}
+    merged["resumed_from"] = {"started_at": previous.get("started_at"), "steps": carried}
     return merged, skip, None
 
 
@@ -483,9 +505,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "--resume",
         action="store_true",
-        help="skip stages already PASSED in --output when it was produced by this same commit, models, approval mode, "
-        "pricing rule and price table, budgets, worker count, concurrency and replan limit; their runs are carried "
-        "forward, everything else is re-run",
+        help="carry every stage already PASSED in --output (with its runs and the paid ping) into this invocation, and "
+        "skip any of them this command requests again. Only from the same commit, models, approval mode, pricing rule "
+        "and price table, budgets, worker count, concurrency, replan limit and request shape — so repeat those "
+        "identity arguments on every stage, including the first",
     )
     ap.add_argument(
         "--allow-unpriced",
@@ -494,7 +517,7 @@ def main(argv: list[str]) -> int:
     )
     ap.add_argument("--dry-run", action="store_true", help="preflight only")
     args = ap.parse_args(argv)
-    order = ["ping", "worker", "planner", "repair"] if args.step == "all" else [args.step]
+    order = list(ALL_STEPS) if args.step == "all" else [args.step]
     args.evidence = {
         "schema": 1,
         "started_at": datetime.now(UTC).isoformat(),
@@ -576,11 +599,20 @@ def main(argv: list[str]) -> int:
     print("use this to choose the matrix ceilings (--max-cost-usd per run, --max-total-cost-usd for 125 operations)")
     if stopped:
         args.evidence["stopped"] = stopped
-    complete = bool(results) and all(results.values()) and len(results) == len(order)
+    # Two different questions. `complete` is about the *evidence*: all four stages passed, whether in one command or in
+    # four. The exit code is about *this* command, so a green `--step ping` authorizes the next stage without claiming
+    # the gate is finished.
+    requested_ok = bool(results) and all(results.values()) and len(results) == len(order)
+    passed = [s for s in ALL_STEPS if args.evidence["steps"].get(s) is True]
+    complete = len(passed) == len(ALL_STEPS)
     args.evidence["complete"] = complete
     args.evidence["finished_at"] = datetime.now(UTC).isoformat()
     _write_evidence(args)
-    return 0 if complete else 1
+    print(f"evidence: {len(passed)}/{len(ALL_STEPS)} stages passed {passed}; complete={complete}")
+    if not complete and requested_ok:
+        remaining = [s for s in ALL_STEPS if s not in passed]
+        print(f"next: rerun with --step {remaining[0]} --resume and the SAME identity arguments (models, approval, budgets)")
+    return 0 if requested_ok else 1
 
 
 if __name__ == "__main__":
