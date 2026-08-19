@@ -167,6 +167,21 @@ def _charge(args: argparse.Namespace, *, step: str, kind: str, cost_usd: float |
     return entry
 
 
+def _record_cap_change(args: argparse.Namespace, previous: dict) -> None:
+    """The aggregate ceiling is recorded with an append-only history, not frozen into the resume identity.
+
+    Frozen, an experiment that reached its ceiling could only continue on a new evidence path — which means paying
+    again for the stages that already passed. Recorded, a change is legal, loud and auditable: when, from what, to
+    what (the same treatment `benchmark.open_experiment` gives the matrix's ceiling, ADR-010)."""
+    history = [dict(h) for h in (previous.get("spend_cap_history") or []) if isinstance(h, dict)]
+    last = history[-1]["to_usd"] if history else None
+    if last != args.max_total_cost_usd:
+        history.append({"at": datetime.now(UTC).isoformat(), "from_usd": last, "to_usd": args.max_total_cost_usd})
+        if last is not None:
+            print(f"[spend] smoke ceiling changed from ${last} to ${args.max_total_cost_usd} (recorded in the evidence)")
+    args.evidence["spend_cap_history"] = history
+
+
 def _spend(args: argparse.Namespace) -> dict:
     """What this smoke has been billed, computed from the whole ledger — every attempt, not only the ones that counted.
 
@@ -199,6 +214,14 @@ def _admit(args: argparse.Namespace, step: str) -> str | None:
         f"[spend] billed ${billed:.4f} of ${cap:.4f} ceiling; {step} <= ${args.max_cost_usd:.4f} per run"
         + (f"; {spend['unpriced_calls']} unpriced call(s) so far" if spend["unpriced_calls"] else "")
     )
+    if spend["unpriced_calls"] and not getattr(args, "allow_unpriced", False):
+        # With unknown cost in the record, `billed` is a floor and no later operation can be *proven* to fit the
+        # ceiling. ADR-010: unknown spend stops the sequence unless the operator explicitly accepted it.
+        return (
+            f"{spend['unpriced_calls']} recorded call(s) have unknown cost, so ${billed:.4f} is a floor and the "
+            f"${cap:.4f} ceiling cannot be enforced — price the model the provider reported in MAS_MODEL_PRICES, or "
+            "accept unknown cost with --allow-unpriced"
+        )
     if step == "ping":
         # the ping's cost cannot be bounded in USD before it runs (one call of --ping-max-tokens at an unknown price),
         # so it is admitted while any ceiling remains and *billed* afterwards like everything else; the next stage then
@@ -433,6 +456,10 @@ def _execute(conn, run_id, *, args: argparse.Namespace, planner, evidence_step: 
         for i in range(args.workers)
     ]
     threads = [run_worker_thread(w, stop) for w in workers]
+    # A marker before the first call: if this process dies mid-run, the evidence still shows that a paid operation was
+    # started and never settled. Its cost lives in `model_calls` in Postgres (`mas status <run>`), not here — the gate
+    # refuses evidence with an unsettled marker rather than quietly reporting a total that is missing a run.
+    _charge(args, step=evidence_step, kind="run_started", cost_usd=0.0, priced=True, run_id=str(run_id))
     t0 = time.monotonic()
     try:
         final = scheduler.run_until_terminal(
@@ -647,8 +674,10 @@ def main(argv: list[str]) -> int:
         "steps": {},  # which stages qualified
         "runs": [],  # the runs behind the qualifying stages
         "ledger": [],  # append-only: EVERY billable operation, qualifying or not (ADR-010)
+        "spend_cap_history": [],  # append-only: every aggregate ceiling this evidence has been run under
         "complete": False,
     }
+    _record_cap_change(args, {})
     skip: list[str] = []
     if args.resume:
         if args.output is None:
@@ -660,8 +689,15 @@ def main(argv: list[str]) -> int:
                 ap.error(f"cannot resume from {args.output}: {exc}")
             args.evidence, skip, refusal = merge_resume(previous, args.evidence)
             if refusal:
-                print(f"not resuming: {refusal}")
-            elif skip:
+                # A refusal is the END of this command, not a note. Continuing would write fresh evidence over the
+                # paid file the resume was refused *from* — the identity check would have protected the experiment's
+                # integrity and destroyed its evidence in the same breath.
+                ap.error(
+                    f"cannot resume {args.output}: {refusal}. That file holds paid evidence and is not overwritten: "
+                    "restore the original arguments, or start a separate experiment with a new --output path"
+                )
+            _record_cap_change(args, previous)
+            if skip:
                 print(f"resuming: skipping already-passed stages {skip} from {args.output}")
         else:
             print(f"nothing to resume: {args.output} does not exist yet")

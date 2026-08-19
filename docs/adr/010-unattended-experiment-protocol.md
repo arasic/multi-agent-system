@@ -64,7 +64,18 @@ that change, plus two protocol gaps, that would each have corrupted the evidence
    while `steps`/`runs` carry only what qualified. A failed $5 planner attempt stays $5 on resume: rebuilding the
    total from the stages that passed would let a retry cross the ceiling unseen. The charge is written *before* the
    stage outcome, so a crash between the two loses the flag, never the money, and the gate audits the ledger
-   (`live.attempts_audited`): present, covering every run, and every entry priced.
+   (`live.attempts_audited`): every entry must name its kind, stage and a finite non-negative cost, every qualifying
+   run must have its charge, the ping must be charged, and the reported total must equal the ledger's own sum —
+   `priced: true` on a shapeless object is not an audit. A `run_started` marker is written before a run's first call,
+   so a process that dies mid-run leaves *visible* unsettled spend (the cost itself is in `model_calls`) instead of a
+   total that is quietly missing a run; the gate refuses evidence with an unsettled marker.
+   **A refused resume aborts.** An identity mismatch ends the command (`ap.error`) before the preflight, because
+   continuing would write fresh evidence over the very file the resume was refused from — protecting the experiment's
+   integrity and destroying its evidence in one move. **Unknown cost stops the sequence**: with an unpriced call on
+   record the total is a floor, so no later operation can be *proven* to fit the ceiling, and every subsequent
+   operation is refused unless `--allow-unpriced` says the operator accepted that. The smoke's own ceiling is
+   recorded with an append-only `spend_cap_history` rather than frozen into the resume identity — for the same reason
+   as the matrix's: a frozen ceiling forces a new evidence path, i.e. paying again for stages that already passed.
 5. **Pacing and a circuit breaker.** `--pace-s` between operations, `--cooldown-s` after a machinery failure, and a
    stop after `--max-consecutive-infrastructure` (default 3) in a row, with the reason printed. Stopping never
    discards anything: rerunning the same command resumes.

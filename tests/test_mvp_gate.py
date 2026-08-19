@@ -9,10 +9,11 @@ import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import ANY
 
 import pytest
 
-from scripts import benchmark, distributed_smoke, live_smoke
+from scripts import benchmark, distributed_smoke, live_smoke, mvp_gate
 from scripts.benchmark import classify_run, completion, crossover, effective_rows
 from scripts.mvp_gate import evaluate
 
@@ -24,6 +25,7 @@ SUITES = {str(n): f"suite{n}" for n in WIDTHS}
 EXPERIMENT = "exp-1"
 SEED = 7
 SPEND_CAP = 500.0
+_PAID_RUNS = ("worker", "planner", "repair")  # the live smoke's three runs (the ping has no run)
 SCHEDULE = benchmark.build_schedule(CONFIGS, WIDTHS, 5, SEED)
 BLOCK_INDEX = {(int(b["n"]), int(b["repetition"])): int(b["index"]) for b in SCHEDULE}
 
@@ -178,21 +180,15 @@ def _write_live_and_distributed(live: Path, distributed: Path) -> None:
         {
             "complete": True,
             "steps": {"ping": True, "worker": True, "planner": True, "repair": True},
-            "runs": [
-                {"step": "worker", "status": "PASSED", "priced": True},
-                {"step": "planner", "status": "PASSED", "priced": True},
-                {"step": "repair", "status": "PASSED", "priced": True},
-            ],
+            "runs": [{"step": s, "run_id": f"run-{s}", "status": "PASSED", "priced": True} for s in _PAID_RUNS],
             "manual_contract_approval": True,
             "ping": _ping_record(),
-            # the append-only record of what the four stages actually cost (ADR-010)
+            # the append-only record of what the four stages actually cost, linked to the runs (ADR-010)
             "ledger": [
-                {"at": "t0", "step": "ping", "kind": "ping", "cost_usd": 0.0004, "priced": True},
-                *[
-                    {"at": f"t-{s}", "step": s, "kind": "run", "cost_usd": 1.5, "priced": True}
-                    for s in ("worker", "planner", "repair")
-                ],
+                _charge("ping", 0.0004, kind="ping"),
+                *[_charge(s, 1.5, run_id=f"run-{s}") for s in _PAID_RUNS],
             ],
+            "spend": {"billed_usd": round(0.0004 + 4.5, 6)},
             "git": {"commit": COMMIT, "dirty": False},
         },
     )
@@ -1146,18 +1142,122 @@ def test_unpriced_charges_stay_visible_make_the_total_a_floor_and_fail_the_gate(
     live, distributed, bench = tmp_path / "live.json", tmp_path / "distributed.json", tmp_path / "bench"
     _write_live_and_distributed(live, distributed)
     _write_matrix(bench, _rows())
-    complete = json.loads(live.read_text(encoding="utf-8"))
-    complete["ledger"] = [_charge("ping", 0.0004, kind="ping"), *[_charge(s) for s in ("worker", "planner", "repair")]]
-    _write(live, complete)
     assert not _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
 
-    complete["ledger"].append(_charge("repair", None, priced=False, status="FAILED"))
-    _write(live, complete)
+    # one failed, unpriced attempt among otherwise complete evidence: the total is no longer a total
+    paid = json.loads(live.read_text(encoding="utf-8"))
+    paid["ledger"].append(_charge("repair", None, priced=False, status="FAILED", run_id="run-repair-2"))
+    _write(live, paid)
     assert "live.attempts_audited" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
 
-    del complete["ledger"]  # no ledger at all: the gate cannot tell what the evidence cost
-    _write(live, complete)
+    del paid["ledger"]  # no ledger at all: the gate cannot tell what the evidence cost
+    _write(live, paid)
     assert "live.attempts_audited" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+
+def test_the_gate_audits_the_shape_of_every_charge_not_just_a_priced_flag(tmp_path: Path):
+    """`{"priced": true}` is not an audit: an entry has to say what it was, what it cost and which run it belongs to,
+    every qualifying run needs its charge, every started run must have settled, and the reported total must be the
+    ledger's own sum."""
+    live, distributed, bench = tmp_path / "live.json", tmp_path / "distributed.json", tmp_path / "bench"
+    _write_live_and_distributed(live, distributed)
+    _write_matrix(bench, _rows())
+    good = json.loads(live.read_text(encoding="utf-8"))
+
+    def audit(**changes) -> list[str]:
+        evidence = json.loads(json.dumps(good))
+        for key, value in changes.items():
+            evidence[key] = value
+        _write(live, evidence)
+        return mvp_gate._ledger_findings(evidence)
+
+    assert audit() == []  # the honest file passes
+
+    shapeless = [{"priced": True}, {"priced": True, "kind": "run", "step": "worker"}]
+    assert any("no valid kind" in p for p in audit(ledger=shapeless))
+    assert any("no usable cost_usd" in p for p in audit(ledger=shapeless))
+
+    negative = [*good["ledger"][:-1], _charge("repair", -5.0, run_id="run-repair")]
+    assert any("no usable cost_usd" in p for p in audit(ledger=negative))
+
+    missing_charge = [e for e in good["ledger"] if e.get("run_id") != "run-planner"]
+    assert any("qualified a stage with no charge" in p for p in audit(ledger=missing_charge))
+
+    no_ping = [e for e in good["ledger"] if e.get("kind") != "ping"]
+    assert any("ping is recorded but never charged" in p for p in audit(ledger=no_ping))
+
+    # a process that died mid-run: the marker is on record, the settlement never happened
+    unsettled = [*good["ledger"], _charge("repair", 0.0, kind="run_started", run_id="run-repair-2")]
+    assert any("started and never settled" in p for p in audit(ledger=unsettled))
+    settled = [*unsettled, _charge("repair", 2.0, run_id="run-repair-2")]
+    assert [p for p in audit(ledger=settled) if "never settled" in p] == []
+
+    assert any("is not the ledger's" in p for p in audit(spend={"billed_usd": 999.0}))
+    assert audit(ledger=[]) == ["no spend ledger (every paid operation must be recorded, qualifying or not)"]
+
+    # ...and the gate itself fails on a shapeless ledger, not only the helper
+    _write(live, {**good, "ledger": shapeless})
+    assert "live.attempts_audited" in _failed(evaluate(live, distributed, bench, current_git=(COMMIT, False)))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"models": {"worker": "p:other", "planner": "p:s"}},
+        {"setup": {**_LIVE_SETUP, "max_cost_usd": 99.0}},
+        {"git": {"commit": "an-older-commit", "dirty": False}},
+        {"request_shape": {**_LIVE_SHAPE, "anthropic_effort": "high"}},
+    ],
+)
+def test_a_refused_resume_aborts_instead_of_overwriting_the_paid_file(tmp_path: Path, monkeypatch, capsys, change: dict):
+    """The identity check protects the experiment's integrity; continuing after it fires would destroy the experiment's
+    evidence in the same breath — fresh evidence written straight over the file the resume was refused from."""
+    paid = tmp_path / "live-smoke.json"
+    paid.write_text(json.dumps(_live_evidence(steps={"ping": True}, ping=_ping_record(), **change)), encoding="utf-8")
+    before = paid.read_text(encoding="utf-8")
+    reached: list[str] = []
+    monkeypatch.setattr(live_smoke, "_preflight", lambda args: reached.append("preflight") or [])
+    monkeypatch.setattr(live_smoke.cli, "ping_spec", lambda *a, **kw: reached.append("model") or _ping_record())
+    monkeypatch.setenv("MAS_MODEL_PRICES", json.dumps({"m": [1.0, 2.0]}))
+
+    with pytest.raises(SystemExit):
+        live_smoke.main(
+            ["--worker", "p:w", "--planner", "p:s", "--no-auto-approve", "--step", "worker", "--resume",
+             "--output", str(paid)]
+        )  # fmt: skip
+    assert reached == []  # neither the preflight nor the provider was reached
+    assert paid.read_text(encoding="utf-8") == before  # the paid evidence is byte-identical
+    assert "cannot resume" in capsys.readouterr().err
+
+
+def test_unknown_cost_stops_the_next_operation_unless_it_was_explicitly_accepted():
+    """ADR-010: with an unpriced call on record the total is a floor, so no later operation can be *proven* to fit the
+    ceiling. Reporting that and continuing anyway was exactly the hole."""
+    evidence = _live_evidence(ledger=[_charge("worker", 2.0), _charge("worker", None, priced=False, unpriced_calls=2)])
+    args = _ledger_args(evidence, allow_unpriced=False)
+    stop = live_smoke._admit(args, "planner")
+    assert stop and "unknown cost" in stop and "--allow-unpriced" in stop
+    assert live_smoke._admit(args, "ping")  # not even the cheapest operation continues on an unknown total
+
+    args.allow_unpriced = True  # an explicit rehearsal may continue with cost unknown
+    assert live_smoke._admit(args, "planner") is None
+
+
+def test_the_smoke_ceiling_is_recorded_with_an_append_only_history():
+    """Frozen into the resume identity, a raised ceiling would force a new evidence path — paying again for stages that
+    already passed. Recorded, the change is legal, loud and auditable (same treatment as the matrix's cap)."""
+    args = argparse.Namespace(max_total_cost_usd=30.0, evidence={})
+    live_smoke._record_cap_change(args, {})
+    assert args.evidence["spend_cap_history"] == [{"at": ANY, "from_usd": None, "to_usd": 30.0}]
+
+    live_smoke._record_cap_change(args, dict(args.evidence))  # same ceiling on resume: nothing to record
+    assert len(args.evidence["spend_cap_history"]) == 1
+
+    previous = dict(args.evidence)
+    args.max_total_cost_usd = 60.0
+    live_smoke._record_cap_change(args, previous)
+    assert [h["to_usd"] for h in args.evidence["spend_cap_history"]] == [30.0, 60.0]
+    assert args.evidence["spend_cap_history"][-1]["from_usd"] == 30.0
 
 
 def test_existing_output_is_never_overwritten_without_resume(tmp_path: Path, monkeypatch, capsys):

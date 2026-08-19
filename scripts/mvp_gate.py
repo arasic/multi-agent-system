@@ -97,6 +97,59 @@ def current_git_state() -> tuple[str, bool]:
     return (rev.stdout.strip() if rev.returncode == 0 else "unknown", bool(dirty.stdout.strip()) or dirty.returncode != 0)
 
 
+LIVE_STEPS = ("ping", "worker", "planner", "repair")
+LEDGER_KINDS = ("ping", "run", "run_started")
+
+
+def _ledger_findings(live: dict[str, Any]) -> list[str]:
+    """Everything wrong with the live smoke's spend ledger, or [] (ADR-010).
+
+    `priced: true` on a shapeless object is not an audit. Each entry must say what it was (kind, step), what it cost
+    (a finite, non-negative number) and — for runs — which run it was; every qualifying run must have its charge;
+    every started run must have settled (an unsettled marker means a process died mid-run and this file's total is
+    missing that run's cost, which lives in `model_calls`); the ping must be charged; and the summary the file reports
+    must equal the sum recomputed here."""
+    ledger = live.get("ledger") if isinstance(live.get("ledger"), list) else None
+    if not ledger:
+        return ["no spend ledger (every paid operation must be recorded, qualifying or not)"]
+    problems: list[str] = []
+    total = 0.0
+    charged_runs: set[str] = set()
+    started_runs: set[str] = set()
+    for i, entry in enumerate(ledger, 1):
+        if not isinstance(entry, dict):
+            problems.append(f"ledger[{i}] is not an object")
+            continue
+        kind, step, cost = entry.get("kind"), entry.get("step"), entry.get("cost_usd")
+        if kind not in LEDGER_KINDS:
+            problems.append(f"ledger[{i}] has no valid kind ({kind!r})")
+        if step not in LIVE_STEPS:
+            problems.append(f"ledger[{i}] has no valid step ({step!r})")
+        if entry.get("priced") is not True:
+            problems.append(f"ledger[{i}] ({step}) has unknown cost")
+        elif not isinstance(cost, int | float) or isinstance(cost, bool) or cost != cost or cost < 0 or cost == float("inf"):
+            problems.append(f"ledger[{i}] ({step}) has no usable cost_usd ({cost!r})")
+        else:
+            total += float(cost)
+        if kind == "run":
+            charged_runs.add(str(entry.get("run_id")))
+            if not entry.get("run_id"):
+                problems.append(f"ledger[{i}] charges a run with no run_id")
+        if kind == "run_started":
+            started_runs.add(str(entry.get("run_id")))
+    for run in live.get("runs") or []:
+        if isinstance(run, dict) and str(run.get("run_id")) not in charged_runs:
+            problems.append(f"run {run.get('run_id')} ({run.get('step')}) qualified a stage with no charge on record")
+    for unsettled in sorted(started_runs - charged_runs):
+        problems.append(f"run {unsettled} was started and never settled (its cost is not in this file)")
+    if isinstance(live.get("ping"), dict) and not any(e.get("kind") == "ping" for e in ledger if isinstance(e, dict)):
+        problems.append("the ping is recorded but never charged")
+    reported = (live.get("spend") or {}).get("billed_usd") if isinstance(live.get("spend"), dict) else None
+    if reported is not None and round(float(reported), 6) != round(total, 6):
+        problems.append(f"the reported total ${reported} is not the ledger's ${round(total, 6)}")
+    return problems
+
+
 def _schedule_followed(schedule: list[dict[str, Any]], rows: list[dict[str, Any]]) -> str | None:
     """Did the evidence actually come out in the frozen order? (ADR-009/ADR-010)
 
@@ -342,6 +395,7 @@ def evaluate(
     # the append-only record of every billable operation, including the ones that did not qualify a stage (ADR-010):
     # a gate that only ever sees successful runs cannot tell what the evidence actually cost
     ledger = live.get("ledger") if isinstance(live.get("ledger"), list) else []
+    ledger_problems = _ledger_findings(live)
     checks = [
         Check("live.complete", live.get("complete") is True, f"steps={steps}"),
         Check(
@@ -370,17 +424,10 @@ def evaluate(
         ),
         Check(
             "live.attempts_audited",
-            bool(ledger)
-            and len(ledger) >= len(runs) + (1 if ping else 0)
-            and all(isinstance(e, dict) and e.get("priced") is True for e in ledger),
-            f"{len(ledger)} billable operation(s) on record, all priced"
-            if ledger and all(isinstance(e, dict) and e.get("priced") is True for e in ledger)
-            else (
-                "no spend ledger in the evidence (every paid operation must be recorded, qualifying or not)"
-                if not ledger
-                else f"{sum(1 for e in ledger if not (isinstance(e, dict) and e.get('priced') is True))} "
-                "operation(s) of unknown cost in the ledger"
-            ),
+            not ledger_problems,
+            f"{len(ledger)} billable operation(s) on record: every run and the ping charged, priced and settled"
+            if not ledger_problems
+            else f"{len(ledger_problems)} ledger problem(s): {ledger_problems[:3]}",
         ),
         Check(
             "live.manual_contract_approval",
