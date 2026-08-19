@@ -111,6 +111,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--output", type=Path, default=ROOT / "mvp-evidence" / "distributed-smoke.json")
     ap.add_argument("--result", type=Path, default=ROOT / "mvp-evidence" / "distributed-result")
     args = ap.parse_args(argv)
+    # This file is written *before* the preflight, so without this guard a rerun that fails preflight (one unset
+    # variable is enough) would replace a passed — and live, paid — result with a failure record. There is no resume
+    # here: a rerun is a new smoke and takes a new path. Refused before anything is written, never after.
+    if args.output.exists():
+        ap.error(
+            f"evidence path already in use: {args.output} — pass --output <new path> "
+            "(evidence is never overwritten, so an earlier passed smoke is never lost)"
+        )
     evidence: dict = {
         "schema": 1,
         "started_at": datetime.now(UTC).isoformat(),

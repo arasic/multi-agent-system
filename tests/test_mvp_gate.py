@@ -1384,9 +1384,30 @@ def test_distributed_smoke_refuses_a_colliding_result_path_before_it_runs_anythi
     assert evidence["complete"] is False and "result path already in use" in evidence["error"]
 
     # the sidecar alone is enough of a collision: `mas result` writes both
+    # (a fresh --output: the first call above wrote smoke.json, and evidence paths are never reused)
     sidecar = tmp_path / "other.mas-result.json"
     sidecar.write_text("{}", encoding="utf-8")
-    assert distributed_smoke.main([*argv[:-1], str(tmp_path / "other")]) == 2
+    argv2 = ["--offline", "--output", str(tmp_path / "smoke2.json"), "--result", str(tmp_path / "other")]
+    assert distributed_smoke.main(argv2) == 2
+
+
+def test_distributed_smoke_never_overwrites_existing_evidence_with_a_failure_record(tmp_path: Path, monkeypatch, capsys):
+    """The evidence file is written before the preflight, so an unguarded rerun replaces a paid pass with its own failure.
+
+    Reproduced against the real script: one unset provider variable turned a `complete: true` live result into a
+    358-byte error record, and the *result*-path guard fired afterwards — protecting the export, not the evidence.
+    """
+    output = tmp_path / "distributed-smoke.json"
+    paid = {"schema": 1, "mode": "live", "complete": True, "run": {"status": "PASSED"}, "cost_usd": 7.42}
+    output.write_text(json.dumps(paid), encoding="utf-8")
+    called: list[str] = []
+    monkeypatch.setattr(distributed_smoke, "running_services", lambda: called.append("services") or set())
+    with pytest.raises(SystemExit) as exc:  # refused by the parser: the command ends before anything is written
+        distributed_smoke.main(["--offline", "--output", str(output), "--result", str(tmp_path / "fresh")])
+    assert exc.value.code == 2
+    assert called == []  # nothing started, nothing submitted
+    assert "evidence path already in use" in capsys.readouterr().err
+    assert json.loads(output.read_text(encoding="utf-8")) == paid  # the paid result is untouched
 
 
 def test_distributed_smoke_refuses_running_actors_but_reuses_the_shared_postgres():
