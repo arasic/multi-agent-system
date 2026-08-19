@@ -53,6 +53,40 @@ Also landed early (LLM-free): the **structural subset of the DAG validator** (ru
 
 **Gate:** value question answered with data (either way).
 
+## Pre-paid readiness (M2 + M3 evidence), as of 2026-08-19 at `904957e`
+
+The MVP finish line is frozen: the four artifacts below on one clean commit, with `scripts/mvp_gate.py` exiting 0.
+No further implementation is required. Returning to code is legitimate only for a **reproduced** defect in one of these
+gates — never for a hypothetical one.
+
+**Free validation — complete.** Exact-head keyless stability gate PASSED at this commit on the first run (100 diamonds
++ 50 chaos + 20 parallel; 0 deadlocks, 0 leaked worktrees, 0 unexpected failures, `abandoned == died` exactly); tree
+clean and `HEAD == origin/main`; images rebuilt; the offline distributed smoke PASSED at this commit
+(`mode: offline`, so it proves the plumbing and deliberately does **not** satisfy the live artifact). Note the gate is
+host-timing sensitive at `lease_s=1`: an earlier run on the same host produced two spurious abandonments and their
+stale reports. Before treating that as a regression, diff the exercised modules (`mas/orchestrator`, `mas/workers`,
+`mas/db`, `mas/verifier`, `mas/planner`) against the last green commit — `stress_step6.py` imports neither `mas.cli`
+nor `mas/providers/`, so changes there cannot affect it. Report every run, not only the green one.
+
+| Prerequisite | State |
+| --- | --- |
+| Quiet keyless stability gate | ✅ |
+| Final commit clean and frozen | ✅ |
+| Models, prices, effort, request shape and budgets frozen | ❌ operator decision |
+| Dedicated capped vendor key | ❌ operator action (needs the upstream chosen first) |
+| `mas doctor --require-live` fully green | ❌ derived from the two above (7 green / 5 red today) |
+
+| Formal artifact | State |
+| --- | --- |
+| Four-stage priced live smoke (ping · worker · human-approved planner · bounded repair) | ❌ absent |
+| Live distributed smoke through gateway + Compose | ❌ absent |
+| 100-cell A/B/C/D matrix, ≥ 5 repetitions | ❌ absent |
+| Value conclusion reviewed and recorded | ❌ blocked on the matrix |
+| `scripts/mvp_gate.py` exits 0 | ❌ exit 2 |
+
+Explicitly **not** MVP blockers, however reasonable they sound: reviewer roles, prompt-injection susceptibility
+measurement, adaptive mode selection, persistent projects, broader profiles, SOC work, or any M4+ item.
+
 ## M4 — Controlled adaptive execution (after the fixed-mode MVP; ADR-008)
 - [ ] 16. **Workflow template contract + registry:** a template defines versioned phases, slots, invariants and deterministic phase-exit checks—not a fixed app DAG. Record template id/version/hash in the plan. Add one `software-build-v1` template (`acceptance → architecture/contracts → implementation slots → integration → verification → bounded repair`) and prove that template instantiation and free-form planning both pass the same validator. Intermediate checks may block or repair a phase but cannot declare the run `PASSED`; only the frozen external acceptance verifier can do that.
 - [ ] 17. **Deterministic execution-mode policy:** planner proposes task shape; policy chooses among `single_agent`, `sequential_workflow` and `parallel_centralized_mas` from independent width, critical-path ratio, dependency density, overlapping outputs, shared-context/tool requirements, integration risk, verifier coverage, budget and M3/history. Unknown/low-confidence cases fall back to the simpler mode or require explicit selection.

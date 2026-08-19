@@ -133,6 +133,17 @@ python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-sm
     --result mvp-evidence/distributed-live-result                # a fresh --result path: exports are never overwritten
 ```
 
+**Two layers, two kinds of model name — don't freeze one and assume the other.** The direct smoke names *actual*
+models on the command line (`--worker <p>:<m> --planner <p>:<m>`). The Compose stack does not: workers request the
+**logical gateway alias** `MAS_MODEL_WORKER=openai:builder`, allow-listed by `MAS_GATEWAY_MODELS=builder`, and the
+gateway resolves it to the real model in `MAS_GATEWAY_UPSTREAM=<provider>:<actual-model>` (for the distributed smoke,
+which submits a prepared DAG, that upstream is normally the *worker* model). So the freeze records four things: the
+direct worker model, the direct planner model, the gateway upstream, and the alias. Of the model variables only
+`MAS_GATEWAY_UPSTREAM`, `MAS_MODEL_WORKER`, `MAS_MODEL_PLANNER`, `MAS_MODEL_PRICES` and the vendor key are *required
+doctor rows*; `MAS_GATEWAY_MODELS` and `MAS_GATEWAY_TOKEN` have Compose defaults (`builder`, `mas-gateway`) and are
+never checked — freeze a deliberate random token anyway rather than shipping the development default.
+`MAS_MODEL_REVIEWER` stays empty: a reviewer role is post-MVP.
+
 The gateway probe must run **inside** the backend network: `gateway` publishes no host port, and `MAS_OPENAI_BASE_URL`
 on the host points at the vendor — so `mas models --probe-tools --spec openai:<m>` from your shell would silently test
 the vendor directly and prove nothing about the gateway. Run it in the `worker` container (which has
@@ -163,15 +174,19 @@ incident. Every stop is resumable — rerun the same command. C/D execute under 
 the equal total budget, and every row carries both the execution-only and the `system_*` (planning added back) cost and
 latency.
 
-`live_smoke.py` is bounded as a whole by `--max-total-cost-usd` (default 30 = three runs at the default per-run
-ceiling): a stage starts only if the ceiling still covers its per-run maximum, each stage prints what it cost, and the
+`live_smoke.py` is bounded as a whole by `--max-total-cost-usd` (default 30, against a default per-run ceiling of 10 —
+**not** a guarantee of three worst-case runs: the ping draws on the same ceiling, so covering three runs that each
+spend their full allowance needs `3 × per-run + ping headroom`. Choose both deliberately; don't inherit the defaults):
+a stage starts only if the ceiling still covers its per-run maximum, each stage prints what it cost, and the
 summary states the total — **the ping included** (its telemetry, reported model id and cost land in the evidence under
 `ping` and in the ledger; an unpriced ping fails the gate, because the price table then does not cover the model the
 provider actually reported) — that measurement is what the matrix's two ceilings should be chosen from. It refuses to
 start with an Anthropic model and `MAS_ANTHROPIC_EFFORT` unset (`mas doctor --require-live` says so earlier).
 `live_smoke.py --resume` (with `--output`) skips stages already PASSED in that file when it came from the same commit,
 models, approval mode, pricing rule and price table, budgets, worker count, concurrency, replan limit **and request
-shape** (thinking, effort, timeout, retries, attempt call budget). `benchmark.py`
+shape** (thinking, effort, timeout, retries, attempt call budget). That list is exhaustive: `MAS_OPENAI_BASE_URL`,
+`MAS_OPENAI_MAX_TOKENS_FIELD` and `MAS_ATTEMPT_MAX_TOKENS` are **not** in the identity, so changing one between stages
+is not detected — the matrix manifest freezes them, the smoke does not. Hold them constant by hand. `benchmark.py`
 re-invoked with the same arguments resumes: recorded cells are skipped, cells whose last row is `infrastructure`-invalid
 (verifier crash/timeout, unusable suite, provider outage, sandbox/workspace failure, worker death, lost client) are
 rerun; `experimental` failures (the model, the plan — an unmappable contract included — or the budgets) are kept as

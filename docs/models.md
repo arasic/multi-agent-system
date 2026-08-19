@@ -64,6 +64,8 @@ Cache multipliers are the vendor's standard ratios, not per-model confirmations.
 
 Price the **exact id the provider reports**, not the alias you requested — `mas models --ping` prints it (`models`), and prefix matching covers dated variants. An unpriced model makes every cost figure a floor: the live smoke fails, and the matrix refuses to start.
 
+**Before the first call you cannot know that id** — it is first observed during the paid ping, and an unpriced ping fails the gate. Seed the table with an officially documented model-family **prefix** that the returned id must begin with: [pricing.py](../mas/providers/pricing.py) resolves an exact key first, then the longest configured key that is a prefix of the reported model. After the ping, compare the reported id against the table and tighten the key to the exact id for the matrix. Note the layering: the alias you request may be a gateway name (`openai:builder`) while the priced id is whatever the **upstream** model reports back.
+
 ## What we measure regardless of model
 
 Per call (`model_calls`): provider, model, role, tokens (incl. cache), cost, `priced`, latency, stop reason / error. Per attempt: `model`, `input_tokens`, `output_tokens`, `cost_usd` (settled from the meter). Per run: totals; `mas status` shows both and flags unpriced usage. This is what makes configs A–D comparable when models change.

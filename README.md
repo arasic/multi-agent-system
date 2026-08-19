@@ -196,8 +196,10 @@ python scripts/distributed_smoke.py --build --output mvp-evidence/distributed-sm
 failure costs one stage instead of the set.
 
 The second command proves the configured provider through the actual gateway, Compose workers, trusted host executor,
-external verifier, and verified-result export. The smoke is bounded as a whole by `--max-total-cost-usd` (default 30)
-and prints what each stage cost — that is the measurement the matrix's ceilings should be chosen from.
+external verifier, and verified-result export. The smoke is bounded as a whole by `--max-total-cost-usd` (default 30,
+against a default per-run ceiling of 10 — the ping draws on the same ceiling, so this does not guarantee three
+worst-case runs; choose both deliberately) and prints what each stage cost — that is the measurement the matrix's
+ceilings should be chosen from.
 (`live_smoke.py --resume` carries already-passed stages forward, but only from the same commit, models, approval mode,
 pricing rule and price table, budgets, worker count, concurrency, replan limit and request shape — thinking, reasoning
 effort, timeout, retries.) The final M3 experiment is resumable and refuses to mix
